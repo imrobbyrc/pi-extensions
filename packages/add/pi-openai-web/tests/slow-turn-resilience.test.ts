@@ -253,6 +253,33 @@ test("settle grace is bounded: silent turn fails after grace elapses", async () 
   }
 });
 
+test("settle grace re-arms after each renewed active bout and stays bounded", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-grace-rearm-"));
+  try {
+    // stall 200ms vs 600ms polls: every quiet poll trips the stall check.
+    // Grace window (1500ms) tides over single quiet polls after each active
+    // bout (active on polls 1 and 3) but must finally lapse into a real stall.
+    const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 10_000, stallGraceMs: 1_500 });
+    let polls = 0;
+    const h = makeWatch(cfg, [spinner()], async () => {
+      polls += 1;
+      return polls === 1 || polls === 3;
+    });
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "failed");
+    assert.match(outcome.error ?? "", /provider_turn_stalled/);
+    assert.equal(h.controller.state, "failed");
+    // Without re-arming, the stale first window would kill the turn right after
+    // the second active bout (<=2 settled graces); a re-armed window must carry
+    // it through several more quiet polls before the bounded lapse.
+    const settled = h.graceEvents.filter(event => event.reason === "harness_settled");
+    assert.ok(settled.length >= 3, `expected re-armed settle grace, got ${JSON.stringify(h.graceEvents)}`);
+    assert.ok(h.graceEvents.some(event => event.reason === "harness_active"), "second active bout must earn harness_active grace again");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("McpToolActivity tracks in-flight tool executions and clamps at zero", () => {
   const activity = new McpToolActivity();
   assert.equal(activity.active, false);
