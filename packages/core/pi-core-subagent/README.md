@@ -1,6 +1,6 @@
-# @arhen/pi-core-subagent
+# @imrobbyrc/pi-core-subagent
 
-[![npm version](https://img.shields.io/npm/v/%40arhen%2Fpi-core-subagent?color=cb3837&logo=npm)](https://www.npmjs.com/package/@arhen/pi-core-subagent)
+[![npm version](https://img.shields.io/npm/v/%40imrobbyrc%2Fpi-core-subagent?color=cb3837&logo=npm)](https://www.npmjs.com/package/@imrobbyrc/pi-core-subagent)
 [![CI](https://img.shields.io/github/actions/workflow/status/arhen/pi-core-subagent/ci.yml?branch=main&logo=github&label=CI)](https://github.com/arhen/pi-core-subagent/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![pi extension](https://img.shields.io/badge/pi-extension-7c3aed)](https://github.com/earendil-works/pi)
@@ -10,7 +10,7 @@
 Requires the [pi coding agent](https://github.com/earendil-works/pi) — install it first: `npm install -g @earendil-works/pi-coding-agent`.
 
 ```sh
-pi install npm:@arhen/pi-core-subagent
+pi install npm:@imrobbyrc/pi-core-subagent
 # or locally: pi install /path/to/pi-subagents
 ```
 

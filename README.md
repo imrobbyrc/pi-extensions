@@ -42,7 +42,7 @@ pi-toolset install          # installs all @arhen/pi-core-* packages
 Or install individual extensions permanently:
 
 ```bash
-pi install npm:@arhen/pi-core-subagent
+pi install npm:@imrobbyrc/pi-core-subagent
 ```
 
 Try one without adding it permanently:
@@ -61,7 +61,7 @@ pi -e npm:@arhen/pi-core-vision
 | --- | --- |
 | [`@arhen/pi-core-ask`](packages/core/pi-core-ask) | Structured up-to-4-question questionnaire tool |
 | [`@arhen/pi-core-skill-tool`](packages/core/pi-core-skill-tool) | Skills catalog, lazy `skill` tool |
-| [`@arhen/pi-core-subagent`](packages/core/pi-core-subagent) | Fast in-process subagents, dependency scheduler |
+| [`@imrobbyrc/pi-core-subagent`](packages/core/pi-core-subagent) | Fast in-process subagents, dependency scheduler |
 | [`@arhen/pi-core-todo`](packages/core/pi-core-todo) | Todo tool with 4-state machine + blockedBy |
 | [`@arhen/pi-core-tps-stats`](packages/core/pi-core-tps-stats) | Live tokens-per-second stats |
 | [`@arhen/pi-core-vision`](packages/core/pi-core-vision) | Vision fallback for text-only models |
