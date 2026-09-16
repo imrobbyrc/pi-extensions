@@ -17,9 +17,6 @@ import {
 import { type RunDetails, type RunSnapshot, TERMINAL } from "./types.ts";
 import { cleanupMerged, ownerAlive, reapDeadWorktrees, repoRoot, sweepStale } from "./worktree.ts";
 
-export type { RunDetails, RunSnapshot, SubagentParamsShape, SubagentRuntime, TaskSnapshot } from "./api.ts";
-export { createSubagentController, SubagentController } from "./api.ts";
-
 export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 	const manager = existingManager ?? new SubagentManager(pi);
 
