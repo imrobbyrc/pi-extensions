@@ -5,6 +5,11 @@
 	"description": "pi extension: fast in-process subagents with a dependency-graph scheduler (needs edges gate tasks and carry upstream output into dependent prompts), plus background runs, intercom and agent-to-agent mailbox. Leader defines agents inline.",
 	"license": "MIT",
 	"main": "./src/index.ts",
+	"exports": {
+		".": "./src/index.ts",
+		"./api": "./src/api.ts",
+		"./src/*": "./src/*"
+	},
 	"scripts": {
 		"test": "bun test",
 		"typecheck": "tsc --noEmit",

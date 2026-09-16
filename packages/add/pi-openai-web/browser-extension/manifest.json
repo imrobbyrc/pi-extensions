@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Pi ChatGPT Picker Bridge",
+  "version": "0.0.1",
+  "description": "Expose visible ChatGPT picker state to the local Pi CDP session.",
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page-bridge.js"],
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+    }
+  ]
+}

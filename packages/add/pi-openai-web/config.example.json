@@ -1,0 +1,21 @@
+{
+  "mcpHost": "127.0.0.1",
+  "mcpPort": 8765,
+  "mcpPath": "/mcp",
+  "publicMcpUrl": "https://pi-harness.example.com/mcp",
+  "browser": "dia",
+  "browserStartupTimeoutMs": 20000,
+  "cdpHost": "127.0.0.1",
+  "cdpPort": 9222,
+  "chatgptUrl": "https://chatgpt.com/",
+  "chatgptAppName": "Pi Workspace",
+  "browserAutoAttachApp": true,
+  "maxReadLines": 500,
+  "maxFileBytes": 1000000,
+  "harnessAutoApproveHerdrRun": false,
+  "providerContextLimitTokens": 128000,
+  "providerComposerLimitTokens": 32000,
+  "providerCompactionWarnTokens": 96000,
+  "providerCompactionMaxTokens": 120000,
+  "providerSessionRetentionDays": 30
+}

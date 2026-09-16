@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "ignoreDeprecations": "6.0",
+    "paths": {
+      "@imrobbyrc/pi-core-subagent": ["./src/core-subagent.d.ts"],
+      "@imrobbyrc/pi-core-subagent/api": ["./src/core-subagent.d.ts"],
+      "@imrobbyrc/pi-core-subagent/src/api.ts": ["./src/core-subagent.d.ts"],
+      "@imrobbyrc/pi-core-subagent/src/index.ts": ["./src/core-subagent.d.ts"]
+    },
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": [
+    "extensions/**/*.ts",
+    "src/**/*.ts",
+    "scripts/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}
