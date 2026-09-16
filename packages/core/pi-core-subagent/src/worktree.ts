@@ -140,7 +140,18 @@ function commitIn(dir: string, message: string, expectBranch?: string): "committ
 		if (head !== expectBranch) throw new Error(`worktree HEAD is "${head}", expected ${expectBranch}`);
 	}
 
-	gitIn(dir, ["add", "-A", "--", ".", ":(exclude)node_modules", ":(exclude,glob)**/node_modules/**"]);
+	const changed = gitRaw(dir, ["status", "--porcelain=v1", "-z"])
+		.split("\0")
+		.filter(Boolean)
+		.map((entry) => entry.slice(3))
+		.filter(
+			(path) =>
+				path !== "node_modules" &&
+				!path.startsWith("node_modules/") &&
+				path !== ".tokensave" &&
+				!path.startsWith(".tokensave/"),
+		);
+	if (changed.length > 0) gitIn(dir, ["add", "-A", "--", ...changed]);
 	if (gitIn(dir, ["diff", "--cached", "--name-only"]).length === 0) return "empty";
 	gitIn(dir, [...COMMIT_CONFIG, "commit", "-m", message, "--no-verify"]);
 	return "committed";

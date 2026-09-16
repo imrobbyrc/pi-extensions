@@ -299,7 +299,15 @@ Background (default) + intercom — the run returns a runId immediately; you sta
 
 ### Per-task fields
 
-`agent` (name you invent — required), `task` (required), `prompt` (system prompt, optional — minimal default used), `write` (toolset, default read-only), plus optional `model` (`provider/model-id`), `thinking` (validated enum: `off|minimal|low|medium|high|xhigh|max`), `tools` (explicit allowlist), `cwd`, `maxRuntimeMs`, `id`, `needs` (dependency edges — see [Graph mode](#graph-mode--needs)). Top-level only: `autoAwait`, `notifyPerTask`, `concurrency`.
+`agent` (name you invent — required), `task` (required), `prompt` (system prompt, optional — minimal default used), `write` (toolset, default read-only), plus optional `model` (`provider/model-id`), `thinking` (validated enum: `off|minimal|low|medium|high|xhigh|max`), `tools` (explicit allowlist), `cwd`, `maxRuntimeMs`, `id`, `needs` (dependency edges — see [Graph mode](#graph-mode--needs)). Top-level only: `autoAwait`, `notifyPerTask`, `concurrency`, `runtime` (`"inprocess"` | `"herdr"`).
+
+### Runtimes: inprocess vs herdr
+
+- **`inprocess` (initial default)**: Fast, zero-overhead execution using isolated `AgentSession` instances inside the same parent node process.
+- **`herdr`**: Spawns each subagent into a dedicated Herdr multiplexer pane using `herdr pane split` and `herdr agent start` with child talk tools bridged over a Unix domain socket.
+  - Requires running inside Herdr with `HERDR_ENV=1`.
+  - Full parity with inprocess mode: supports graph waves, worktrees, `ask_parent`, `notify_parent`, sibling mailbox messages, steering, and cancellation.
+  - Panes remain open after completion for inspection; only startup failures prior to a usable session clean up the pane.
 
 ### Child talk tools (always on)
 
@@ -315,7 +323,8 @@ Background (default) + intercom — the run returns a runId immediately; you sta
 ## Commands
 
 - `/subagents` — list runs; `/subagents peek` (or `ctrl+shift+a`) — browsable pane
-- `/subagents auto-limit on|off` — toggle leader-imposed `maxRuntimeMs` caps (persists to `~/.pi/agent/subagents-config.json`; default **off**). `on` gives tasks without an explicit `maxRuntimeMs` the 1 h default ceiling; `off` raises the ceiling to 6 h (still a ceiling — an unbounded child would pin the run forever). Bare `/subagents auto-limit` shows the current state.
+- `/subagents runtime` — open the runtime picker; `/subagents runtime herdr|inprocess` sets the persisted default directly. An explicit tool-call `runtime` still wins.
+- `/subagents auto-limit on|off` — toggle leader-imposed `maxRuntimeMs` caps (persists with the runtime default in `~/.pi/agent/subagents-config.json`; default **off**). `on` gives tasks without an explicit `maxRuntimeMs` the 1 h default ceiling; `off` raises the ceiling to 6 h (still a ceiling — an unbounded child would pin the run forever). Bare `/subagents auto-limit` shows the current state.
 
 ## Peek — `/subagents peek` or `ctrl+shift+a`
 
@@ -328,7 +337,7 @@ Read-only pane over the session's subagents:
 
 ## Watching a child from outside
 
-A child has no terminal of its own — but it does write a real transcript file, and that file is the seam every external viewer can use:
+A child has no terminal of its own when running `inprocess` — but it does write a real transcript file, and that file is the seam every external viewer can use:
 
 ```mermaid
 flowchart LR
@@ -343,7 +352,7 @@ flowchart LR
 tail -f /path/from/subagent_status.jsonl
 ```
 
-In a terminal multiplexer, that is a pane per agent — e.g. with [Herdr](https://herdr.dev):
+When running under `runtime: "herdr"`, each child already runs visibly inside its own split Herdr terminal pane. Alternatively, in any terminal multiplexer (e.g. [Herdr](https://herdr.dev)):
 
 ```sh
 herdr pane split --current --direction right

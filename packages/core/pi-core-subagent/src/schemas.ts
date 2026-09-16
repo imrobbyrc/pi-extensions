@@ -3,6 +3,7 @@ import { type Static, Type } from "typebox";
 import { DEFAULT_CONCURRENCY, MAX_CONCURRENCY } from "./manager.ts";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const RUNTIMES = ["inprocess", "herdr"] as const;
 const TaskItem = Type.Object({
 	id: Type.Optional(Type.String({ description: "Optional stable task id" })),
 	agent: Type.String({ minLength: 1, description: "Agent name you invent (defined inline via `prompt`)" }),
@@ -56,6 +57,11 @@ export const SubagentParams = Type.Object({
 		Type.Boolean({
 			description: "Wake you (queued follow-up turn) as each task completes. Default true.",
 			default: true,
+		}),
+	),
+	runtime: Type.Optional(
+		StringEnum(RUNTIMES, {
+			description: "Execution runtime override: 'inprocess' or 'herdr' (otherwise uses the persisted default)",
 		}),
 	),
 });

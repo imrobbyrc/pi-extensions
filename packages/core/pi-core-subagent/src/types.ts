@@ -15,6 +15,8 @@ export interface UsageStats {
 	turns: number;
 }
 
+export type SubagentRuntime = "inprocess" | "herdr";
+
 export interface TaskSnapshot {
 	id: string;
 	runId: string;
@@ -47,11 +49,15 @@ export interface TaskSnapshot {
 	isolationReason?: string;
 	stackedOn?: string;
 	worktreeError?: string;
+	runtime?: SubagentRuntime;
+	paneId?: string;
+	herdrAgent?: string;
 }
 
 export interface RunSnapshot {
 	id: string;
 	mode: RunMode;
+	runtime: SubagentRuntime;
 	status: RunStatus;
 	notifyPerTask: boolean;
 	createdAt: number;

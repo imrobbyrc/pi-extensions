@@ -17,8 +17,11 @@ import {
 import { type RunDetails, type RunSnapshot, TERMINAL } from "./types.ts";
 import { cleanupMerged, ownerAlive, reapDeadWorktrees, repoRoot, sweepStale } from "./worktree.ts";
 
-export default function (pi: ExtensionAPI) {
-	const manager = new SubagentManager(pi);
+export type { RunDetails, RunSnapshot, SubagentParamsShape, SubagentRuntime, TaskSnapshot } from "./api.ts";
+export { createSubagentController, SubagentController } from "./api.ts";
+
+export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
+	const manager = existingManager ?? new SubagentManager(pi);
 
 	const openPeek = async (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
@@ -53,14 +56,42 @@ export default function (pi: ExtensionAPI) {
 			{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "70%", margin: 2 } },
 		);
 	};
+	const setRuntime = (runtime: "inprocess" | "herdr", ctx: ExtensionContext) => {
+		manager.setDefaultRuntime(runtime);
+		ctx.ui.notify(`Default subagent runtime: ${runtime}. Explicit \`runtime\` still overrides it.`, "info");
+	};
+
+	const chooseRuntime = async (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) {
+			ctx.ui.notify(
+				`Default subagent runtime: ${manager.defaultRuntime}. Use \`/subagents runtime herdr|inprocess\`.`,
+				"info",
+			);
+			return;
+		}
+		const selected = await ctx.ui.select("Default subagent runtime", [
+			`inprocess${manager.defaultRuntime === "inprocess" ? " (current)" : ""}`,
+			`herdr${manager.defaultRuntime === "herdr" ? " (current)" : ""}`,
+		]);
+		if (selected?.startsWith("inprocess")) setRuntime("inprocess", ctx);
+		else if (selected?.startsWith("herdr")) setRuntime("herdr", ctx);
+	};
+
 	pi.registerCommand("subagents", {
 		description:
-			"List subagent runs. `/subagents peek` opens the browsable pane; `/subagents auto-limit on|off` toggles the 1 h default runtime ceiling (default off = 6 h).",
+			"List runs; `/subagents peek` browses agents; `/subagents runtime [herdr|inprocess]` chooses the persisted default; `/subagents auto-limit on|off` controls the runtime ceiling.",
 		handler: async (args, ctx) => {
 			const arg = String(args ?? "")
 				.trim()
 				.toLowerCase();
 			if (arg === "peek") return openPeek(ctx);
+			if (arg === "runtime") return chooseRuntime(ctx);
+			if (arg.startsWith("runtime ")) {
+				const value = arg.split(/\s+/)[1];
+				if (value === "herdr" || value === "inprocess") setRuntime(value, ctx);
+				else ctx.ui.notify("Use `/subagents runtime herdr|inprocess`.", "warning");
+				return;
+			}
 			if (arg === "auto-limit" || arg.startsWith("auto-limit ")) {
 				const value = arg.split(/\s+/)[1];
 				if (value === "on" || value === "off") {

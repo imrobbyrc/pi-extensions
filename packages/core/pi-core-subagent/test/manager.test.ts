@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,9 +7,12 @@ import { SubagentManager } from "../src/manager.ts";
 
 const stubPi = { events: { emit() {} }, sendUserMessage() {} } as unknown as ExtensionAPI;
 const stubCtx = { cwd: "/tmp", hasUI: false } as unknown as ExtensionContext;
+const testConfigPath = join(tmpdir(), `pi-core-subagent-manager-${process.pid}.json`);
+rmSync(testConfigPath, { force: true });
+afterAll(() => rmSync(testConfigPath, { force: true }));
 
 function makeManager(): SubagentManager {
-	return new SubagentManager(stubPi);
+	return new SubagentManager(stubPi, undefined, testConfigPath);
 }
 
 describe("createRun", () => {

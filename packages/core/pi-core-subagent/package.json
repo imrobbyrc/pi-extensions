@@ -1,10 +1,15 @@
 {
 	"name": "@arhen/pi-core-subagent",
-	"version": "1.3.54",
+	"version": "1.3.55",
 	"type": "module",
 	"description": "pi extension: fast in-process subagents with a dependency-graph scheduler (needs edges gate tasks and carry upstream output into dependent prompts), plus background runs, intercom and agent-to-agent mailbox. Leader defines agents inline.",
 	"license": "MIT",
 	"main": "./src/index.ts",
+	"exports": {
+		".": "./src/index.ts",
+		"./api": "./src/api.ts",
+		"./src/*": "./src/*"
+	},
 	"scripts": {
 		"test": "bun test",
 		"typecheck": "tsc --noEmit",
@@ -26,7 +31,8 @@
 		"agent-orchestration",
 		"task-graph",
 		"dag",
-		"graph-protocol"
+		"graph-protocol",
+		"pi-package"
 	],
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "^0.84.2",
@@ -47,7 +53,7 @@
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/arhen/pi-extensions",
+		"url": "https://github.com/imrobbyrc/pi-extensions",
 		"directory": "packages/core/pi-core-subagent"
 	},
 	"publishConfig": {

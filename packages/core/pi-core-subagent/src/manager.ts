@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, sep } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -29,6 +29,7 @@ import {
 	truncateText,
 } from "./format.ts";
 import { applyUpstream, resolveNeeds, runWaveScheduler } from "./graph.ts";
+import { checkHerdrEnvironment, defaultHerdrRunner, type HerdrCommandRunner, runHerdrChild } from "./herdr.ts";
 import { createMailbox, type Mailbox } from "./mailbox.ts";
 import type { SubagentParamsShape, TaskInput } from "./schemas.ts";
 import {
@@ -38,6 +39,7 @@ import {
 	type RunMode,
 	type RunSnapshot,
 	type RunStatus,
+	type SubagentRuntime,
 	type TaskSnapshot,
 	type TaskStatus,
 	TERMINAL,
@@ -246,15 +248,19 @@ export interface ParkedMsg {
 	text: string;
 }
 
+export interface LiveChild {
+	abort: () => void;
+	dispose: () => void;
+	steer: (message: string) => void;
+	reply?: (message: string) => void;
+}
+
 export class SubagentManager {
 	private runs = new Map<string, RunSnapshot>();
 	private settlers = new Map<string, true>();
 	private settleWaiters = new Map<string, Set<(run: RunSnapshot) => void>>();
 	private pendingReplies = new Map<string, PendingReply>();
-	private liveChildren = new Map<
-		string,
-		{ abort: () => void; dispose: () => void; steer: (message: string) => void }
-	>();
+	private liveChildren = new Map<string, LiveChild>();
 	private mailboxes: Mailbox = createMailbox();
 	private liveWorktrees = new Map<string, Worktree>();
 	private runControllers = new Map<string, AbortController>();
@@ -266,28 +272,59 @@ export class SubagentManager {
 	private persistChain: Promise<unknown> = Promise.resolve();
 	private readonly instanceNonce = Math.random().toString(36).slice(2, 8);
 	private cleared = false;
+	private ownedPanes = new Set<string>();
 
 	private autoLimit = false;
+	private _defaultRuntime: SubagentRuntime = "inprocess";
+	private config: Record<string, unknown> = {};
 
 	turnActivity = false;
 
-	constructor(private readonly pi: ExtensionAPI) {
+	constructor(
+		private readonly pi: ExtensionAPI,
+		private herdrRunner: HerdrCommandRunner = defaultHerdrRunner,
+		private readonly configPath = join(getAgentDir(), "subagents-config.json"),
+	) {
 		try {
-			const cfg = JSON.parse(readFileSync(join(getAgentDir(), "subagents-config.json"), "utf8"));
-			if (typeof cfg.autoLimit === "boolean") this.autoLimit = cfg.autoLimit;
+			this.config = JSON.parse(readFileSync(this.configPath, "utf8"));
+			if (typeof this.config.autoLimit === "boolean") this.autoLimit = this.config.autoLimit;
+			if (this.config.runtime === "inprocess" || this.config.runtime === "herdr") {
+				this._defaultRuntime = this.config.runtime;
+			}
 		} catch {}
+	}
+
+	private saveConfig(patch: Record<string, unknown>): void {
+		let latest = this.config;
+		try {
+			latest = JSON.parse(readFileSync(this.configPath, "utf8"));
+		} catch {}
+		this.config = { ...latest, ...patch };
+		writeFileSync(this.configPath, JSON.stringify(this.config, null, 2));
+	}
+
+	setHerdrRunner(runner: HerdrCommandRunner): void {
+		this.herdrRunner = runner;
 	}
 
 	setAutoLimit(on: boolean): boolean {
 		this.autoLimit = on;
-		void writeFile(join(getAgentDir(), "subagents-config.json"), JSON.stringify({ autoLimit: on }, null, 2)).catch(
-			() => {},
-		);
+		this.saveConfig({ autoLimit: on });
 		return on;
 	}
 
 	get autoLimitOn(): boolean {
 		return this.autoLimit;
+	}
+
+	setDefaultRuntime(runtime: SubagentRuntime): SubagentRuntime {
+		this._defaultRuntime = runtime;
+		this.saveConfig({ runtime });
+		return runtime;
+	}
+
+	get defaultRuntime(): SubagentRuntime {
+		return this._defaultRuntime;
 	}
 
 	hasActiveRun(): boolean {
@@ -383,14 +420,21 @@ export class SubagentManager {
 					const anyAborted = run.tasks.some((t) => t.status === "aborted");
 					status = anyFailed ? "failed" : anyAborted ? "aborted" : "completed";
 				}
+				const runtime: SubagentRuntime = run.runtime ?? "inprocess";
 				return {
 					...run,
+					runtime,
 					status,
 					endedAt: interrupted ? Date.now() : run.endedAt,
 					tasks: run.tasks.map((t) =>
 						TERMINAL.includes(t.status)
-							? t
-							: { ...t, status: "aborted" as TaskStatus, error: t.error || "Interrupted by session reload" },
+							? { ...t, runtime: t.runtime ?? runtime }
+							: {
+									...t,
+									runtime: t.runtime ?? runtime,
+									status: "aborted" as TaskStatus,
+									error: t.error || "Interrupted by session reload",
+								},
 					),
 				};
 			});
@@ -722,6 +766,25 @@ export class SubagentManager {
 	): Promise<void> {
 		if (TERMINAL.includes(task.status)) return;
 
+		if (run.runtime === "herdr") {
+			try {
+				await checkHerdrEnvironment(this.herdrRunner);
+			} catch (err) {
+				this.updateTask(
+					run,
+					task,
+					{
+						status: "failed",
+						error: err instanceof Error ? err.message : String(err),
+						endedAt: Date.now(),
+					},
+					ctx,
+					onUpdate,
+				);
+				return;
+			}
+		}
+
 		const file = resolveAgentFile(input.agent, routingTask, task.cwd, getAgentDir());
 		if (file?.path) task.agentFile = file.path;
 		const prompt = file?.body ?? input.prompt?.trim();
@@ -849,148 +912,186 @@ export class SubagentManager {
 				: "";
 			const subagentInstruction = `You are running as a subagent. Your bash tool already executes in the project working directory — never prefix commands with \`cd\`. Do not call subagent/delegation tools unless the parent explicitly asks. Return a concise final answer. You MAY use ask_parent only when truly blocked on information only the parent has; notify_parent for one-way updates; send_agent_message/poll_agent_messages to coordinate with siblings. Your mailbox address and siblings: ${task.roster ?? "(none)"}. Use the exact task ids (e.g. task_2) as send_agent_message targets. Siblings run independently and may start late or finish early — never block indefinitely on their replies: poll at most 5 times, then proceed with your best judgment. A gated sibling (marked ↳ waits in the graph) may not be running yet; do not wait for it. An unanswered ask_parent times out after 10 minutes — proceed with your best judgment then. When your work is done, call notify_parent ONCE with a concise result summary — key findings, verdicts, file:line evidence — so the leader can start consuming your output before the run finishes.${worktreeNote}`;
 
-			const loader = new DefaultResourceLoader({
-				cwd: childCwd,
-				agentDir: getAgentDir(),
-				noExtensions: true,
-				appendSystemPromptOverride: (base) => [
-					...base,
-					[prompt?.trim(), subagentInstruction].filter(Boolean).join("\n\n"),
-				],
-			});
-			await loader.reload();
+			if (run.runtime === "herdr") {
+				await runHerdrChild({
+					run,
+					task,
+					input,
+					prompt,
+					subagentInstruction,
+					childCwd,
+					model,
+					thinking,
+					tools,
+					wt,
+					ctx,
+					signal,
+					resume,
+					runner: this.herdrRunner,
+					ownedPanes: this.ownedPanes,
+					childHandlers: this.makeChildHandlers(run, task, ctx),
+					registerLiveChild: (handle) => {
+						this.liveChildren.set(key, handle);
+					},
+					unregisterLiveChild: () => {
+						this.liveChildren.delete(key);
+					},
+					updateTask: (patch) => {
+						this.updateTask(run, task, patch, ctx, onUpdate);
+					},
+					updateRun: () => {
+						this.updateRun(run, ctx, onUpdate);
+					},
+					awaitParentReply: (rId, tId, ms) => this.awaitParentReply(rId, tId, ms),
+					autoLimit: this.autoLimit,
+					defaultRuntimeMs: DEFAULT_RUNTIME_MS,
+					unlimitedRuntimeMs: UNLIMITED_RUNTIME_MS,
+				});
+			} else {
+				const loader = new DefaultResourceLoader({
+					cwd: childCwd,
+					agentDir: getAgentDir(),
+					noExtensions: true,
+					appendSystemPromptOverride: (base) => [
+						...base,
+						[prompt?.trim(), subagentInstruction].filter(Boolean).join("\n\n"),
+					],
+				});
+				await loader.reload();
 
-			const customTools: ToolDefinition[] = createChildTools(task.id, this.makeChildHandlers(run, task, ctx));
+				const customTools: ToolDefinition[] = createChildTools(task.id, this.makeChildHandlers(run, task, ctx));
 
-			const created = await createAgentSession({
-				cwd: childCwd,
-				agentDir: getAgentDir(),
-				modelRuntime: await createChildModelRuntime(ctx),
-				resourceLoader: loader,
-				sessionManager: resume
-					? SessionManager.open(resume.sessionFile, undefined, childCwd)
-					: SessionManager.create(childCwd, undefined, { parentSession: getParentSessionFile(ctx) }),
-				model,
-				thinkingLevel: thinking as ThinkingLevel | undefined,
-				tools,
-				customTools,
-			});
-			child = created.session;
-			child.setSessionName?.(`subagent: ${task.agent}`);
-			this.updateTask(
-				run,
-				task,
-				{ status: "running", sessionId: child.sessionId, sessionFile: child.sessionFile },
-				ctx,
-				onUpdate,
-			);
-
-			const childFailurePromise = new Promise<never>((_, reject) => {
-				childState.failChildEnd = reject;
-			});
-			const childEndPromise = new Promise<void>((resolve) => {
-				childState.childEndResolve = resolve;
-			});
-
-			unsubscribe = child.subscribe((event: AgentSessionEvent) =>
-				this.onChildEvent(event, run, task, ctx, onUpdate, childState),
-			);
-
-			const abortChild = () => {
-				void child?.abort();
-				this.runControllers.get(run.id)?.abort();
-			};
-			const runController = this.runControllers.get(run.id);
-			if (signal) signal.addEventListener("abort", abortChild, { once: true });
-			if (runController) runController.signal.addEventListener("abort", abortChild, { once: true });
-			abortListener = () => {
-				signal?.removeEventListener("abort", abortChild);
-				runController?.signal.removeEventListener("abort", abortChild);
-			};
-
-			if (run.status === "aborted" || TERMINAL.includes(task.status) || signal?.aborted) {
-				await child.abort();
-				throw new Error("Canceled by subagent_cancel");
-			}
-			this.liveChildren.set(key, {
-				abort: () => void child?.abort(),
-				dispose: () => child?.dispose(),
-
-				steer: (message) =>
-					void child?.prompt(message, { streamingBehavior: "steer" }).catch((err) =>
-						this.pi.sendUserMessage(`[steer_subagent] ${err instanceof Error ? err.message : String(err)}`, {
-							deliverAs: "followUp",
-						}),
-					),
-			});
-
-			const maxRuntimeMs = input.maxRuntimeMs ?? (this.autoLimit ? DEFAULT_RUNTIME_MS : UNLIMITED_RUNTIME_MS);
-			const promptPromise = child.prompt(resume?.message ?? task.task, { source: "extension" });
-			const races: Promise<unknown>[] = [promptPromise, childFailurePromise, childEndPromise];
-			if (maxRuntimeMs > 0) {
-				races.push(
-					new Promise<never>((_, reject) => {
-						timeout = setTimeout(() => reject(new Error(`Subagent timed out after ${maxRuntimeMs}ms`)), maxRuntimeMs);
-					}),
+				const created = await createAgentSession({
+					cwd: childCwd,
+					agentDir: getAgentDir(),
+					modelRuntime: await createChildModelRuntime(ctx),
+					resourceLoader: loader,
+					sessionManager: resume
+						? SessionManager.open(resume.sessionFile, undefined, childCwd)
+						: SessionManager.create(childCwd, undefined, { parentSession: getParentSessionFile(ctx) }),
+					model,
+					thinkingLevel: thinking as ThinkingLevel | undefined,
+					tools,
+					customTools,
+				});
+				child = created.session;
+				child.setSessionName?.(`subagent: ${task.agent}`);
+				this.updateTask(
+					run,
+					task,
+					{ status: "running", sessionId: child.sessionId, sessionFile: child.sessionFile },
+					ctx,
+					onUpdate,
 				);
+
+				const childFailurePromise = new Promise<never>((_, reject) => {
+					childState.failChildEnd = reject;
+				});
+				const childEndPromise = new Promise<void>((resolve) => {
+					childState.childEndResolve = resolve;
+				});
+
+				unsubscribe = child.subscribe((event: AgentSessionEvent) =>
+					this.onChildEvent(event, run, task, ctx, onUpdate, childState),
+				);
+
+				const abortChild = () => {
+					void child?.abort();
+					this.runControllers.get(run.id)?.abort();
+				};
+				const runController = this.runControllers.get(run.id);
+				if (signal) signal.addEventListener("abort", abortChild, { once: true });
+				if (runController) runController.signal.addEventListener("abort", abortChild, { once: true });
+				abortListener = () => {
+					signal?.removeEventListener("abort", abortChild);
+					runController?.signal.removeEventListener("abort", abortChild);
+				};
+
+				if (run.status === "aborted" || TERMINAL.includes(task.status) || signal?.aborted) {
+					await child.abort();
+					throw new Error("Canceled by subagent_cancel");
+				}
+				this.liveChildren.set(key, {
+					abort: () => void child?.abort(),
+					dispose: () => child?.dispose(),
+
+					steer: (message) =>
+						void child?.prompt(message, { streamingBehavior: "steer" }).catch((err) =>
+							this.pi.sendUserMessage(`[steer_subagent] ${err instanceof Error ? err.message : String(err)}`, {
+								deliverAs: "followUp",
+							}),
+						),
+				});
+
+				const maxRuntimeMs = input.maxRuntimeMs ?? (this.autoLimit ? DEFAULT_RUNTIME_MS : UNLIMITED_RUNTIME_MS);
+				const promptPromise = child.prompt(resume?.message ?? task.task, { source: "extension" });
+				const races: Promise<unknown>[] = [promptPromise, childFailurePromise, childEndPromise];
+				if (maxRuntimeMs > 0) {
+					races.push(
+						new Promise<never>((_, reject) => {
+							timeout = setTimeout(() => reject(new Error(`Subagent timed out after ${maxRuntimeMs}ms`)), maxRuntimeMs);
+						}),
+					);
+				}
+				await Promise.race(races);
+				if (timeout) clearTimeout(timeout);
+
+				childState.pendingFailure ??= lastAssistantFailure(child.messages as AssistantMessage[]);
+				if (childState.pendingFailure) throw failureError(childState.pendingFailure);
+
+				const finalText =
+					task.finalText ||
+					truncateText((child.messages as AssistantMessage[]).map(getFirstText).filter(Boolean).at(-1) || "");
+
+				if (task.status === "awaiting_parent") {
+					this.pendingReplies.get(key)?.resolve("(your task is being finalized — stop work and return now)");
+				}
+				if (!TERMINAL.includes(task.status)) {
+					this.updateTask(run, task, { status: "completed", finalText, endedAt: Date.now() }, ctx, onUpdate);
+				}
 			}
-			await Promise.race(races);
-			if (timeout) clearTimeout(timeout);
 
-			childState.pendingFailure ??= lastAssistantFailure(child.messages as AssistantMessage[]);
-			if (childState.pendingFailure) throw failureError(childState.pendingFailure);
+			if (wt && task.status === "completed") {
+				let committed: "committed" | "empty" | undefined;
+				try {
+					committed = commitWorktree(wt, `subagent ${task.agent}: ${truncateText(input.task, 60)}`);
 
-			const finalText =
-				task.finalText ||
-				truncateText((child.messages as AssistantMessage[]).map(getFirstText).filter(Boolean).at(-1) || "");
+					keepWorktreeDir = committed === "committed";
+				} catch (commitErr) {
+					keepWorktreeDir = true;
+					this.updateTask(
+						run,
+						task,
+						{
+							branch: wt.branch,
+							worktreeError: `commit failed (uncommitted changes remain in ${wt.path}): ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+						},
+						ctx,
+						onUpdate,
+					);
+				}
 
-			if (task.status === "awaiting_parent") {
-				this.pendingReplies.get(key)?.resolve("(your task is being finalized — stop work and return now)");
-			}
-			if (!TERMINAL.includes(task.status)) {
-				this.updateTask(run, task, { status: "completed", finalText, endedAt: Date.now() }, ctx, onUpdate);
-				if (wt) {
-					let committed: "committed" | "empty" | undefined;
+				if (committed === "committed") {
 					try {
-						committed = commitWorktree(wt, `subagent ${task.agent}: ${truncateText(input.task, 60)}`);
-
-						keepWorktreeDir = committed === "committed";
-					} catch (commitErr) {
-						keepWorktreeDir = true;
+						const { stat, files } = branchDiff(wt);
+						this.updateTask(
+							run,
+							task,
+							{ branch: wt.branch, diffStat: stat || undefined, changedFiles: files.length ? files : undefined },
+							ctx,
+							onUpdate,
+						);
+					} catch (diffErr) {
 						this.updateTask(
 							run,
 							task,
 							{
 								branch: wt.branch,
-								worktreeError: `commit failed (uncommitted changes remain in ${wt.path}): ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+								worktreeError: `committed, but the diff could not be read: ${diffErr instanceof Error ? diffErr.message : String(diffErr)}`,
 							},
 							ctx,
 							onUpdate,
 						);
-					}
-
-					if (committed === "committed") {
-						try {
-							const { stat, files } = branchDiff(wt);
-							this.updateTask(
-								run,
-								task,
-								{ branch: wt.branch, diffStat: stat || undefined, changedFiles: files.length ? files : undefined },
-								ctx,
-								onUpdate,
-							);
-						} catch (diffErr) {
-							this.updateTask(
-								run,
-								task,
-								{
-									branch: wt.branch,
-									worktreeError: `committed, but the diff could not be read: ${diffErr instanceof Error ? diffErr.message : String(diffErr)}`,
-								},
-								ctx,
-								onUpdate,
-							);
-						}
 					}
 				}
 			}
@@ -1132,9 +1233,20 @@ export class SubagentManager {
 			}
 		}
 
+		const runtime: SubagentRuntime = params.runtime ?? this.defaultRuntime;
+		if (runtime !== "inprocess" && runtime !== "herdr") {
+			throw new Error(`Invalid runtime "${runtime}". Supported: "inprocess" | "herdr"`);
+		}
+		if (runtime === "herdr") {
+			if (process.env.HERDR_ENV !== "1") {
+				throw new Error("Herdr runtime requires HERDR_ENV=1 (must run inside a Herdr workspace)");
+			}
+		}
+
 		const run: RunSnapshot = {
 			id: newId("run"),
 			mode,
+			runtime,
 			status: "queued",
 			notifyPerTask: params.notifyPerTask ?? true,
 			createdAt: Date.now(),
@@ -1152,6 +1264,7 @@ export class SubagentManager {
 				tools: input.tools ?? (input.write ? WRITE_TOOLS : READONLY_TOOLS),
 				toolCalls: 0,
 				usage: emptyUsage(),
+				runtime,
 			})),
 			aggregateUsage: emptyUsage(),
 		};
