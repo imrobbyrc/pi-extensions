@@ -40,7 +40,7 @@ export interface OpenAIWebRuntimeDeps {
   getOrchestratorConfig?: () => OrchestratorConfig | undefined;
   /** Reap harness-owned worker panes on provider abort and shutdown. */
   stopHarness?: () => Promise<void>;
-  /** Poll while Herdr is active; tool execution can outlast provider text progress. */
+  /** Poll while harness work is active; tool execution (Herdr runs, MCP tool calls) can outlast provider text progress. */
   isHarnessActive?: () => Promise<boolean>;
   /** Optional durable identity store for reconnecting provider browser turns. */
   resumeStore?: ProviderResumeStore;
@@ -575,7 +575,7 @@ export class OpenAIWebRuntime {
     let stablePolls = 0;
     let harnessWasActive = false;
     let harnessSettledGraceUntil = 0;
-    const stallGraceAfterHarnessMs = 30_000;
+    const stallGraceAfterHarnessMs = this.config.providerStallGraceMs ?? 30_000;
 
     while (true) {
       if (options.signal?.aborted) {
@@ -590,21 +590,25 @@ export class OpenAIWebRuntime {
       }
       const harnessActive = await this.deps.isHarnessActive?.() ?? false;
       if (harnessActive) {
+        // Each active bout earns a fresh settle window once activity ends.
         harnessWasActive = true;
+        harnessSettledGraceUntil = 0;
       } else if (harnessWasActive && harnessSettledGraceUntil === 0) {
         // Worker completion can reach MCP before ChatGPT renders its final text.
         // Keep watcher alive briefly so completion/result propagation can finish.
         harnessSettledGraceUntil = Date.now() + stallGraceAfterHarnessMs;
       }
       if (controller.stalled()) {
-        // Herdr tool calls can legitimately produce no browser text while workers
-        // run. Poll durable harness state before declaring provider failure.
+        // Harness tool work (Herdr runs, in-flight MCP tool calls) legitimately
+        // produces no browser text while it executes. Poll durable harness
+        // activity before declaring provider failure. The hard turn timeout
+        // above still bounds this grace.
         if (harnessActive) {
           controller.touchProgress();
-          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "herdr_active" });
+          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "harness_active" });
         } else if (harnessSettledGraceUntil > Date.now()) {
           controller.touchProgress();
-          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "herdr_settled" });
+          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "harness_settled" });
         } else {
           const error = `provider_turn_stalled after ${controller.stallTimeoutMs}ms without progress`;
           await stopGeneration(conversation.client).catch(() => {});

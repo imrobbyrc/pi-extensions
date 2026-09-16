@@ -13,6 +13,8 @@ export interface HarnessConfig {
   // Provider mode (openai-web).
   catalogSuccessTtlMs: number; catalogFailureRetryMs: number;
   providerTurnTimeoutMs: number; providerStallTimeoutMs: number; providerToolWaitMs: number;
+  /** Extra stall grace after harness (Herdr/MCP) activity settles; default 30s. */
+  providerStallGraceMs?: number;
   providerCompactionWarnTokens?: number; providerCompactionMaxTokens?: number; providerContextLimitTokens?: number; providerComposerLimitTokens?: number; providerSessionRetentionDays?: number;
   /** Headless auto-approval for herdr run actions. Default: fail closed. */
   harnessAutoApproveHerdrRun?: boolean;
