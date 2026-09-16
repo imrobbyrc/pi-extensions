@@ -78,6 +78,7 @@ export async function loadConfig(): Promise<HarnessConfig> {
     catalogFailureRetryMs: envNumber("PLANNER_CATALOG_FAILURE_RETRY_MS") ?? file.catalogFailureRetryMs ?? 3 * 60 * 1000,
     providerTurnTimeoutMs: envNumber("PLANNER_PROVIDER_TURN_TIMEOUT_MS") ?? file.providerTurnTimeoutMs ?? 10 * 60 * 1000,
     providerStallTimeoutMs: envNumber("PLANNER_PROVIDER_STALL_TIMEOUT_MS") ?? file.providerStallTimeoutMs ?? 90 * 1000,
+    providerStallGraceMs: envNumber("PLANNER_PROVIDER_STALL_GRACE_MS") ?? file.providerStallGraceMs ?? 30 * 1000,
     providerToolWaitMs: envNumber("PLANNER_PROVIDER_TOOL_WAIT_MS") ?? file.providerToolWaitMs ?? 5 * 60 * 1000,
     providerCompactionWarnTokens: envNumber("PLANNER_PROVIDER_COMPACTION_WARN_TOKENS") ?? file.providerCompactionWarnTokens ?? 96_000,
     providerCompactionMaxTokens: envNumber("PLANNER_PROVIDER_COMPACTION_MAX_TOKENS") ?? file.providerCompactionMaxTokens ?? 120_000,

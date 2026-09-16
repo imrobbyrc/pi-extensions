@@ -20,6 +20,39 @@ function text(value: unknown) {
   return { content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
 }
 
+/**
+ * In-flight harness/MCP tool executions. While any handler is executing, the
+ * provider turn watcher treats the turn as actively progressing (a spinner
+ * with no new assistant text is expected during tool work).
+ */
+export class McpToolActivity {
+  private count = 0;
+
+  begin(): void { this.count += 1; }
+  end(): void { this.count = Math.max(0, this.count - 1); }
+  get inFlight(): number { return this.count; }
+  get active(): boolean { return this.count > 0; }
+}
+
+/**
+ * Bracket a harness tool handler so its execution counts as provider-turn
+ * progress. `activity` is optional so non-runtime callers (tests, tooling)
+ * can reuse handlers untracked.
+ */
+export function trackedTool<R>(
+  activity: McpToolActivity | undefined,
+  handler: (args: any) => Promise<R>
+): (args?: any) => Promise<R> {
+  return async (args?: any) => {
+    activity?.begin();
+    try {
+      return await handler(args);
+    } finally {
+      activity?.end();
+    }
+  };
+}
+
 // Protocol-bound limits keep hostile or accidental payloads bounded.
 export const HERDR_GOAL_MAX = 4_000;
 export const HERDR_HANDOFF_MAX = 64_000;
@@ -48,11 +81,12 @@ export const HERDR_TOOL_DESCRIPTION = [
  * Strict frozen provider tool allowlist: bounded read/list/search/repo-map/
  * git status/diff plus one Pi-native herdr tool. Never subagent/bash/edit/write.
  */
-export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter }) {
+export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity }) {
   return (): McpServer => {
     const server = new McpServer({ name: "pi-harness", version: "1.0.0" });
     const workspaceRoot = deps.workspaceRoot;
     const limits = { maxReadLines: deps.config.maxReadLines, maxFileBytes: deps.config.maxFileBytes };
+    const track = <R>(handler: (args: any) => Promise<R>) => trackedTool(deps.activity, handler);
 
     server.registerTool(
       "repo_map",
@@ -62,7 +96,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         inputSchema: z.object({ max_depth: z.number().int().min(1).max(6).optional() }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
-      async ({ max_depth }) => text(await repoMap(workspaceRoot, max_depth ?? 3))
+      track(async ({ max_depth }) => text(await repoMap(workspaceRoot, max_depth ?? 3)))
     );
 
     server.registerTool(
@@ -73,7 +107,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         inputSchema: z.object({ path: z.string().default(".") }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
-      async ({ path }) => text((await listDirectory(workspaceRoot, path)).join("\n"))
+      track(async ({ path }) => text((await listDirectory(workspaceRoot, path)).join("\n")))
     );
 
     server.registerTool(
@@ -88,7 +122,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
-      async ({ path, start_line, end_line }) => text(await readTextFile(workspaceRoot, path, limits, start_line ?? 1, end_line))
+      track(async ({ path, start_line, end_line }) => text(await readTextFile(workspaceRoot, path, limits, start_line ?? 1, end_line)))
     );
 
     server.registerTool(
@@ -103,7 +137,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
-      async ({ query, glob, max_results }) => text(await searchWorkspace(workspaceRoot, query, max_results ?? 50, glob))
+      track(async ({ query, glob, max_results }) => text(await searchWorkspace(workspaceRoot, query, max_results ?? 50, glob)))
     );
 
     server.registerTool(
@@ -114,7 +148,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         inputSchema: z.object({}),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
-      async () => text(await gitStatus(workspaceRoot))
+      track(async () => text(await gitStatus(workspaceRoot)))
     );
 
     server.registerTool(
@@ -125,7 +159,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         inputSchema: z.object({ staged: z.boolean().optional() }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
-      async ({ staged }) => text(await gitDiff(workspaceRoot, staged ?? false))
+      track(async ({ staged }) => text(await gitDiff(workspaceRoot, staged ?? false)))
     );
 
     server.registerTool(
@@ -146,12 +180,12 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
-      async ({ action, goal, workers, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
+      track(async ({ action, goal, workers, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
         if (action === "run") {
           if (!goal) throw new Error("herdr run requires goal.");
           if (!workers?.length) throw new Error("herdr run requires 1-4 workers.");
           if (handoff) parseHerdrHandoff(handoff); // fail closed on malformed envelopes
-          const mapped: HerdrWorker[] = workers.map((worker) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.depends_on }));
+          const mapped: HerdrWorker[] = workers.map((worker: { id: string; objective: string; owns: string[]; depends_on: string[] }) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.depends_on }));
           const run = await deps.subagent.run({ goal, workers: mapped, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}), ...(handoff ? { handoff } : {}) });
           return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
         }
@@ -167,7 +201,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         // stop
         const result = await deps.subagent.stop(run_id);
         return text({ ok: true, runs: result });
-      }
+      })
     );
 
     return server;

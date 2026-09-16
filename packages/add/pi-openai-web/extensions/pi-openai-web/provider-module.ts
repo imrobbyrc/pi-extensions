@@ -21,7 +21,7 @@ import {
   type OrchestratorConfig,
   type OrchestratorScope
 } from "../../src/provider/orchestrator.js";
-import { createHarnessMcpFactory } from "../../src/mcp/server.js";
+import { createHarnessMcpFactory, McpToolActivity } from "../../src/mcp/server.js";
 import { SubagentMcpAdapter } from "../../src/mcp/subagent-adapter.ts";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 
@@ -59,6 +59,8 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
   let orchestratorState: OrchestratorState | undefined;
   /** Captured per-context UI for explicit TUI confirmations (herdr run gate). */
   let uiContext: { hasUI: boolean; confirm: (title: string, message: string) => Promise<boolean> } | undefined;
+  /** Shared in-flight MCP tool tracker: proves harness tool work is actively running to the provider turn watcher. */
+  const mcpToolActivity = new McpToolActivity();
   const activityLog: string[] = [];
 
   const recordActivity = (event: string, detail?: Record<string, unknown>): void => {
@@ -117,7 +119,7 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       activity: (event, detail) => recordActivity(event, detail),
       getOrchestratorConfig: () => orchestratorState?.config,
       stopHarness: async () => { subagents?.shutdown(); },
-      isHarnessActive: async () => Boolean(subagents?.hasActiveRun())
+      isHarnessActive: async () => Boolean(subagents?.hasActiveRun()) || mcpToolActivity.active
     });
     const created = createOpenAIWebProvider({
       runtime,
@@ -139,7 +141,8 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       infrastructure = new HarnessRuntime(cfg, () => createHarnessMcpFactory({
         config: cfg,
         workspaceRoot: process.cwd(),
-        subagent: subagentAdapter
+        subagent: subagentAdapter,
+        activity: mcpToolActivity
       })());
     }
     return infrastructure;
