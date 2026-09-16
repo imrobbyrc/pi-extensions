@@ -200,7 +200,10 @@ export class HarnessMcpHttpServer {
 
     app.get("/healthz", async () => ({ ok: true, name: "pi-harness" }));
     app.all(this.config.mcpPath, async (request, reply) => {
-      return nodeHandler(request.raw as NodeIncomingMessageLike, reply.raw, request.body);
+      // MCP streamable HTTP owns raw response lifecycle; prevent Fastify from
+      // closing the SSE stream before the handler finishes writing.
+      reply.hijack();
+      await nodeHandler(request.raw as NodeIncomingMessageLike, reply.raw, request.body);
     });
 
     await app.listen({ host: this.config.mcpHost, port: this.config.mcpPort });

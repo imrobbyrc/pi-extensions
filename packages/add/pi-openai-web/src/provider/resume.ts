@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { isValidConversationId } from "../browser/chatgpt.js";
 
 /** Durable, non-secret identity for reconnecting a provider browser turn. */
 export interface ProviderResumeMetadata {
@@ -30,6 +31,7 @@ export class FileProviderResumeStore implements ProviderResumeStore {
       if (value.schemaVersion !== 1 || typeof value.targetId !== "string" || typeof value.descriptorKey !== "string"
         || typeof value.branchKey !== "string" || typeof value.leaseKey !== "string" || typeof value.epoch !== "number"
         ) return undefined;
+      if (value.conversationId !== undefined && typeof value.conversationId !== "string") return undefined;
       return value as ProviderResumeMetadata;
     } catch {
       return undefined;

@@ -1,15 +1,22 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { cloneRun, SubagentManager } from "./manager.ts";
+import { cloneRun, getOrCreateSubagentManager, type SubagentManager } from "./manager.ts";
 import type { SubagentParamsShape } from "./schemas.ts";
 import type { RunDetails, RunSnapshot, SubagentRuntime, TaskSnapshot } from "./types.ts";
 
 export class SubagentController {
 	constructor(readonly manager: SubagentManager) {}
 
-	run(params: SubagentParamsShape, ctx: ExtensionContext): RunSnapshot {
+	hasActiveRun(): boolean {
+		return this.manager.hasActiveRun();
+	}
+
+	run(params: SubagentParamsShape | any, ctx: ExtensionContext | any): RunSnapshot {
 		return this.manager.startInBackground(params, ctx).run;
 	}
 
+	status(): RunSnapshot[];
+	status(runId: string): RunSnapshot;
+	status(runId?: string): RunSnapshot | RunSnapshot[];
 	status(runId?: string): RunSnapshot | RunSnapshot[] {
 		const run = this.manager.getRun(runId);
 		if (runId) {
@@ -35,7 +42,9 @@ export class SubagentController {
 	}
 
 	reply(runId: string, taskId: string, message: string): RunSnapshot {
-		if (!this.manager.deliverReply(runId, taskId, message)) throw new Error(`No pending question for ${runId}/${taskId}.`);
+		if (!this.manager.deliverReply(runId, taskId, message)) {
+			throw new Error(`No pending question for ${runId}/${taskId}.`);
+		}
 		return cloneRun(this.manager.getRun(runId)!);
 	}
 
@@ -48,8 +57,8 @@ export class SubagentController {
 	}
 }
 
-export function createSubagentController(pi: ExtensionAPI): SubagentController {
-	return new SubagentController(new SubagentManager(pi));
+export function createSubagentController(pi: ExtensionAPI | any): SubagentController {
+	return new SubagentController(getOrCreateSubagentManager(pi));
 }
 
 export type { RunDetails, RunSnapshot, SubagentParamsShape, SubagentRuntime, TaskSnapshot };

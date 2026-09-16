@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { compactLines, formatUsage, makeSummary, statusIcon, taskLine, truncateText } from "./format.ts";
 import { waveNotation } from "./graph.ts";
-import { cloneRun, type ParkedMsg, SubagentManager } from "./manager.ts";
+import { cloneRun, getOrCreateSubagentManager, type ParkedMsg, type SubagentManager } from "./manager.ts";
 import { createPeekPane, type PeekTask } from "./peek.ts";
 import {
 	AwaitParam,
@@ -17,8 +17,35 @@ import {
 import { type RunDetails, type RunSnapshot, TERMINAL } from "./types.ts";
 import { cleanupMerged, ownerAlive, reapDeadWorktrees, repoRoot, sweepStale } from "./worktree.ts";
 
+export type { RunDetails, RunSnapshot, SubagentParamsShape, SubagentRuntime, TaskSnapshot } from "./api.ts";
+export { createSubagentController, SubagentController } from "./api.ts";
+export { getOrCreateSubagentManager } from "./manager.ts";
+
+const INITIALIZED_KEY = Symbol.for("@imrobbyrc/pi-core-subagent.initialized");
+const INITIALIZED_SET_KEY = Symbol.for("@imrobbyrc/pi-core-subagent.initializedSet");
+
+function isAlreadyInitialized(pi: ExtensionAPI): boolean {
+	if ((pi as any)[INITIALIZED_KEY]) return true;
+	const g = globalThis as unknown as { [INITIALIZED_SET_KEY]?: WeakSet<ExtensionAPI> };
+	return g[INITIALIZED_SET_KEY]?.has(pi) ?? false;
+}
+
+function markInitialized(pi: ExtensionAPI): void {
+	try {
+		(pi as any)[INITIALIZED_KEY] = true;
+	} catch {}
+	const g = globalThis as unknown as { [INITIALIZED_SET_KEY]?: WeakSet<ExtensionAPI> };
+	if (!g[INITIALIZED_SET_KEY]) {
+		g[INITIALIZED_SET_KEY] = new WeakSet<ExtensionAPI>();
+	}
+	g[INITIALIZED_SET_KEY]!.add(pi);
+}
+
 export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
-	const manager = existingManager ?? new SubagentManager(pi);
+	if (isAlreadyInitialized(pi)) return;
+	markInitialized(pi);
+
+	const manager = existingManager ?? getOrCreateSubagentManager(pi);
 
 	const openPeek = async (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;

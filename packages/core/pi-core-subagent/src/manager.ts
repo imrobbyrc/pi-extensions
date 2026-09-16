@@ -255,6 +255,42 @@ export interface LiveChild {
 	reply?: (message: string) => void;
 }
 
+const MANAGER_REGISTRY_SYMBOL = Symbol.for("@imrobbyrc/pi-core-subagent.managerRegistry");
+const MANAGER_SYMBOL = Symbol.for("@imrobbyrc/pi-core-subagent.manager");
+
+function getGlobalManagerRegistry(): WeakMap<ExtensionAPI, SubagentManager> {
+	const g = globalThis as unknown as { [MANAGER_REGISTRY_SYMBOL]?: WeakMap<ExtensionAPI, SubagentManager> };
+	if (!g[MANAGER_REGISTRY_SYMBOL]) {
+		g[MANAGER_REGISTRY_SYMBOL] = new WeakMap<ExtensionAPI, SubagentManager>();
+	}
+	return g[MANAGER_REGISTRY_SYMBOL]!;
+}
+
+export function getOrCreateSubagentManager(
+	pi: ExtensionAPI | any,
+	herdrRunner?: HerdrCommandRunner,
+	configPath?: string,
+): SubagentManager {
+	const direct = (pi as any)[MANAGER_SYMBOL] as SubagentManager | undefined;
+	if (direct) return direct;
+
+	const registry = getGlobalManagerRegistry();
+	const fromRegistry = registry.get(pi);
+	if (fromRegistry) {
+		try {
+			(pi as any)[MANAGER_SYMBOL] = fromRegistry;
+		} catch {}
+		return fromRegistry;
+	}
+
+	const manager = new SubagentManager(pi, herdrRunner, configPath);
+	registry.set(pi, manager);
+	try {
+		(pi as any)[MANAGER_SYMBOL] = manager;
+	} catch {}
+	return manager;
+}
+
 export class SubagentManager {
 	private runs = new Map<string, RunSnapshot>();
 	private settlers = new Map<string, true>();

@@ -288,6 +288,18 @@ export async function selectModelExact(client: CdpClient, browserModelLabel: str
   if (confirmed !== true) throw new Error(`model_confirmation_failed: "${browserModelLabel}" is not the confirmed selected model.`);
 }
 
+function effortMatches(actual: string, requested: string): boolean {
+  const aliases: Record<string, string[]> = {
+    instant: ["light"],
+    light: ["instant"],
+    high: ["heavy"],
+    heavy: ["high"]
+  };
+  const actualLabel = actual.trim().toLowerCase();
+  const requestedLabel = requested.trim().toLowerCase();
+  return actualLabel === requestedLabel || aliases[requestedLabel]?.includes(actualLabel) === true;
+}
+
 export async function selectEffortExact(client: CdpClient, effort: string): Promise<void> {
   // Label-driven tick walk: slider positions are model-specific (totals and labels
   // vary), so positions mean nothing globally. Click each tick, read the authoritative
@@ -298,7 +310,7 @@ export async function selectEffortExact(client: CdpClient, effort: string): Prom
     throw new Error(`effort_selection_failed: picker did not open for "${effort}".`);
   }
   const initial = await readEffortDescription(client);
-  if (initial && initial.label.toLowerCase() === effort.toLowerCase()) {
+  if (initial && effortMatches(initial.label, effort)) {
     await closeMenus(client);
     return; // already at target
   }
@@ -317,7 +329,7 @@ export async function selectEffortExact(client: CdpClient, effort: string): Prom
         if (!(await openModelPicker(client))) return null;
         return readEffortDescription(client);
       })());
-      if (desc && desc.label.toLowerCase() === effort.toLowerCase()) {
+      if (desc && effortMatches(desc.label, effort)) {
         await closeMenus(client);
         return;
       }

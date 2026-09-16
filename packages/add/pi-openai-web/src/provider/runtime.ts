@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import CDP from "chrome-remote-interface";
 import type { HarnessConfig } from "../types.js";
-import { extractConversationId } from "../browser/chatgpt.js";
+import { extractConversationId, isValidConversationId, toTemporaryChatUrl } from "../browser/chatgpt.js";
 import type { OpenAIWebModelCatalog } from "./catalog.js";
 import { treeToMarkdown, type DomTreeNode } from "./answer.js";
 import {
-  attach, enablePage, enableTemporaryChatBestEffort, evalJson,
+  attach, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
   readTurnState, serializeAssistantTurn, sleep, stopGeneration, submitPrompt,
   waitForComposer, waitForConversationUrl, type CdpClient, type TurnDomState
 } from "./page.js";
@@ -211,6 +211,7 @@ export class OpenAIWebRuntime {
     this.turn = undefined;
     this.contextTokens = 0;
     this.leaseEpoch += 1;
+    await this.deps.resumeStore?.clear().catch(() => {});
     if (!conversation) return;
     try { await conversation.client.close(); } catch { /* already gone */ }
     try {
@@ -246,10 +247,13 @@ export class OpenAIWebRuntime {
   private async persistResume(conversation: ProviderConversation): Promise<void> {
     const store = this.deps.resumeStore;
     if (!store) return;
+    const conversationId = (conversation.conversationId && isValidConversationId(conversation.conversationId))
+      ? conversation.conversationId
+      : undefined;
     const metadata: ProviderResumeMetadata = {
       schemaVersion: 1,
       targetId: conversation.targetId,
-      ...(conversation.conversationId ? { conversationId: conversation.conversationId } : {}),
+      ...(conversationId ? { conversationId } : {}),
       descriptorKey: conversation.descriptorKey,
       branchKey: conversation.branchKey,
       leaseKey: conversation.leaseKey,
@@ -266,10 +270,25 @@ export class OpenAIWebRuntime {
     const wantedKey = descriptorKey(descriptor.browserModelLabel, descriptor.effort);
     const branchKey = this.deps.getBranchKey();
     if (metadata.descriptorKey !== wantedKey || metadata.branchKey !== branchKey) return undefined;
+
+    // Never resume stale or invalid conversation IDs
+    if (metadata.conversationId && !isValidConversationId(metadata.conversationId)) {
+      await this.deps.resumeStore?.clear().catch(() => {});
+      this.emit("provider_reconnect_fallback", { reason: "invalid_session_conversation_id" });
+      return undefined;
+    }
+
     try {
       const client = await attach(this.config, metadata.targetId);
       await enablePage(client);
       await waitForComposer(client);
+
+      // Reconnected target must be a valid Temporary Chat target
+      const isTemp = await isTemporaryChat(client);
+      if (!isTemp) {
+        throw new Error("target_not_temporary_chat");
+      }
+
       this.leaseEpoch = metadata.epoch;
       const conversation: ProviderConversation = {
         targetId: metadata.targetId,
@@ -293,7 +312,8 @@ export class OpenAIWebRuntime {
 
   private async createConversation(descriptor: OpenAIWebModelDescriptor): Promise<ProviderConversation> {
     await this.deps.ensureBrowser();
-    const target = await CDP.New({ host: this.config.cdpHost, port: this.config.cdpPort, url: this.config.chatgptUrl });
+    const tempUrl = toTemporaryChatUrl(this.config.chatgptUrl);
+    const target = await CDP.New({ host: this.config.cdpHost, port: this.config.cdpPort, url: tempUrl });
     if (!target.id) throw new Error("CDP created provider tab without targetId; no prompt was sent.");
     this.emit("provider_target_created", { targetId: target.id, model: descriptor.id });
     const client = await attach(this.config, target.id);
@@ -301,7 +321,10 @@ export class OpenAIWebRuntime {
       await enablePage(client);
       await client.Page.bringToFront().catch(() => {});
       await waitForComposer(client);
-      await enableTemporaryChatBestEffort(client);
+      const isTemp = await ensureTemporaryChat(client, this.config.chatgptUrl);
+      if (!isTemp) {
+        throw new Error("ChatGPT Temporary Chat could not be confirmed. Enable Temporary Chat in newly-created provider tab, then retry.");
+      }
       await this.selectExact(client, descriptor);
       const attached = await this.attachAppBestEffort(client, this.config.chatgptAppName);
       this.emit(attached ? "provider_agent_attached" : "provider_agent_attach_unconfirmed", { app: this.config.chatgptAppName });
@@ -329,6 +352,16 @@ export class OpenAIWebRuntime {
     const branchKey = this.deps.getBranchKey();
     if (this.conversation && (this.conversation.descriptorKey !== wantedKey || this.conversation.branchKey !== branchKey || this.conversation.epoch !== this.leaseEpoch)) {
       await this.resetConversation(this.conversation.descriptorKey !== wantedKey ? "descriptor_changed" : this.conversation.branchKey !== branchKey ? "pi_branch_changed" : "lease_epoch_changed");
+    }
+    if (this.conversation) {
+      if (this.conversation.conversationId && !isValidConversationId(this.conversation.conversationId)) {
+        await this.resetConversation("invalid_conversation_id");
+      } else {
+        const isTemp = await isTemporaryChat(this.conversation.client).catch(() => false);
+        if (!isTemp) {
+          await this.resetConversation("target_not_temporary_chat");
+        }
+      }
     }
     if (!this.conversation) {
       // Reconnect first so a Pi restart can recover an existing target even when
@@ -388,7 +421,7 @@ export class OpenAIWebRuntime {
       controller.touchProgress();
       const url = await waitForConversationUrl(conversation.client);
       const conversationId = extractConversationId(url);
-      if (conversationId) conversation.conversationId = conversationId;
+      if (conversationId && isValidConversationId(conversationId)) conversation.conversationId = conversationId;
       conversation.bootstrapped = true;
       conversation.syncedMessageCount = context.messages.length;
       await this.persistResume(conversation);
@@ -459,8 +492,11 @@ export class OpenAIWebRuntime {
 
   private async record(conversation: ProviderConversation, type: import("./session-store.js").SessionRecord["type"], content: string, toolName?: string): Promise<void> {
     if (!this.deps.sessionStore) return;
+    const conversationId = (conversation.conversationId && isValidConversationId(conversation.conversationId))
+      ? conversation.conversationId
+      : conversation.targetId;
     await this.deps.sessionStore.append({
-      conversationId: conversation.conversationId ?? conversation.targetId,
+      conversationId,
       timestamp: Date.now(),
       type,
       content: content.slice(0, 50_000),
@@ -511,7 +547,7 @@ export class OpenAIWebRuntime {
     }
     const url = await waitForConversationUrl(fresh.client);
     const conversationId = extractConversationId(url);
-    if (conversationId) fresh.conversationId = conversationId;
+    if (conversationId && isValidConversationId(conversationId)) fresh.conversationId = conversationId;
     fresh.bootstrapped = true;
     fresh.syncedMessageCount = syncedMessageCount ?? previous.syncedMessageCount;
     this.conversation = fresh;

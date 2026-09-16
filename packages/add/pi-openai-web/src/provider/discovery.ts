@@ -2,7 +2,8 @@ import CDP from "chrome-remote-interface";
 import type { HarnessConfig } from "../types.js";
 import type { DiscoveredModel } from "./types.js";
 import { readExtensionPickerState } from "./extension-discovery.js";
-import { attach, enablePage, enableTemporaryChatBestEffort, evalJson, sleep, waitFor, waitForComposer, type CdpClient } from "./page.js";
+import { toTemporaryChatUrl } from "../browser/chatgpt.js";
+import { attach, enablePage, ensureTemporaryChat, evalJson, sleep, waitFor, waitForComposer, type CdpClient } from "./page.js";
 import {
   closeMenus, enumerateModelRows, FIND_EFFORT_POWER_ITEM, FIND_TRIGGER,
   openModelPicker, readEffortDescription, readLockedPositions,
@@ -95,14 +96,14 @@ async function enumerateEffortOptions(client: CdpClient, log?: (message: string)
  * Discover all selectable model/effort combinations on a dedicated probe target.
  */
 export async function discoverModelCatalog(config: HarnessConfig, log?: (message: string) => void): Promise<DiscoveredModel[]> {
-  const target = await CDP.New({ host: config.cdpHost, port: config.cdpPort, url: config.chatgptUrl });
+  const target = await CDP.New({ host: config.cdpHost, port: config.cdpPort, url: toTemporaryChatUrl(config.chatgptUrl) });
   if (!target.id) throw new Error("CDP created catalog probe tab without targetId.");
   let client: CdpClient | undefined;
   try {
     client = await attach(config, target.id);
     await enablePage(client);
     await waitForComposer(client);
-    await enableTemporaryChatBestEffort(client);
+    await ensureTemporaryChat(client, config.chatgptUrl);
     // Temporary Chat toggling can remount the composer; wait until the picker trigger is back.
     if (!(await waitFor(client, `() => (${FIND_TRIGGER}) !== null`, 10_000))) {
       throw new Error("ChatGPT model/effort picker trigger did not appear after Temporary Chat setup.");

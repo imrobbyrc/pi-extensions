@@ -44,6 +44,38 @@ export function isAppAttachmentConfirmed(snapshot: AppAttachmentSnapshot, appNam
   return Boolean(name) && snapshot.signals.some((signal) => signal.toLowerCase().includes(name));
 }
 
+export const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+
+export function isValidConversationId(conversationId: string | undefined | null): boolean {
+  if (!conversationId || typeof conversationId !== "string") return false;
+  if (conversationId.startsWith("WEB:") || conversationId.includes(":")) return false;
+  return SESSION_ID_PATTERN.test(conversationId);
+}
+
+export function toTemporaryChatUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.pathname = "/";
+    parsed.searchParams.set("temporary-chat", "true");
+    return parsed.toString();
+  } catch {
+    const hasQuery = url.includes("?");
+    return `${url}${hasQuery ? "&" : "?"}temporary-chat=true`;
+  }
+}
+
+export function isTemporaryChatUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (/\/c\/[^/?#]+/i.test(parsed.pathname)) return false;
+    return parsed.searchParams.get("temporary-chat") === "true";
+  } catch {
+    return false;
+  }
+}
+
 export function extractConversationId(url: string): string | undefined {
-  return url.match(/\/c\/([^/?#]+)/i)?.[1];
+  const candidate = url.match(/\/c\/([^/?#]+)/i)?.[1];
+  if (!candidate || !isValidConversationId(candidate)) return undefined;
+  return candidate;
 }

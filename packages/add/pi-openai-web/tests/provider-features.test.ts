@@ -21,6 +21,12 @@ test("provider resume metadata is durable, validated, and clearable", async () =
     const memory = new MemoryProviderResumeStore();
     await memory.save(metadata);
     assert.equal((await memory.load())?.targetId, "tab-1");
+    // Conversation identity metadata is durable and preserved across saves
+    const withConv = { ...metadata, conversationId: "valid-conv-123" };
+    await store.save(withConv);
+    const loadedWithConv = await store.load();
+    assert.equal(loadedWithConv?.conversationId, "valid-conv-123");
+    assert.equal(loadedWithConv?.targetId, "tab-1");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

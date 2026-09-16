@@ -1,6 +1,6 @@
 import CDP from "chrome-remote-interface";
 import type { HarnessConfig } from "../types.js";
-import { extractConversationId } from "../browser/chatgpt.js";
+import { extractConversationId, isTemporaryChatUrl, toTemporaryChatUrl } from "../browser/chatgpt.js";
 
 /**
  * Reusable low-level ChatGPT page primitives shared by catalog discovery and
@@ -33,7 +33,7 @@ export interface TurnDomState {
 }
 
 export async function newChatGptTarget(config: HarnessConfig): Promise<{ id?: string }> {
-  return CDP.New({ host: config.cdpHost, port: config.cdpPort, url: config.chatgptUrl });
+  return CDP.New({ host: config.cdpHost, port: config.cdpPort, url: toTemporaryChatUrl(config.chatgptUrl) });
 }
 
 export async function attach(config: HarnessConfig, targetId: string): Promise<CdpClient> {
@@ -155,10 +155,12 @@ export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
 }
 
 export async function waitForConversationUrl(client: CdpClient, timeoutMs = 10_000): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
   let url = await currentUrl(client);
+  if (isTemporaryChatUrl(url)) return url;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     url = await currentUrl(client);
+    if (isTemporaryChatUrl(url)) return url;
     if (extractConversationId(url)) return url;
     await sleep(250);
   }
@@ -175,16 +177,67 @@ export async function stopGeneration(client: CdpClient): Promise<boolean> {
   }`)) === true;
 }
 
-/** Best-effort Temporary Chat enable; provider conversations default to Temporary. */
-export async function enableTemporaryChatBestEffort(client: CdpClient): Promise<boolean> {
+/** Check whether the target page is in Temporary Chat mode. */
+export async function isTemporaryChat(client: CdpClient): Promise<boolean> {
+  const info = await evalJson<{
+    hasTurnOff: boolean;
+    hasSaveChat: boolean;
+    hasTempParam: boolean;
+    isNormalChatUrl: boolean;
+  }>(client, `() => {
+    const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
+    const hasSaveChat = Boolean(document.querySelector('button[aria-label="Save chat"]'));
+    const hasTempParam = new URL(location.href).searchParams.get("temporary-chat") === "true";
+    const isNormalChatUrl = /\\/c\\/[^/?#]+/i.test(location.href);
+    return {
+      hasTurnOff,
+      hasSaveChat,
+      hasTempParam,
+      isNormalChatUrl
+    };
+  }`);
+  if (!info) return false;
+  if (info.isNormalChatUrl) return false;
+  return info.hasTurnOff || info.hasSaveChat || info.hasTempParam;
+}
+
+/** Ensure the target page is in Temporary Chat mode. Fails closed if cannot be confirmed. */
+export async function ensureTemporaryChat(client: CdpClient, chatgptUrl?: string): Promise<boolean> {
+  if (await isTemporaryChat(client)) return true;
+
+  // 1. Try clicking visible "Temporary chat" toggle button if present
   const clicked = await evalJson<boolean>(client, `() => {
     const off = [...document.querySelectorAll('button[aria-label="Temporary chat"]')].find(el => el.offsetParent !== null);
     if (!off) return false;
     off.click();
     return true;
   }`);
-  if (clicked !== true) return false;
-  return waitFor(client, `() => Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'))`, 3_000);
+  if (clicked === true) {
+    const confirmed = await waitFor(client, `() => {
+      const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
+      const hasSave = Boolean(document.querySelector('button[aria-label="Save chat"]'));
+      return hasTurnOff || hasSave;
+    }`, 3_000);
+    if (confirmed) return true;
+  }
+
+  // 2. If still not in temporary chat, navigate directly to temporary chat URL
+  const targetUrl = toTemporaryChatUrl(chatgptUrl ?? "https://chatgpt.com/");
+  await client.Page.navigate({ url: targetUrl });
+  await waitForComposer(client);
+
+  return waitFor(client, `() => {
+    const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
+    const hasSaveChat = Boolean(document.querySelector('button[aria-label="Save chat"]'));
+    const hasTempParam = new URL(location.href).searchParams.get("temporary-chat") === "true";
+    const isNormalChatUrl = /\\/c\\/[^/?#]+/i.test(location.href);
+    return !isNormalChatUrl && (hasTurnOff || hasSaveChat || hasTempParam);
+  }`, 5_000);
+}
+
+/** Best-effort Temporary Chat enable; backwards-compatible alias delegating to ensureTemporaryChat. */
+export async function enableTemporaryChatBestEffort(client: CdpClient): Promise<boolean> {
+  return ensureTemporaryChat(client);
 }
 
 /** Clear the composer text (used when a leftover draft must not leak into the next submit). */
