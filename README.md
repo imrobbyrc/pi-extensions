@@ -22,11 +22,6 @@ packages/
 │   ├── pi-core-tps-stats/
 │   └── pi-core-vision/
 ├── add/         → optional/extra extensions (opt in)
-│   ├── pi-add-9router/
-│   ├── pi-add-code-diagnostic/
-│   ├── pi-add-commandcode/
-│   ├── pi-add-vantis/
-│   └── pi-add-wafer/
 └── pi-toolset/  → installer: manage the installed set
 ```
 
@@ -70,11 +65,6 @@ pi -e npm:@arhen/pi-core-vision
 
 | Package | Purpose for |
 | --- | --- |
-| [`@arhen/pi-add-9router`](packages/add/pi-add-9router) | 9router provider registration + model discovery |
-| [`@arhen/pi-add-code-diagnostic`](packages/add/pi-add-code-diagnostic) | Repo-scoped typecheck/lint diagnostics |
-| [`@arhen/pi-add-commandcode`](packages/add/pi-add-commandcode) | Command Code Provider API: 58 models, dual-endpoint routing, ZDR |
-| [`@arhen/pi-add-vantis`](packages/add/pi-add-vantis) | Vantis integration |
-| [`@arhen/pi-add-wafer`](packages/add/pi-add-wafer) | Wafer integration |
 
 ## 🔧 Manage the set
 

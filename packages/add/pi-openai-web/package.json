@@ -28,7 +28,7 @@
     "gui": "tsx scripts/demo-orchestrator-gui.ts"
   },
   "dependencies": {
-    "@imrobbyrc/pi-core-subagent": "workspace:*",
+    "@imrobbyrc/pi-core-subagent": "file:../../core/pi-core-subagent",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "chrome-remote-interface": "^0.33.3",
