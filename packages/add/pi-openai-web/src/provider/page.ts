@@ -27,6 +27,8 @@ export interface TurnDomState {
   userIdentities: string[];
   responseIdentities: string[];
   completionActionVisible: boolean;
+  /** Identity owning visible completion action, when available. */
+  completionResponseIdentity?: string;
   stopVisible: boolean;
   busy: boolean;
   url: string;
@@ -148,6 +150,7 @@ export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
       userIdentities,
       responseIdentities,
       completionActionVisible: Boolean(completion),
+      completionResponseIdentity: completion ? last?.getAttribute('data-turn-id') ?? undefined : undefined,
       stopVisible: Boolean(stop),
       busy,
       url: location.href
@@ -231,9 +234,8 @@ export async function ensureTemporaryChat(client: CdpClient, chatgptUrl?: string
 
   return waitFor(client, `() => {
     const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
-    const hasSaveChat = Boolean(document.querySelector('button[aria-label="Save chat"]'));
     const isNormalChatUrl = /\\/c\\/[^/?#]+/i.test(location.href);
-    return !isNormalChatUrl && (hasTurnOff || hasSaveChat);
+    return !isNormalChatUrl && hasTurnOff;
   }`, 5_000);
 }
 

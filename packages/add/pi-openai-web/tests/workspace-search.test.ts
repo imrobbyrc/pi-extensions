@@ -65,6 +65,19 @@ test("fallback search fails closed on globs it cannot faithfully enforce", async
   }
 });
 
+test("fallback search preserves ripgrep case sensitivity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-search-case-"));
+  try {
+    await writeFile(join(dir, "case.txt"), "Needle only\n");
+    await withRipgrepUnavailable(async () => {
+      const result = await searchWorkspace(dir, "needle", 50, "*.txt");
+      assert.doesNotMatch(result, /case\.txt/, "fallback must match rg's case-sensitive default");
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("glob still filters through ripgrep when it is available", async () => {
   const dir = await makeWorkspace();
   try {

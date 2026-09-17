@@ -108,7 +108,7 @@ test("ensureTemporaryChat fails closed when navigation lands on a non-temporary 
   const { client, navigations } = miniBrowser({
     href: "https://chatgpt.com/",
     turnOffVisible: false,
-    saveChatVisible: false,
+    saveChatVisible: true,
     temporaryToggleVisible: false,
     composerVisible: true
   });

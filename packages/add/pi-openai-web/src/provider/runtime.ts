@@ -706,7 +706,9 @@ export class OpenAIWebRuntime {
         }
         // Copy action is ChatGPT's semantic completion signal; text stability alone can
         // observe a remounted/virtualized partial turn.
-        if (state.completionActionVisible && stablePolls >= 2 && turnMarkdown.length > 0) {
+        if (state.completionActionVisible
+          && state.completionResponseIdentity === identity
+          && stablePolls >= 2 && turnMarkdown.length > 0) {
           controller.transition("completed");
           this.emit("provider_completed", { model: controller.descriptor.id, chars: turnMarkdown.length });
           return { kind: "completed", markdown: turnMarkdown };

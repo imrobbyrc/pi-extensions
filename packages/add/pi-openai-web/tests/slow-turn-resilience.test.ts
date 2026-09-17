@@ -80,7 +80,7 @@ interface Frame { state: TurnDomState; tree?: unknown }
 const spinner = (): Frame => ({ state: domState({ stopVisible: true, busy: true }) });
 /** Completed frame: response rendered, copy action visible (ChatGPT completion signal). */
 const completedFrame = (identity: string, text: string): Frame => ({
-  state: domState({ responseIdentities: [identity], completionActionVisible: true }),
+  state: domState({ responseIdentities: [identity], completionActionVisible: true, completionResponseIdentity: identity }),
   tree: { tag: "p", children: [{ tag: "#text", text }] }
 });
 
@@ -323,7 +323,7 @@ test("same-length snapshot rewrites reach onText so the output path can replace 
       tree: { tag: "p", children: [{ tag: "#text", text }] }
     });
     const doneText = (text: string): Frame => ({
-      state: domState({ responseIdentities: ["r1"], completionActionVisible: true }),
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
       tree: { tag: "p", children: [{ tag: "#text", text }] }
     });
     const h = makeWatch(

@@ -101,7 +101,7 @@ interface Frame { state: TurnDomState; tree?: unknown }
 const spinner = (): Frame => ({ state: domState({ stopVisible: true, busy: true }) });
 const domQuiet = (): Frame => ({ state: domState({}) });
 const completedFrame = (identity: string, text: string): Frame => ({
-  state: domState({ responseIdentities: [identity], completionActionVisible: true }),
+  state: domState({ responseIdentities: [identity], completionActionVisible: true, completionResponseIdentity: identity }),
   tree: { tag: "p", children: [{ tag: "#text", text }] }
 });
 const busyText = (identity: string, text: string): Frame => ({

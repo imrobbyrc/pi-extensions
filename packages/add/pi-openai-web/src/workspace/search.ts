@@ -100,7 +100,7 @@ function compileGlob(glob: string): (relativePath: string) => boolean {
 
 async function fallbackSearch(root: string, query: string, maxResults: number, glob?: string): Promise<string> {
   const results: string[] = [];
-  const needle = query.toLowerCase();
+  const needle = query;
   const globMatches = glob ? compileGlob(glob) : undefined;
 
   async function walk(dir: string): Promise<void> {
@@ -122,7 +122,7 @@ async function fallbackSearch(root: string, query: string, maxResults: number, g
         const lines = raw.toString("utf8").split(/\r?\n/);
         for (let i = 0; i < lines.length && results.length < maxResults; i += 1) {
           const line = lines[i] ?? "";
-          if (line.toLowerCase().includes(needle)) {
+          if (line.includes(needle)) {
             results.push(`${relative(root, full)}:${i + 1}: ${line}`);
           }
         }
