@@ -135,7 +135,9 @@ export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
     const messages = raw.filter(el => !raw.some(other => other !== el && other.contains(el)));
     const last = messages.at(-1);
     const stop = [...document.querySelectorAll('${STOP_BUTTON_SELECTOR}')].find(el => el.offsetParent !== null);
-    const completion = [...document.querySelectorAll('${COMPLETION_ACTION_SELECTOR}')].find(el => el.offsetParent !== null);
+    // Bind copy/completion action to newest assistant message. A stale copy
+    // button from an earlier turn must not complete a partially rendered turn.
+    const completion = last?.querySelector('${COMPLETION_ACTION_SELECTOR}');
     const busy = last ? Boolean(
       last.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') ||
       last.getAttribute('aria-busy') === 'true'
