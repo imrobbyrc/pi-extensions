@@ -81,6 +81,13 @@ export const HERDR_TOOL_DESCRIPTION = [
  * Strict frozen provider tool allowlist: bounded read/list/search/repo-map/
  * git status/diff plus one Pi-native herdr tool. Never subagent/bash/edit/write.
  */
+export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; handoff?: string }): void {
+  if (!input.goal) throw new Error("herdr run requires goal.");
+  if (!input.workers?.length) throw new Error("herdr run requires 1-4 workers.");
+  if (!input.handoff?.trim()) throw new Error("herdr run requires planning handoff.");
+  parseHerdrHandoff(input.handoff);
+}
+
 export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity }) {
   return (): McpServer => {
     const server = new McpServer({ name: "pi-harness", version: "1.0.0" });
@@ -182,9 +189,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
       },
       track(async ({ action, goal, workers, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
         if (action === "run") {
-          if (!goal) throw new Error("herdr run requires goal.");
-          if (!workers?.length) throw new Error("herdr run requires 1-4 workers.");
-          if (handoff) parseHerdrHandoff(handoff); // fail closed on malformed envelopes
+          validateHerdrRunInput({ goal, workers, handoff });
           const mapped: HerdrWorker[] = workers.map((worker: { id: string; objective: string; owns: string[]; depends_on: string[] }) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.depends_on }));
           const run = await deps.subagent.run({ goal, workers: mapped, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}), ...(handoff ? { handoff } : {}) });
           return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
