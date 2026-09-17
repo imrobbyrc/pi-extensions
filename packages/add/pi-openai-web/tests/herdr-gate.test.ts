@@ -7,7 +7,7 @@ const validHandoff = JSON.stringify({
   taskId: "task-1",
   planFingerprint: "plan-1",
   gates: { graph: "graph", handoff: "handoff", critique: "critique" },
-  workers: [{ id: "w1" }],
+  workers: [{ id: "w1", objective: "fix", owns: ["src"], dependsOn: [] }],
   authority: "Pi"
 });
 
@@ -17,4 +17,6 @@ test("herdr run requires complete planning handoff", () => {
   assert.throws(() => validateHerdrRunInput(base), /handoff/);
   assert.throws(() => validateHerdrRunInput({ ...base, handoff: "{}" }), /handoff/);
   assert.doesNotThrow(() => validateHerdrRunInput({ ...base, handoff: validHandoff }));
+  assert.throws(() => validateHerdrRunInput({ ...base, workers: [{ ...base.workers[0], id: "w2" }], handoff: validHandoff }), /workers/);
+  assert.throws(() => validateHerdrRunInput({ ...base, handoff: validHandoff.replace('task-1', '') }), /handoff|task/);
 });

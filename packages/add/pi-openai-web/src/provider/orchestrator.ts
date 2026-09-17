@@ -44,7 +44,10 @@ export function buildHerdrHandoff(input: { taskId: string; planFingerprint: stri
 export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: unknown[] } {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
-    if (value.protocol !== "pi-provider-herdr-handoff-v1" || value.authority !== "Pi" || typeof value.taskId !== "string" || typeof value.planFingerprint !== "string" || !Array.isArray(value.workers)) throw new Error();
+    if (value.protocol !== "pi-provider-herdr-handoff-v1" || value.authority !== "Pi"
+      || typeof value.taskId !== "string" || !value.taskId.trim()
+      || typeof value.planFingerprint !== "string" || !value.planFingerprint.trim()
+      || !Array.isArray(value.workers) || value.workers.length === 0) throw new Error();
     const gates = value.gates as OrchestrationGates | undefined;
     assertOrchestrationGates(gates);
     return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers: value.workers };

@@ -85,7 +85,21 @@ export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[
   if (!input.goal) throw new Error("herdr run requires goal.");
   if (!input.workers?.length) throw new Error("herdr run requires 1-4 workers.");
   if (!input.handoff?.trim()) throw new Error("herdr run requires planning handoff.");
-  parseHerdrHandoff(input.handoff);
+  const parsed = parseHerdrHandoff(input.handoff);
+  const normalize = (worker: unknown): string => {
+    const value = worker as Record<string, unknown>;
+    return JSON.stringify({
+      id: value.id,
+      objective: value.objective,
+      owns: value.owns,
+      dependsOn: value.dependsOn ?? value.depends_on
+    });
+  };
+  const expected = input.workers.map(normalize);
+  const actual = parsed.workers.map(normalize);
+  if (expected.length !== actual.length || expected.some((worker, index) => worker !== actual[index])) {
+    throw new Error("herdr run handoff workers do not match requested workers.");
+  }
 }
 
 export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity }) {
