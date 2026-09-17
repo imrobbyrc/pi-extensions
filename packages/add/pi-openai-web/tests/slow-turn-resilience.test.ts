@@ -164,7 +164,7 @@ test("active harness work does not falsely stall; turn completes after silent sp
     const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 10_000 });
     let polls = 0;
     // Harness (Herdr run / MCP tool) active for the first three polls — silent spinner.
-    const h = makeWatch(cfg, [spinner(), spinner(), spinner(), completedFrame("r1", "Recovered after silent harness work")], async () => {
+    const h = makeWatch(cfg, [{ state: domState({}) }, { state: domState({}) }, { state: domState({}) }, completedFrame("r1", "Recovered after silent harness work"), completedFrame("r1", "Recovered after silent harness work")], async () => {
       polls += 1;
       return polls <= 3;
     });
@@ -186,7 +186,7 @@ test("genuinely silent turn still fails with provider_turn_stalled", async () =>
   const dir = await mkdtemp(join(tmpdir(), "pi-grace-silent-"));
   try {
     const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 10_000 });
-    const h = makeWatch(cfg, [spinner()]); // no harness activity, spinner forever
+    const h = makeWatch(cfg, [{ state: domState({}) }]); // no browser or harness activity
     const outcome = await h.run();
     assert.equal(outcome.kind, "failed");
     assert.match(outcome.error ?? "", /provider_turn_stalled after 200ms without progress/);
@@ -198,11 +198,25 @@ test("genuinely silent turn still fails with provider_turn_stalled", async () =>
   }
 });
 
+test("busy browser state does not falsely stall without harness activity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-grace-browser-busy-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 1_000, turnTimeoutMs: 10_000 });
+    const h = makeWatch(cfg, [spinner(), spinner(), completedFrame("r1", "Finished thinking"), completedFrame("r1", "Finished thinking"), completedFrame("r1", "Finished thinking")]);
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.match(outcome.markdown ?? "", /Finished thinking/);
+    assert.equal(h.stopClickCount(), 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hard turn timeout still fires while harness stays active", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-grace-timeout-"));
   try {
     const cfg = baseConfig(dir, { stallTimeoutMs: 250, turnTimeoutMs: 1_500 });
-    const h = makeWatch(cfg, [spinner()], async () => true); // harness active forever
+    const h = makeWatch(cfg, [{ state: domState({}) }], async () => true); // harness active forever
     const outcome = await h.run();
     assert.equal(outcome.kind, "failed");
     assert.match(outcome.error ?? "", /provider_turn_timeout after 1500ms/);
@@ -239,7 +253,7 @@ test("settle grace is bounded: silent turn fails after grace elapses", async () 
   try {
     const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 10_000, stallGraceMs: 400 });
     let polls = 0;
-    const h = makeWatch(cfg, [spinner()], async () => {
+    const h = makeWatch(cfg, [{ state: domState({}) }], async () => {
       polls += 1;
       return polls <= 1; // one active poll, then silence forever
     });
@@ -261,7 +275,7 @@ test("settle grace re-arms after each renewed active bout and stays bounded", as
     // bout (active on polls 1 and 3) but must finally lapse into a real stall.
     const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 10_000, stallGraceMs: 1_500 });
     let polls = 0;
-    const h = makeWatch(cfg, [spinner()], async () => {
+    const h = makeWatch(cfg, [{ state: domState({}) }], async () => {
       polls += 1;
       return polls === 1 || polls === 3;
     });

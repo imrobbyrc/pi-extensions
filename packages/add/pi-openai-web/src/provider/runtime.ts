@@ -598,24 +598,6 @@ export class OpenAIWebRuntime {
         // Keep watcher alive briefly so completion/result propagation can finish.
         harnessSettledGraceUntil = Date.now() + stallGraceAfterHarnessMs;
       }
-      if (controller.stalled()) {
-        // Harness tool work (Herdr runs, in-flight MCP tool calls) legitimately
-        // produces no browser text while it executes. Poll durable harness
-        // activity before declaring provider failure. The hard turn timeout
-        // above still bounds this grace.
-        if (harnessActive) {
-          controller.touchProgress();
-          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "harness_active" });
-        } else if (harnessSettledGraceUntil > Date.now()) {
-          controller.touchProgress();
-          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "harness_settled" });
-        } else {
-          const error = `provider_turn_stalled after ${controller.stallTimeoutMs}ms without progress`;
-          await stopGeneration(conversation.client).catch(() => {});
-          controller.transition("failed", error);
-          return { kind: "failed", error };
-        }
-      }
       let state: TurnDomState;
       try {
         state = await readTurnState(conversation.client);
@@ -636,8 +618,8 @@ export class OpenAIWebRuntime {
 
       // Never complete while ChatGPT is busy (thinking/reasoning shimmer or stop button visible)
       if (state.stopVisible || state.busy) {
-        // A persistent spinner is not progress. Only new assistant text proves
-        // forward motion; otherwise the shorter stall timeout must win.
+        // Busy state refreshes the browser-activity heartbeat above. Only new
+        // assistant text drives completion; hard timeout still bounds a spinner.
         stablePolls = 0;
         if (turnMarkdown.length !== lastTextLength) {
           controller.touchProgress();
@@ -659,6 +641,29 @@ export class OpenAIWebRuntime {
           controller.transition("completed");
           this.emit("provider_completed", { model: controller.descriptor.id, chars: turnMarkdown.length });
           return { kind: "completed", markdown: turnMarkdown };
+        }
+      }
+
+      // Check stall after consuming this poll: new response text and busy state
+      // are valid browser progress signals and must refresh the heartbeat first.
+      if (state.stopVisible || state.busy) {
+        controller.touchProgress();
+      } else if (controller.stalled()) {
+        // Harness tool work (Herdr runs, in-flight MCP tool calls) legitimately
+        // produces no browser text while it executes. Poll durable harness
+        // activity before declaring provider failure. The hard turn timeout
+        // above still bounds this grace.
+        if (harnessActive) {
+          controller.touchProgress();
+          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "harness_active" });
+        } else if (harnessSettledGraceUntil > Date.now()) {
+          controller.touchProgress();
+          this.emit("provider_stall_grace", { turnId: controller.turnId, reason: "harness_settled" });
+        } else {
+          const error = `provider_turn_stalled after ${controller.stallTimeoutMs}ms without progress`;
+          await stopGeneration(conversation.client).catch(() => {});
+          controller.transition("failed", error);
+          return { kind: "failed", error };
         }
       }
       await sleep(600);
