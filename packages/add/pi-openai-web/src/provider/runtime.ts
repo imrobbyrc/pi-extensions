@@ -615,6 +615,9 @@ export class OpenAIWebRuntime {
         currentFullMarkdown = tree ? treeToMarkdown(tree as DomTreeNode) : "";
       }
       const turnMarkdown = currentFullMarkdown;
+      // Tool-call/reasoning turns can have a stable assistant identity but no
+      // text or busy marker yet. Identity proves provider turn is alive.
+      if (identity && turnMarkdown.length === 0) controller.touchProgress();
 
       // Never complete while ChatGPT is busy (thinking/reasoning shimmer or stop button visible)
       if (state.stopVisible || state.busy) {
