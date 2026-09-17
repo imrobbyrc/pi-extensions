@@ -15,6 +15,12 @@ export interface HarnessConfig {
   providerTurnTimeoutMs: number; providerStallTimeoutMs: number; providerToolWaitMs: number;
   /** Extra stall grace after harness (Herdr/MCP) activity settles; default 30s. */
   providerStallGraceMs?: number;
+  /** Adaptive watch polling: fast cadence while generating/visible changes; default 250ms. */
+  providerPollActiveMs?: number;
+  /** Adaptive watch polling: baseline cadence; default 600ms. */
+  providerPollIdleMs?: number;
+  /** Adaptive watch polling: slow cadence while harness tools run with no browser change; default 1200ms. */
+  providerPollHarnessWaitMs?: number;
   providerCompactionWarnTokens?: number; providerCompactionMaxTokens?: number; providerContextLimitTokens?: number; providerComposerLimitTokens?: number; providerSessionRetentionDays?: number;
   /** Headless auto-approval for herdr run actions. Default: fail closed. */
   harnessAutoApproveHerdrRun?: boolean;

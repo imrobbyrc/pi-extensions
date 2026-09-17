@@ -262,6 +262,68 @@ export async function setEffortPosition(client: CdpClient, position: number): Pr
   return final ? final.value : null;
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizedLabel(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function effortTokenOf(token: string): string {
+  return token.replace(/[^a-z]/gi, "").toLowerCase();
+}
+
+/**
+ * Fast-path proof predicate: the composer trigger label proves the exact
+ * model/effort selection only when the model label matches as a whole segment
+ * ("GPT-5" cannot prove inside "GPT-5.6") and the remainder carries exactly the
+ * requested effort level (aliases allowed). effort=null additionally requires no
+ * effort token at all. Any doubt is false, keeping the exact-selection fallback.
+ */
+export function pickerTriggerProvesExact(triggerLabel: string, browserModelLabel: string, effort: string | null): boolean {
+  const trigger = normalizedLabel(triggerLabel);
+  const model = normalizedLabel(browserModelLabel);
+  if (!trigger || !model) return false;
+  const match = trigger.match(new RegExp(`(?<![\\w.])(${escapeRegExp(model)})(?![\\w.])`));
+  if (!match || match.index === undefined) return false;
+  const remainder = `${trigger.slice(0, match.index)} ${trigger.slice(match.index + match[0].length)}`;
+  const tokens = remainder.split(/\s+/).map(effortTokenOf).filter(Boolean);
+  if (effort === null) return !tokens.some(token => EFFORT_LABEL.test(token));
+  return tokens.some(token => effortMatches(token, effort));
+}
+
+/** Read the composer picker trigger label without opening any menu; null when unreadable. */
+export async function readPickerTriggerLabel(client: CdpClient): Promise<string | null> {
+  // The trigger remounts while the composer settles; poll briefly, then give up
+  // so the caller can fall back to the (slower) exact selection path.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const label = await evalJson<string | null>(client, `/* piPickerTrigger */ (() => {
+      const slots = [...document.querySelectorAll('[data-composer-transition-slot="trailing"], [data-composer-transition-slot="end"]')];
+      const triggers = slots.flatMap(slot => [...slot.querySelectorAll('button[aria-haspopup="menu"]')]).filter(el => el.offsetParent !== null);
+      const trigger = triggers.find(el => ${EFFORT_LABEL.toString()}.test((el.textContent || '').trim())) ?? triggers[0];
+      return trigger ? ((trigger.textContent || '').replace(/\\s+/g, ' ').trim() || null) : null;
+    })()`);
+    if (label) return label;
+    await sleep(250);
+  }
+  return null;
+}
+
+/**
+ * Proven-exact selection probe for the picker fast path. Reads only the composer
+ * trigger; fails closed (false) on any doubt or probe error so selection always
+ * falls back to the exact picker walk.
+ */
+export async function selectionIsProvenExact(client: CdpClient, browserModelLabel: string, effort: string | null): Promise<boolean> {
+  try {
+    const label = await readPickerTriggerLabel(client);
+    return label !== null && pickerTriggerProvesExact(label, browserModelLabel, effort);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Select exactly one model by visible label and confirm via aria-checked readback.
  * Fails closed: ambiguity or a rejected selection is an error.

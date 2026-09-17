@@ -84,10 +84,17 @@ const completedFrame = (identity: string, text: string): Frame => ({
   tree: { tag: "p", children: [{ tag: "#text", text }] }
 });
 
+/** Mirrors the browser-side checksum so tree-derived revisions behave like the real probe. */
+function checksum(text: string): number {
+  let sum = 0;
+  for (let index = 0; index < text.length; index += 1) sum = (Math.imul(31, sum) + text.charCodeAt(index)) | 0;
+  return sum;
+}
+
 /**
  * Fake CDP client serving one scripted DOM frame per watch poll. The last frame
- * repeats forever. Discriminates the three evaluate sites used by watch():
- * readTurnState, serializeAssistantTurn, stopGeneration.
+ * repeats forever. Discriminates the evaluate sites used by watch():
+ * readTurnState, the cheap revision probe, serializeAssistantTurn, stopGeneration.
  */
 function fakeClient(frames: Frame[]) {
   if (frames.length === 0) throw new Error("script needs at least one frame");
@@ -99,6 +106,11 @@ function fakeClient(frames: Frame[]) {
         if (expression.includes("data-turn-id-container")) {
           current = frames.length > 1 ? frames.shift()! : frames[0]!;
           return { result: { value: current.state } };
+        }
+        if (expression.includes("piRevisionProbe")) {
+          if (current.tree === undefined || current.tree === null) return { result: { value: null } };
+          const json = JSON.stringify(current.tree);
+          return { result: { value: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" } } };
         }
         if (expression.includes("[data-turn-id=")) {
           return { result: { value: current.tree } };

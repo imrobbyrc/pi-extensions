@@ -260,6 +260,72 @@ export async function clearComposer(client: CdpClient): Promise<void> {
 }
 
 /**
+ * Cheap revision fingerprint of one assistant turn. Far lighter than a full
+ * DOM serialization: text length plus a rolling checksum catches growth, shrink,
+ * and same-length rewrites; structural fingerprints catch child/link/code-language
+ * changes that leave text identical. Contains no response bodies.
+ */
+export interface AssistantTurnRevision {
+  textLength: number;
+  textChecksum: number;
+  childCount: number;
+  linkChecksum: number;
+  languageKey: string;
+}
+
+/** Last serialized assistant turn with the revision it was serialized at. */
+export interface SerializedAssistantTurn {
+  identity: string;
+  revision: AssistantTurnRevision;
+}
+
+/** Read the cheap revision fingerprint of the assistant turn bound by identity. */
+export async function readAssistantTurnRevision(client: CdpClient, identity: string): Promise<AssistantTurnRevision | undefined> {
+  const revision = await evalJson<AssistantTurnRevision | null>(client, `/* piRevisionProbe */ (() => {
+    const wanted = ${JSON.stringify(identity)};
+    const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']');
+    if (!message) return null;
+    const checksum = (text) => {
+      let sum = 0;
+      for (let index = 0; index < text.length; index += 1) sum = (Math.imul(31, sum) + text.charCodeAt(index)) | 0;
+      return sum;
+    };
+    const text = message.textContent || '';
+    const links = [...message.querySelectorAll('a[href]')].map(link => link.getAttribute('href') || '').join('|');
+    const languageKey = [...message.querySelectorAll('code[class*="language-"]')].map(code => code.className).join('|');
+    return {
+      textLength: text.length,
+      textChecksum: checksum(text),
+      childCount: message.childElementCount,
+      linkChecksum: checksum(links),
+      languageKey
+    };
+  })()`);
+  return revision ?? undefined;
+}
+
+/**
+ * Decide whether the assistant turn must be fully (re)serialized: first sight,
+ * a changed binding identity, an unreadable revision (message gone/remounting —
+ * never skip), or any content/structural revision delta. An unchanged revision
+ * proves the last serialized snapshot is still current.
+ */
+export function assistantRevisionRequiresSerialization(
+  previous: SerializedAssistantTurn | undefined,
+  identity: string,
+  revision: AssistantTurnRevision | undefined
+): boolean {
+  if (!previous || previous.identity !== identity) return true;
+  if (!revision) return true;
+  const prior = previous.revision;
+  return prior.textLength !== revision.textLength
+    || prior.textChecksum !== revision.textChecksum
+    || prior.childCount !== revision.childCount
+    || prior.linkChecksum !== revision.linkChecksum
+    || prior.languageKey !== revision.languageKey;
+}
+
+/**
  * Serialize the assistant message at the given index into a JSON tree (answer.ts
  * converts it to markdown in Node). Index-based so ownership is decided by the caller.
  */

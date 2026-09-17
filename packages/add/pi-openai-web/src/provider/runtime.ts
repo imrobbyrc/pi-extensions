@@ -5,11 +5,12 @@ import { extractConversationId, isValidConversationId, toTemporaryChatUrl } from
 import type { OpenAIWebModelCatalog } from "./catalog.js";
 import { treeToMarkdown, type DomTreeNode } from "./answer.js";
 import {
-  attach, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
-  readTurnState, serializeAssistantTurn, sleep, stopGeneration, submitPrompt,
-  waitForComposer, waitForConversationUrl, type CdpClient, type TurnDomState
+  assistantRevisionRequiresSerialization, attach, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
+  readAssistantTurnRevision, readTurnState, serializeAssistantTurn, sleep, stopGeneration, submitPrompt,
+  waitForComposer, waitForConversationUrl, type AssistantTurnRevision, type CdpClient,
+  type SerializedAssistantTurn, type TurnDomState
 } from "./page.js";
-import { selectEffortExact, selectModelExact } from "./model-picker.js";
+import { selectEffortExact, selectionIsProvenExact, selectModelExact } from "./model-picker.js";
 import { ProviderTurnController } from "./turn.js";
 import { descriptorKey } from "./model-ids.js";
 import { canonicalHistoryFallback, checkpointIsFrom, compactionBootstrapPrompt, compactionDecision, DEFAULT_COMPACTION_CONFIG, estimateTokens, HANDOFF_BRIEF_PROMPT, parseCompactionCheckpoint, type CompactionConfig } from "./compaction.js";
@@ -23,6 +24,42 @@ export const BOOTSTRAP_LIMITS = {
   systemPromptMax: 4_000,
   userBatchMax: 16_000
 };
+
+/** Adaptive watch polling defaults: fast while generating, baseline otherwise. */
+export const DEFAULT_WATCH_POLL_CADENCE = {
+  activeMs: 250,
+  idleMs: 600,
+  harnessWaitMs: 1_200
+} as const;
+
+export interface WatchPollInputs {
+  stopVisible: boolean;
+  busy: boolean;
+  /** Fresh assistant text arrived on the previous poll. */
+  textChanged: boolean;
+  harnessActive: boolean;
+}
+
+export interface WatchPollCadenceConfig {
+  providerPollActiveMs?: number;
+  providerPollIdleMs?: number;
+  providerPollHarnessWaitMs?: number;
+}
+
+/**
+ * Adaptive watch cadence: poll fast while ChatGPT is actively generating (stop
+ * button, busy shimmer, or fresh text) and slower while harness tools run with
+ * no visible browser change. Pure: the hard timeout, stall grace, and
+ * cancellation checks run on every poll regardless of the chosen delay.
+ */
+export function watchPollDelayMs(inputs: WatchPollInputs, config?: WatchPollCadenceConfig): number {
+  const activeMs = config?.providerPollActiveMs ?? DEFAULT_WATCH_POLL_CADENCE.activeMs;
+  const idleMs = config?.providerPollIdleMs ?? DEFAULT_WATCH_POLL_CADENCE.idleMs;
+  const harnessWaitMs = config?.providerPollHarnessWaitMs ?? DEFAULT_WATCH_POLL_CADENCE.harnessWaitMs;
+  if (inputs.stopVisible || inputs.busy || inputs.textChanged) return activeMs;
+  if (inputs.harnessActive) return harnessWaitMs;
+  return idleMs;
+}
 
 export interface RuntimeActivity {
   (event: string, detail?: Record<string, unknown>): void;
@@ -222,6 +259,15 @@ export class OpenAIWebRuntime {
 
   /** Exact browser model/effort selection on the provider target. Fails closed. */
   async selectExact(client: CdpClient, descriptor: OpenAIWebModelDescriptor): Promise<void> {
+    // Fast path: skip the picker walk only when the composer trigger already
+    // proves the exact model/effort. Any doubt falls back to exact selection.
+    if (await selectionIsProvenExact(client, descriptor.browserModelLabel, descriptor.effort)) {
+      this.emit("provider_model_confirmed", { id: descriptor.id, label: descriptor.browserModelLabel, via: "trigger_fast_path" });
+      if (descriptor.effort !== null) {
+        this.emit("provider_effort_confirmed", { id: descriptor.id, effort: descriptor.effort, via: "trigger_fast_path" });
+      }
+      return;
+    }
     await selectModelExact(client, descriptor.browserModelLabel);
     this.emit("provider_model_confirmed", { id: descriptor.id, label: descriptor.browserModelLabel });
     if (descriptor.effort !== null) {
@@ -575,6 +621,7 @@ export class OpenAIWebRuntime {
     // replace text without changing length, and each new snapshot must reach
     // the output path so it can replace stale streamed text.
     let lastText = "";
+    let lastSerialized: SerializedAssistantTurn | undefined;
     let stablePolls = 0;
     let harnessWasActive = false;
     let harnessSettledGraceUntil = 0;
@@ -614,10 +661,26 @@ export class OpenAIWebRuntime {
       const identity = state.responseIdentities.find(candidate => !initialResponseIdentities.has(candidate));
       let currentFullMarkdown = "";
       if (identity) {
-        const tree = await serializeAssistantTurn(conversation.client, identity);
-        currentFullMarkdown = tree ? treeToMarkdown(tree as DomTreeNode) : "";
+        // Serialize only when the binding identity or a cheap content revision
+        // requires it; an unchanged revision reuses the last snapshot. Shrinks
+        // and same-length rewrites change the checksum, so they always
+        // reserialize; an unreadable revision (message gone) never skips.
+        let revision: AssistantTurnRevision | undefined;
+        try {
+          revision = await readAssistantTurnRevision(conversation.client, identity);
+        } catch {
+          revision = undefined; // probe failure falls through to full serialization
+        }
+        if (assistantRevisionRequiresSerialization(lastSerialized, identity, revision)) {
+          const tree = await serializeAssistantTurn(conversation.client, identity);
+          currentFullMarkdown = tree ? treeToMarkdown(tree as DomTreeNode) : "";
+          lastSerialized = revision ? { identity, revision } : undefined;
+        } else {
+          currentFullMarkdown = lastText;
+        }
       }
       const turnMarkdown = currentFullMarkdown;
+      const markdownChanged = turnMarkdown !== lastText;
       // Tool-call/reasoning turns can have a stable assistant identity but no
       // text or busy marker yet. Identity proves provider turn is alive.
       if (identity && turnMarkdown.length === 0) controller.touchProgress();
@@ -627,13 +690,13 @@ export class OpenAIWebRuntime {
         // Busy state refreshes the browser-activity heartbeat above. Only new
         // assistant text drives completion; hard timeout still bounds a spinner.
         stablePolls = 0;
-        if (turnMarkdown !== lastText) {
+        if (markdownChanged) {
           controller.touchProgress();
           handlers.onText?.(turnMarkdown);
           lastText = turnMarkdown;
         }
       } else if (turnMarkdown.length > 0) {
-        if (turnMarkdown !== lastText) {
+        if (markdownChanged) {
           controller.touchProgress();
           stablePolls = 0;
           handlers.onText?.(turnMarkdown);
@@ -672,7 +735,10 @@ export class OpenAIWebRuntime {
           return { kind: "failed", error };
         }
       }
-      await sleep(600);
+      await sleep(watchPollDelayMs(
+        { stopVisible: state.stopVisible, busy: state.busy, textChanged: markdownChanged, harnessActive },
+        this.config
+      ));
     }
   }
 }
