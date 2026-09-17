@@ -571,7 +571,10 @@ export class OpenAIWebRuntime {
 
     const baseline = baselineOverride ?? await readTurnState(conversation.client);
     const initialResponseIdentities = new Set(baseline.responseIdentities);
-    let lastTextLength = -1;
+    // Track the last forwarded snapshot by content: a rewrite can shrink or
+    // replace text without changing length, and each new snapshot must reach
+    // the output path so it can replace stale streamed text.
+    let lastText = "";
     let stablePolls = 0;
     let harnessWasActive = false;
     let harnessSettledGraceUntil = 0;
@@ -624,17 +627,17 @@ export class OpenAIWebRuntime {
         // Busy state refreshes the browser-activity heartbeat above. Only new
         // assistant text drives completion; hard timeout still bounds a spinner.
         stablePolls = 0;
-        if (turnMarkdown.length !== lastTextLength) {
+        if (turnMarkdown !== lastText) {
           controller.touchProgress();
           handlers.onText?.(turnMarkdown);
-          lastTextLength = turnMarkdown.length;
+          lastText = turnMarkdown;
         }
       } else if (turnMarkdown.length > 0) {
-        if (turnMarkdown.length !== lastTextLength) {
+        if (turnMarkdown !== lastText) {
           controller.touchProgress();
           stablePolls = 0;
           handlers.onText?.(turnMarkdown);
-          lastTextLength = turnMarkdown.length;
+          lastText = turnMarkdown;
         } else {
           stablePolls += 1;
         }

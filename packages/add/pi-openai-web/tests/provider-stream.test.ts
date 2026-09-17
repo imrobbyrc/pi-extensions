@@ -98,3 +98,47 @@ test("failed turn surfaces runtime error message", async () => {
   const error = events.at(-1) as { error: { errorMessage?: string } };
   assert.equal(error.error.errorMessage, "provider_turn_stalled");
 });
+
+test("streaming snapshot rewrites and shrinks replace the streamed text", async () => {
+  // ChatGPT re-renders a turn mid-stream: the watched DOM snapshot can shrink
+  // ("abcdef" -> "abc") or rewrite in place ("abc" -> "axc"). The public
+  // output path must replace the emitted text for such snapshots while normal
+  // growing snapshots keep streaming as plain deltas.
+  const runtime = {
+    resolveDescriptor: () => descriptor(),
+    runTurn: async (
+      _d: OpenAIWebModelDescriptor,
+      _c: { messages: unknown[] },
+      handlers: FakeTurnCall["handlers"]
+    ) => {
+      handlers.onText?.("abcdef");
+      handlers.onText?.("abc");
+      handlers.onText?.("axc");
+      return { kind: "completed" as const, markdown: "axc" };
+    }
+  } as unknown as OpenAIWebRuntime;
+  const stream = streamTurn(model, { messages: [] }, undefined, { runtime, catalog: {} as never });
+  const events: unknown[] = [];
+  await drain(stream, events);
+
+  // The final message must carry the last snapshot, never the stale longer text.
+  const done = events.at(-1) as { message: { content: Array<{ type: string; text?: string }> } };
+  assert.equal(done.message.content[0]?.text, "axc");
+
+  const typed = events as Array<{ type: string; delta?: string; content?: string }>;
+  // Normal append stays a plain delta; each replace re-opens the block and
+  // replays the corrected snapshot (pi-ai consumers reset on text_start).
+  assert.deepEqual(
+    typed.map(event => event.type),
+    ["start", "text_start", "text_delta", "text_start", "text_delta", "text_start", "text_delta", "text_end", "done"]
+  );
+  assert.deepEqual(typed.filter(e => e.type === "text_delta").map(e => e.delta), ["abcdef", "abc", "axc"]);
+
+  // Replay with pi-ai consumer semantics (text_start resets, text_delta appends).
+  let replayed = "";
+  for (const event of typed) {
+    if (event.type === "text_start") replayed = "";
+    else if (event.type === "text_delta") replayed += event.delta ?? "";
+  }
+  assert.equal(replayed, "axc");
+});

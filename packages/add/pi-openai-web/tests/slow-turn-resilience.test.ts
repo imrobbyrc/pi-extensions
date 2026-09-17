@@ -121,7 +121,12 @@ interface WatchHarness {
   stopClickCount: () => number;
 }
 
-function makeWatch(cfg: HarnessConfig, frames: Frame[], isHarnessActive?: () => Promise<boolean>): WatchHarness {
+function makeWatch(
+  cfg: HarnessConfig,
+  frames: Frame[],
+  isHarnessActive?: () => Promise<boolean>,
+  handlers?: { onText?: (fullTextSoFar: string) => void }
+): WatchHarness {
   const { client, stopClickCount } = fakeClient(frames);
   const graceEvents: Array<{ reason: string | undefined }> = [];
   const runtime = new OpenAIWebRuntime({
@@ -154,7 +159,7 @@ function makeWatch(cfg: HarnessConfig, frames: Frame[], isHarnessActive?: () => 
     stopClickCount,
     run: (options = {}) => (runtime as unknown as {
       watch: (c: ProviderTurnController, h: unknown, o: { signal?: AbortSignal }, b: TurnDomState) => Promise<{ kind: string; error?: string; markdown?: string }>
-    }).watch(controller, {}, options, baseline)
+    }).watch(controller, handlers ?? {}, options, baseline)
   };
 }
 
@@ -289,6 +294,36 @@ test("settle grace re-arms after each renewed active bout and stays bounded", as
     const settled = h.graceEvents.filter(event => event.reason === "harness_settled");
     assert.ok(settled.length >= 3, `expected re-armed settle grace, got ${JSON.stringify(h.graceEvents)}`);
     assert.ok(h.graceEvents.some(event => event.reason === "harness_active"), "second active bout must earn harness_active grace again");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("same-length snapshot rewrites reach onText so the output path can replace text", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-rewrite-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 1_000, turnTimeoutMs: 10_000 });
+    const emitted: string[] = [];
+    // Busy frames whose DOM snapshot rewrites in place without changing length
+    // ("abc" -> "axc"), then the completed turn confirms the rewritten text.
+    const busyText = (text: string): Frame => ({
+      state: domState({ stopVisible: true, busy: true, responseIdentities: ["r1"] }),
+      tree: { tag: "p", children: [{ tag: "#text", text }] }
+    });
+    const doneText = (text: string): Frame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true }),
+      tree: { tag: "p", children: [{ tag: "#text", text }] }
+    });
+    const h = makeWatch(
+      cfg,
+      [busyText("abc"), busyText("axc"), doneText("axc"), doneText("axc"), doneText("axc")],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "axc");
+    assert.ok(emitted.includes("axc"), `expected the rewritten snapshot on onText, got ${JSON.stringify(emitted)}`);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

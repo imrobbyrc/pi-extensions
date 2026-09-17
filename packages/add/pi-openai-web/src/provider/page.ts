@@ -200,7 +200,9 @@ export async function isTemporaryChat(client: CdpClient): Promise<boolean> {
   }`);
   if (!info) return false;
   if (info.isNormalChatUrl) return false;
-  return info.hasTurnOff || info.hasSaveChat || info.hasTempParam;
+  // URL parameter is navigation intent, not evidence. Require a visible
+  // Temporary Chat control so a non-temporary target fails closed.
+  return info.hasTurnOff || info.hasSaveChat;
 }
 
 /** Ensure the target page is in Temporary Chat mode. Fails closed if cannot be confirmed. */
@@ -231,9 +233,8 @@ export async function ensureTemporaryChat(client: CdpClient, chatgptUrl?: string
   return waitFor(client, `() => {
     const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
     const hasSaveChat = Boolean(document.querySelector('button[aria-label="Save chat"]'));
-    const hasTempParam = new URL(location.href).searchParams.get("temporary-chat") === "true";
     const isNormalChatUrl = /\\/c\\/[^/?#]+/i.test(location.href);
-    return !isNormalChatUrl && (hasTurnOff || hasSaveChat || hasTempParam);
+    return !isNormalChatUrl && (hasTurnOff || hasSaveChat);
   }`, 5_000);
 }
 

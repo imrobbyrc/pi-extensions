@@ -24,6 +24,8 @@ npm test
 - `auth.test.ts` — credential storage permissions/persistence.
 - `browser-launcher.test.ts` — isolated profile launch args, CDP wait polling.
 - `browser-session.test.ts` / `fresh-chat.test.ts` — pure ChatGPT state helpers (URL identity extraction, fail-closed state confirmation, fresh-chat detection).
+- `page-temporary-chat.test.ts` — Temporary Chat confirmation requires visible DOM evidence; the `temporary-chat=true` URL parameter alone fails closed (isTemporaryChat/ensureTemporaryChat against a scripted CDP double).
+- `workspace-search.test.ts` — search_workspace glob is enforced by the rg-free JS fallback (gitignore-style subset) or fails closed; scope never widens.
 - `config.test.ts` — config loading and planner-era field rejection.
 - `path-safety.test.ts` — workspace path containment and traversal rejection.
 
