@@ -202,7 +202,7 @@ export async function isTemporaryChat(client: CdpClient): Promise<boolean> {
   if (info.isNormalChatUrl) return false;
   // URL parameter is navigation intent, not evidence. Require a visible
   // Temporary Chat control so a non-temporary target fails closed.
-  return info.hasTurnOff || info.hasSaveChat;
+  return info.hasTurnOff;
 }
 
 /** Ensure the target page is in Temporary Chat mode. Fails closed if cannot be confirmed. */
@@ -219,8 +219,7 @@ export async function ensureTemporaryChat(client: CdpClient, chatgptUrl?: string
   if (clicked === true) {
     const confirmed = await waitFor(client, `() => {
       const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
-      const hasSave = Boolean(document.querySelector('button[aria-label="Save chat"]'));
-      return hasTurnOff || hasSave;
+        return hasTurnOff;
     }`, 3_000);
     if (confirmed) return true;
   }

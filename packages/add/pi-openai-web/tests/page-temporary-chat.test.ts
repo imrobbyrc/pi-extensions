@@ -80,14 +80,14 @@ test("isTemporaryChat still confirms on visible Temporary Chat controls", async 
   });
   assert.equal(await isTemporaryChat(withTurnOff.client), true);
 
-  const withSaveChat = miniBrowser({
+  const saveOnly = miniBrowser({
     href: "https://chatgpt.com/",
     turnOffVisible: false,
     saveChatVisible: true,
     temporaryToggleVisible: false,
     composerVisible: true
   });
-  assert.equal(await isTemporaryChat(withSaveChat.client), true);
+  assert.equal(await isTemporaryChat(saveOnly.client), false);
 });
 
 test("isTemporaryChat fails closed on a normal conversation URL even with temporary controls", async () => {
