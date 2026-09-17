@@ -222,7 +222,8 @@ export async function ensureTemporaryChat(client: CdpClient, chatgptUrl?: string
   if (clicked === true) {
     const confirmed = await waitFor(client, `() => {
       const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
-        return hasTurnOff;
+      const isNormalChatUrl = /\\/c\\/[^/?#]+/i.test(location.href);
+      return !isNormalChatUrl && hasTurnOff;
     }`, 3_000);
     if (confirmed) return true;
   }

@@ -117,6 +117,31 @@ test("ensureTemporaryChat fails closed when navigation lands on a non-temporary 
   assert.ok(navigations.length >= 1, "must attempt navigation before failing closed");
 });
 
+test("ensureTemporaryChat rejects click confirmation on a normal conversation URL", async () => {
+  const page = {
+    href: "https://chatgpt.com/c/existing",
+    turnOffVisible: false,
+    saveChatVisible: false,
+    temporaryToggleVisible: true,
+    composerVisible: true
+  };
+  const { client, navigations } = miniBrowser(page);
+  const clicking = {
+    Runtime: {
+      evaluate: async (args: { expression: string }) => {
+        if (args.expression.includes('button[aria-label="Temporary chat"]')) {
+          page.temporaryToggleVisible = false;
+          page.turnOffVisible = true;
+        }
+        return client.Runtime.evaluate(args);
+      }
+    },
+    Page: client.Page
+  } as unknown as CdpClient;
+  assert.equal(await ensureTemporaryChat(clicking, "https://chatgpt.com/c/existing"), true);
+  assert.ok(navigations.length >= 1, "must not accept click proof on normal URL without direct recovery");
+});
+
 test("ensureTemporaryChat succeeds by clicking the visible Temporary chat toggle", async () => {
   const page = {
     href: "https://chatgpt.com/",
