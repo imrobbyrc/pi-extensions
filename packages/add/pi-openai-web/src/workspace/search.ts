@@ -44,13 +44,64 @@ export async function searchWorkspace(
     if (code !== "ENOENT" && code !== 1) {
       throw error;
     }
-    return fallbackSearch(rootReal, query, maxResults);
+    return fallbackSearch(rootReal, query, maxResults, glob);
   }
 }
 
-async function fallbackSearch(root: string, query: string, maxResults: number): Promise<string> {
+/**
+ * Compile a ripgrep-style glob into a matcher for the rg-free fallback walk.
+ * Supports the gitignore subset ripgrep users rely on: '*' any characters
+ * except '/', '**' any characters (a leading '**' followed by a slash matches
+ * any depth including root), '?' one character except '/', and a leading '!'
+ * negation. Patterns without '/' match the file name at any depth; patterns
+ * with '/' anchor to the workspace root. Anything outside this subset throws
+ * so the search fails closed instead of silently widening scope.
+ */
+function compileGlob(glob: string): (relativePath: string) => boolean {
+  const negated = glob.startsWith("!");
+  const pattern = glob.slice(negated ? 1 : 0);
+  if (pattern.length === 0 || /[\[\]{}]/.test(pattern)) {
+    throw new Error(`search_workspace glob "${glob}" cannot be enforced without ripgrep; refusing to widen search scope`);
+  }
+  const escape = (char: string): string => char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let source = "";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]!;
+    if (char === "*") {
+      let stars = 1;
+      while (pattern[index + stars] === "*") stars += 1;
+      const after = pattern[index + stars];
+      const segmentStart = index === 0 || pattern[index - 1] === "/";
+      const wholeSegment = stars >= 2 && segmentStart && (after === undefined || after === "/");
+      if (wholeSegment && after === "/") {
+        source += "(?:.*/)?";
+        index += stars; // also consume the following slash
+      } else if (wholeSegment) {
+        source += ".*";
+        index += stars - 1;
+      } else {
+        // Single '*' and '**' inside a segment never cross '/'.
+        source += "[^/]*";
+        index += stars - 1;
+      }
+    } else if (char === "?") {
+      source += "[^/]";
+    } else {
+      source += escape(char);
+    }
+  }
+  const anchored = pattern.includes("/");
+  const regex = new RegExp(`^${source}$`);
+  return (relativePath) => {
+    const candidate = anchored ? relativePath : (relativePath.split("/").pop() ?? relativePath);
+    return regex.test(candidate) !== negated;
+  };
+}
+
+async function fallbackSearch(root: string, query: string, maxResults: number, glob?: string): Promise<string> {
   const results: string[] = [];
   const needle = query.toLowerCase();
+  const globMatches = glob ? compileGlob(glob) : undefined;
 
   async function walk(dir: string): Promise<void> {
     if (results.length >= maxResults) return;
@@ -64,6 +115,8 @@ async function fallbackSearch(root: string, query: string, maxResults: number): 
         continue;
       }
       try {
+        const relativePath = relative(root, full).split("\\").join("/");
+        if (globMatches && !globMatches(relativePath)) continue;
         const raw = await readFile(full);
         if (raw.length > 512_000 || raw.includes(0)) continue;
         const lines = raw.toString("utf8").split(/\r?\n/);

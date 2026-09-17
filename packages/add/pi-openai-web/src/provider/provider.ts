@@ -69,7 +69,6 @@ export function streamTurn(model: Model<"openai-web">, context: Context, options
       timestamp: Date.now()
     };
     let textIndex = -1;
-    let emittedTextLength = 0;
     const ensureTextBlock = (): number => {
       if (textIndex === -1) {
         output.content.push({ type: "text", text: "" });
@@ -80,12 +79,21 @@ export function streamTurn(model: Model<"openai-web">, context: Context, options
     };
     const appendText = (full: string): void => {
       const index = ensureTextBlock();
-      const delta = full.slice(emittedTextLength);
-      if (!delta) return;
-      emittedTextLength = full.length;
       const block = output.content[index];
-      if (block?.type === "text") block.text = full;
-      stream.push({ type: "text_delta", contentIndex: index, delta, partial: output });
+      if (block?.type !== "text" || full === block.text) return;
+      if (full.startsWith(block.text)) {
+        // Normal streaming delta: only the newly appended suffix is sent.
+        const delta = full.slice(block.text.length);
+        block.text = full;
+        stream.push({ type: "text_delta", contentIndex: index, delta, partial: output });
+        return;
+      }
+      // The watched snapshot replaced earlier text (ChatGPT re-rendered a
+      // shorter or rewritten turn). Deltas cannot un-send text, so re-open the
+      // block and replay the corrected snapshot; consumers reset on text_start.
+      block.text = full;
+      stream.push({ type: "text_start", contentIndex: index, partial: output });
+      stream.push({ type: "text_delta", contentIndex: index, delta: full, partial: output });
     };
 
     try {
