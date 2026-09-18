@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { makeSummary, SubagentsWidget } from "../src/format.ts";
 import type { RunSnapshot, TaskSnapshot, UsageStats } from "../src/types.ts";
 
@@ -105,5 +106,11 @@ describe("SubagentsWidget", () => {
 		expect(out).not.toContain("done-2");
 		// header + 4 rows + the "+n more" footer
 		expect(out.split("\n")).toHaveLength(6);
+	});
+
+	test("narrow panes never receive an over-width widget line", () => {
+		const tasks = Array.from({ length: 6 }, (_, i) => task({ status: "running", agent: `very-long-agent-${i}` }));
+		const out = new SubagentsWidget(() => [run(tasks)], plain).render(9);
+		expect(out.every((line) => visibleWidth(line) <= 9)).toBe(true);
 	});
 });
