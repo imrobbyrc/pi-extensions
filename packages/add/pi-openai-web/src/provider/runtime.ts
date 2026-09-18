@@ -424,16 +424,14 @@ export class OpenAIWebRuntime {
     if (this.conversation && this.conversation.branchKey !== branchKey) {
       await this.resetConversation("pi_branch_changed");
     }
-    if (this.conversation) {
-      if (this.conversation.conversationId && !isValidConversationId(this.conversation.conversationId)) {
-        await this.resetConversation("invalid_conversation_id");
-      } else {
-        const isTemp = await isTemporaryChat(this.conversation.client).catch(() => false);
-        if (!isTemp) {
-          await this.resetConversation("target_not_temporary_chat");
-        }
-      }
+    if (this.conversation?.conversationId && !isValidConversationId(this.conversation.conversationId)) {
+      await this.resetConversation("invalid_conversation_id");
     }
+    // Do not re-check Temporary Chat on every turn. ChatGPT can briefly hide or
+    // remount its temporary-chat controls after navigation/stream completion;
+    // treating that transient DOM miss as ownership loss reset the target before
+    // turn two. Creation and reconnect already validate the target, while the
+    // Pi branch key remains the session boundary.
     if (this.conversation && this.conversation.descriptorKey !== wantedKey) {
       // Model/effort changes are provider settings, not Pi conversation
       // boundaries. Reconfigure current target instead of opening a new tab.

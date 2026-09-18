@@ -146,6 +146,45 @@ test("record falls back to targetId and never passes invalid conversation IDs to
   }
 });
 
+test("same Pi session reuses target; changed branch resets it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-session-lifecycle-test-"));
+  try {
+    let branchKey = "session-1";
+    let closed = 0;
+    const runtime = new OpenAIWebRuntime({
+      config: baseConfig(dir),
+      catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+      ensureBrowser: async () => {},
+      getBranchKey: () => branchKey
+    });
+    const first = {
+      targetId: "tab-session-1",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey,
+      leaseKey: "session-1:lease",
+      epoch: 0,
+      bootstrapped: true,
+      syncedMessageCount: 1,
+      client: { close: async () => { closed += 1; } }
+    };
+    (runtime as any).conversation = first;
+
+    const turnOneTarget = (await (runtime as any).ensureConversation(descriptor)).targetId;
+    const turnTwoTarget = (await (runtime as any).ensureConversation(descriptor)).targetId;
+    assert.equal(turnOneTarget, "tab-session-1");
+    assert.equal(turnTwoTarget, turnOneTarget, "turns in one Pi session must reuse target");
+
+    const second = { ...first, targetId: "tab-session-2", branchKey: "session-2", client: { close: async () => {} } };
+    (runtime as any).createConversation = async () => second;
+    branchKey = "session-2";
+    const newSessionTarget = (await (runtime as any).ensureConversation(descriptor)).targetId;
+    assert.equal(newSessionTarget, "tab-session-2");
+    assert.equal(closed, 1, "new Pi session may reset old target");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("resetConversation clears resume store atomically", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-reset-test-"));
   try {
