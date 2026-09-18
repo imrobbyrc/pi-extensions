@@ -13,6 +13,7 @@ import { type ChildMessage, MAX_HERDR_MESSAGE_SIZE, parseChildMessage } from "./
 import { classifyFailure } from "./manager.ts";
 import type { TaskInput } from "./schemas.ts";
 import type { RunSnapshot, TaskSnapshot, UsageStats } from "./types.ts";
+import { TERMINAL } from "./types.ts";
 import type { Worktree } from "./worktree.ts";
 
 const execFileAsync = promisify(execFile);
@@ -198,6 +199,68 @@ export interface LiveHerdrChild {
 	reply?(message: string): void;
 }
 
+/** Ownership registries for live herdr panes (manager-owned; shared with the child runner). */
+export interface HerdrPaneOwnership {
+	ownedPanes: Set<string>;
+	herdrTokens?: Map<string, string>;
+}
+
+export interface HerdrCloseResult {
+	/** True when there was nothing to close or the pane close was confirmed. */
+	closed: boolean;
+	/** Set when a close was attempted and failed — ownership is retained so the close stays retryable. */
+	error?: string;
+}
+
+/**
+ * Transactional owned-pane close (P1a): close FIRST, release ownedPanes/herdrTokens only on a
+ * confirmed close. A failed or throwing close retains ownership — the pane may still be live.
+ */
+export async function closeOwnedHerdrPane(
+	runner: HerdrCommandRunner,
+	task: { runId: string; id: string; paneId?: string },
+	ownership: HerdrPaneOwnership,
+): Promise<HerdrCloseResult> {
+	const paneId = task.paneId;
+	if (!paneId || !ownership.ownedPanes.has(paneId)) return { closed: true };
+	let error: string | undefined;
+	try {
+		const res = await runner.exec(["pane", "close", paneId]);
+		if (res.exitCode !== 0) {
+			error = res.stderr?.trim() || `herdr pane close exited with code ${res.exitCode}`;
+		}
+	} catch (err) {
+		error = err instanceof Error ? err.message : String(err);
+	}
+	if (error !== undefined) {
+		return { closed: false, error };
+	}
+	ownership.ownedPanes.delete(paneId);
+	ownership.herdrTokens?.delete(`${task.runId}:${task.id}`);
+	return { closed: true };
+}
+
+/**
+ * Reusable terminal-cleanup boundary for herdr failures (P1b): abort the worker (best-effort
+ * ctrl+c — a stalled worker may still be mutating), then close its owned pane authoritatively.
+ * Returns undefined when the boundary completed (task may be published as settled `failed`);
+ * otherwise returns cleanup-pending metadata while ownership is retained for retry.
+ */
+export async function cleanupFailedHerdrTask(
+	runner: HerdrCommandRunner,
+	task: TaskSnapshot,
+	ownership: HerdrPaneOwnership,
+): Promise<TaskSnapshot["cleanupPending"]> {
+	if (task.herdrAgent) {
+		try {
+			await runner.exec(["agent", "send-keys", task.herdrAgent, "ctrl+c"]);
+		} catch {}
+	}
+	const close = await closeOwnedHerdrPane(runner, task, ownership);
+	if (close.closed) return undefined;
+	return { error: close.error ?? "herdr pane close failed", attempts: 1, lastAttemptAt: Date.now() };
+}
+
 export interface RunHerdrChildOptions {
 	run: RunSnapshot;
 	task: TaskSnapshot;
@@ -214,6 +277,8 @@ export interface RunHerdrChildOptions {
 	resume?: { sessionFile: string; branch?: string; message: string };
 	runner: HerdrCommandRunner;
 	ownedPanes: Set<string>;
+	/** Per-task child IPC tokens; released together with pane ownership on confirmed close. */
+	herdrTokens?: Map<string, string>;
 	childHandlers: ChildHandlers;
 	registerLiveChild: (handle: LiveHerdrChild) => void;
 	unregisterLiveChild: () => void;
@@ -304,8 +369,19 @@ async function startHerdrPaneAndAgent(
 
 		const startRes = await opts.runner.exec(startArgs);
 		if (startRes.exitCode !== 0) {
-			await opts.runner.exec(["pane", "close", paneId]).catch(() => {});
-			opts.ownedPanes.delete(paneId);
+			// Transactional teardown of the unusable pane: release ownership only on confirmed close;
+			// a failed teardown keeps the task explicitly cleanup-pending (ownership retained).
+			const close = await closeOwnedHerdrPane(opts.runner, opts.task, {
+				ownedPanes: opts.ownedPanes,
+				herdrTokens: opts.herdrTokens,
+			});
+			if (!close.closed) {
+				opts.task.cleanupPending = {
+					error: `startup teardown incomplete: ${close.error}`,
+					attempts: 1,
+					lastAttemptAt: Date.now(),
+				};
+			}
 			throw new Error(`Failed to start Herdr agent: ${startRes.stderr || `exit code ${startRes.exitCode}`}`);
 		}
 	} catch (startupErr) {
@@ -349,6 +425,9 @@ export async function runHerdrChild(opts: RunHerdrChildOptions): Promise<void> {
 	}
 
 	async function handleChildEvent(msg: ChildMessage, sock: Socket): Promise<void> {
+		// No live mutation after terminal (P1b): once the task has settled, late pane traffic
+		// (a stalled worker that kept running) must not revive or rewrite it.
+		if (TERMINAL.includes(opts.task.status)) return;
 		if (msg.type === "ready") {
 			if (msg.sessionId) opts.task.sessionId = msg.sessionId;
 			if (msg.sessionFile) opts.task.sessionFile = msg.sessionFile;
@@ -567,17 +646,19 @@ export async function runHerdrChild(opts: RunHerdrChildOptions): Promise<void> {
 		} catch {}
 	}
 
+	let outcome: "completed" | "failed" | "aborted";
+	let outcomeError: string | undefined;
 	if (opts.signal?.aborted || promptAborted) {
-		opts.task.status = "aborted";
-		opts.task.error = "Subagent was aborted.";
+		outcome = "aborted";
+		outcomeError = "Subagent was aborted.";
 	} else if (promptRes && promptRes.exitCode !== 0) {
-		opts.task.status = "failed";
-		opts.task.error = promptRes.stderr || `Herdr agent prompt failed with exit code ${promptRes.exitCode}`;
+		outcome = "failed";
+		outcomeError = promptRes.stderr || `Herdr agent prompt failed with exit code ${promptRes.exitCode}`;
 	} else if (childFailed) {
-		opts.task.status = childFailed.stopReason === "aborted" ? "aborted" : "failed";
-		opts.task.error = childFailed.error || `Subagent ended with stopReason "${childFailed.stopReason}"`;
+		outcome = childFailed.stopReason === "aborted" ? "aborted" : "failed";
+		outcomeError = childFailed.error || `Subagent ended with stopReason "${childFailed.stopReason}"`;
 	} else if (childCompleted) {
-		opts.task.status = "completed";
+		outcome = "completed";
 		opts.task.finalText = childCompleted.finalText || opts.task.finalText;
 	} else {
 		const salvaged = salvageFromSessionFile(opts.task.sessionFile ?? "");
@@ -588,23 +669,43 @@ export async function runHerdrChild(opts: RunHerdrChildOptions): Promise<void> {
 		if (salvaged.stopReason) {
 			const fail = classifyFailure(salvaged.stopReason, salvaged.errorMessage);
 			if (fail) {
-				opts.task.status = fail.status;
-				opts.task.error = fail.message;
+				outcome = fail.status;
+				outcomeError = fail.message;
 			} else {
-				opts.task.status = "completed";
+				outcome = "completed";
 			}
 		} else if (opts.task.finalText) {
-			opts.task.status = "completed";
+			outcome = "completed";
 		} else {
-			opts.task.status = "failed";
-			opts.task.error = "Subagent settled with no final response or session transcript";
+			outcome = "failed";
+			outcomeError = "Subagent settled with no final response or session transcript";
 		}
 	}
+
+	// Terminal-cleanup boundary (P1b): a failed herdr worker may still be live in its pane — e.g.
+	// the prompt CLI stalled while the agent kept working. Abort + close BEFORE publishing the
+	// failed terminal state; if teardown fails, keep the task explicitly cleanup-pending with
+	// ownership retained so the cleanup stays retryable.
+	let cleanupPending: TaskSnapshot["cleanupPending"];
+	if (outcome === "failed") {
+		cleanupPending = await cleanupFailedHerdrTask(opts.runner, opts.task, {
+			ownedPanes: opts.ownedPanes,
+			herdrTokens: opts.herdrTokens,
+		});
+		if (!cleanupPending) {
+			// Pane confirmed closed: nothing can reach the task from the pane anymore.
+			childSocket?.destroy();
+		}
+	}
+	opts.task.status = outcome;
+	opts.task.error = outcomeError;
+	opts.task.cleanupPending = cleanupPending;
 	opts.task.endedAt = Date.now();
 	opts.updateTask({
 		status: opts.task.status,
 		finalText: opts.task.finalText,
 		error: opts.task.error,
+		cleanupPending: opts.task.cleanupPending,
 		endedAt: opts.task.endedAt,
 		usage: opts.task.usage,
 	});

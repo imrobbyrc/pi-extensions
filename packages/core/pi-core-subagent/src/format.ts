@@ -228,6 +228,9 @@ export function makeTaskNotice(run: RunSnapshot, task: TaskSnapshot, kind: strin
 	const src = task.agentFile ? `\nAgent file: ${task.agentFile}${task.model ? ` (model ${task.model})` : ""}` : "";
 	const swap = task.modelNote ? `\nModel: ${task.modelNote}` : "";
 	const tools = task.toolsNote ? `\nTools: ${task.toolsNote}` : "";
+	const pendingCleanup = task.cleanupPending
+		? `\nCleanup pending: its herdr pane/agent teardown failed (${task.cleanupPending.error}) — the worker pane may still be live. Retry cleanup (subagents API retryCleanup); session end force-closes owned panes.`
+		: "";
 	return [
 		`Task ${task.agent} (${task.id}) ${kind} in run ${run.id}: ${detail}${wt}`,
 		`Goal: ${goal}${src}${swap}${tools}`,
@@ -235,7 +238,7 @@ export function makeTaskNotice(run: RunSnapshot, task: TaskSnapshot, kind: strin
 			? "Never started — stop and diagnose before spawning anything else: a config-level error (model, plan, auth, agent file) fails identically on every respawn."
 			: kind === "completed"
 				? `Use subagent_result(runId: "${run.id}", taskId: "${task.id}") for full output.`
-				: `Session file kept — resume_subagent(runId: "${run.id}", taskId: "${task.id}", model?: ...) revives it with full context. subagent_result for what it produced so far.`,
+				: `Session file kept — resume_subagent(runId: "${run.id}", taskId: "${task.id}", model?: ...) revives it with full context. subagent_result for what it produced so far.${pendingCleanup}`,
 	].join("\n");
 }
 export function makeNotice(run: RunSnapshot, kind: string): string {

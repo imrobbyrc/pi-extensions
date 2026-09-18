@@ -16,6 +16,7 @@ import {
 } from "../src/herdr.ts";
 import { MAX_HERDR_MESSAGE_SIZE, parseChildMessage } from "../src/herdr-protocol.ts";
 import { SubagentManager } from "../src/manager.ts";
+import type { RunSnapshot } from "../src/types.ts";
 
 class FakeHerdrRunner implements HerdrCommandRunner {
 	calls: { args: string[]; options?: any }[] = [];
@@ -23,6 +24,8 @@ class FakeHerdrRunner implements HerdrCommandRunner {
 	splitExitCode = 0;
 	startExitCode = 0;
 	startStderr = "";
+	closeExitCode = 0;
+	closeStderr = "";
 	promptExitCode = 0;
 	agentGetResult: any = {
 		result: {
@@ -57,7 +60,7 @@ class FakeHerdrRunner implements HerdrCommandRunner {
 			return { stdout: JSON.stringify({ pane: { cols: 160, rows: 40 } }), stderr: "", exitCode: 0 };
 		}
 		if (cmd === "pane" && sub === "close") {
-			return { stdout: "{}", stderr: "", exitCode: 0 };
+			return { stdout: "{}", stderr: this.closeExitCode !== 0 ? this.closeStderr : "", exitCode: this.closeExitCode };
 		}
 		if (cmd === "agent" && sub === "start") {
 			return { stdout: "{}", stderr: this.startStderr, exitCode: this.startExitCode };
@@ -638,21 +641,36 @@ describe("herdr runtime", () => {
 		);
 	});
 
-	test("14. Successful/failed/canceled usable panes remain", async () => {
-		const fake = new FakeHerdrRunner();
-		fake.customExec = async (args) => {
+	test("14. Completed panes remain for review; failed panes are closed by the terminal cleanup boundary", async () => {
+		// Completed: the pane stays live for the herdr review loop.
+		const { fake } = reviewLoopFake();
+		const m1 = new SubagentManager(stubPi, fake);
+		const d1 = m1.startInBackground({ agent: "keeper", task: "t14a", runtime: "herdr" }, stubCtx);
+		expect(await waitFor(() => m1.getRun(d1.run.id)?.tasks[0]?.status === "completed")).toBe(true);
+		await new Promise((r) => setTimeout(r, 50));
+		expect(fake.calls.some((c) => c.args[0] === "pane" && c.args[1] === "close")).toBe(false);
+
+		// Failed (settled with no transcript): cleanup aborts + closes its pane BEFORE publishing failed.
+		const fake2 = new FakeHerdrRunner();
+		fake2.customExec = async (args) => {
 			if (args[0] === "pane" && args[1] === "split") {
-				return { stdout: JSON.stringify({ result: { pane_id: "pane_keep" } }), stderr: "", exitCode: 0 };
+				return { stdout: JSON.stringify({ result: { pane_id: "pane_fail14" } }), stderr: "", exitCode: 0 };
 			}
 			return undefined;
 		};
-
-		const m = new SubagentManager(stubPi, fake);
-		const _details = m.startInBackground({ agent: "keeper", task: "t14", runtime: "herdr" }, stubCtx);
-		await new Promise((r) => setTimeout(r, 100));
-
-		// Pane close should NOT have been called
-		expect(fake.calls.some((c) => c.args[0] === "pane" && c.args[1] === "close")).toBe(false);
+		const m2 = new SubagentManager(stubPi, fake2);
+		const d2 = m2.startInBackground({ agent: "failer14", task: "t14b", runtime: "herdr" }, stubCtx);
+		let run2 = d2.run;
+		while (!["completed", "failed", "aborted"].includes(run2.status)) {
+			const awaited = await m2.awaitRun(d2.run.id, 2000);
+			if (!awaited?.run) break;
+			run2 = awaited.run;
+		}
+		expect(run2.status).toBe("failed");
+		expect(run2.tasks[0]?.cleanupPending).toBeUndefined();
+		expect(fake2.calls.some((c) => c.args[0] === "pane" && c.args[1] === "close" && c.args[2] === "pane_fail14")).toBe(
+			true,
+		);
 	});
 
 	test("15. Child protocol rejects bad token, wrong task, malformed/oversized JSON", () => {
@@ -1133,5 +1151,261 @@ describe("herdr runtime", () => {
 		const task = details.run.tasks[0]!;
 		expect(herdrTaskDir(details.run.id, task.id)).toBe(herdrTaskDir(details.run.id, task.id));
 		expect(herdrTaskDir("run:a b", "task:1")).toMatch(/pi-herdr/);
+	});
+
+	// ---- P1: transactional accept + terminal cleanup boundary ----
+
+	/** Event+exec recorder: one ordered log of herdr commands and manager events. */
+	function recorder(): { log: string[]; wrap(fake: FakeHerdrRunner): void; pi: ExtensionAPI } {
+		const log: string[] = [];
+		return {
+			log,
+			wrap(fake: FakeHerdrRunner) {
+				const orig = fake.exec.bind(fake);
+				fake.exec = async (args: string[], options?: any) => {
+					log.push(`exec:${args.join(" ")}`);
+					return orig(args, options);
+				};
+			},
+			pi: {
+				events: {
+					emit(type: string, payload: Record<string, unknown>) {
+						log.push(`event:${type}:${String(payload?.status ?? "")}`);
+					},
+				},
+				sendUserMessage() {},
+			} as unknown as ExtensionAPI,
+		};
+	}
+
+	function stalledPromptFake(paneId: string): FakeHerdrRunner {
+		const fake = new FakeHerdrRunner();
+		fake.customExec = async (args) => {
+			if (args[0] === "pane" && args[1] === "split") {
+				return { stdout: JSON.stringify({ result: { pane_id: paneId } }), stderr: "", exitCode: 0 };
+			}
+			if (args[0] === "agent" && args[1] === "prompt") {
+				// Prompt CLI gives up (stall) while the worker in the pane may still be live.
+				return { stdout: "", stderr: "agent_prompt_stalled after 60000ms without progress", exitCode: 1 };
+			}
+			return undefined;
+		};
+		return fake;
+	}
+
+	const TERMINAL_RUN = ["completed", "failed", "aborted"];
+	async function awaitTerminal(m: SubagentManager, runId: string): Promise<RunSnapshot | undefined> {
+		let run = m.getRun(runId);
+		while (run && !TERMINAL_RUN.includes(run.status)) {
+			const awaited = await m.awaitRun(runId, 2000);
+			if (!awaited?.run) break;
+			run = awaited.run;
+		}
+		return run;
+	}
+
+	test("28. accept: pane-close failure returns a retryable failure and retains the live binding", async () => {
+		const { fake } = reviewLoopFake();
+		const m = new SubagentManager(stubPi, fake);
+		const details = m.startInBackground({ agent: "acceptee28", task: "t28", runtime: "herdr" }, stubCtx);
+		const taskId = details.run.tasks[0]!.id;
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "completed")).toBe(true);
+
+		// herdr becomes unreachable: pane close fails.
+		fake.closeExitCode = 1;
+		fake.closeStderr = "herdr server unreachable";
+		const refused = await m.acceptTask(details.run.id, taskId, stubCtx);
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) expect(refused.reason).toMatch(/closing its pane failed/);
+		if (!refused.ok) expect(refused.reason).toMatch(/retry/);
+		expect(m.getRun(details.run.id)!.tasks[0]!.acceptedAt).toBeUndefined();
+
+		// Ownership was retained: the pane binding still supports a same-pane correction round.
+		const correction = m.correctTask(details.run.id, taskId, stubCtx, { message: "tweak while herdr is flaky" });
+		expect(correction.ok).toBe(true);
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "completed")).toBe(true);
+
+		// Recovery: retrying accept now confirms the close and finalizes.
+		fake.closeExitCode = 0;
+		const accepted = await m.acceptTask(details.run.id, taskId, stubCtx);
+		expect(accepted.ok).toBe(true);
+		const task = m.getRun(details.run.id)!.tasks[0]!;
+		expect(task.acceptedAt).toBeGreaterThan(0);
+		// One failed close attempt + one confirmed close — never a silent second guess.
+		expect(fake.calls.filter((c) => c.args[0] === "pane" && c.args[1] === "close")).toHaveLength(2);
+
+		// Fully finalized: further corrections are refused.
+		const refusedCorrection = m.correctTask(details.run.id, taskId, stubCtx, { message: "one more" });
+		expect(refusedCorrection.ok).toBe(false);
+	});
+
+	test("29. stalled prompt: ctrl+c and pane close complete BEFORE the failed terminal state is published", async () => {
+		const rec = recorder();
+		const fake = stalledPromptFake("pane_stall");
+		rec.wrap(fake);
+		const m = new SubagentManager(rec.pi, fake);
+		const details = m.startInBackground({ agent: "stallee", task: "t29", runtime: "herdr" }, stubCtx);
+
+		const run = await awaitTerminal(m, details.run.id);
+		expect(run?.status).toBe("failed");
+		expect(run?.tasks[0]?.error).toContain("agent_prompt_stalled");
+		expect(run?.tasks[0]?.cleanupPending).toBeUndefined();
+
+		const ctrlC = rec.log.findIndex((l) => l.startsWith("exec:agent send-keys") && l.endsWith("ctrl+c"));
+		const close = rec.log.indexOf("exec:pane close pane_stall");
+		const failedEvent = rec.log.indexOf("event:subagent:task-updated:failed");
+		const runCompleted = rec.log.indexOf("event:subagent:run-completed:failed");
+		expect(ctrlC).toBeGreaterThanOrEqual(0);
+		expect(close).toBeGreaterThan(ctrlC);
+		expect(failedEvent).toBeGreaterThan(close); // terminal only after the cleanup boundary
+		expect(runCompleted).toBeGreaterThan(close);
+	});
+
+	test("30. cleanup failure keeps the task explicitly cleanup-pending and retryable", async () => {
+		const rec = recorder();
+		const fake = stalledPromptFake("pane_pending");
+		fake.closeExitCode = 1;
+		fake.closeStderr = "herdr socket busy";
+		rec.wrap(fake);
+		const m = new SubagentManager(rec.pi, fake);
+		const details = m.startInBackground({ agent: "pendee", task: "t30", runtime: "herdr" }, stubCtx);
+		const taskId = details.run.tasks[0]!.id;
+
+		const run = await awaitTerminal(m, details.run.id);
+		expect(run?.status).toBe("failed");
+		const task = run?.tasks[0];
+		expect(task?.cleanupPending).toBeDefined();
+		expect(task?.cleanupPending?.error).toContain("herdr socket busy");
+		expect(task?.cleanupPending?.attempts).toBe(1);
+
+		// Terminal publication still waited for the cleanup attempt.
+		const close = rec.log.indexOf("exec:pane close pane_pending");
+		const failedEvent = rec.log.indexOf("event:subagent:task-updated:failed");
+		expect(close).toBeGreaterThanOrEqual(0);
+		expect(failedEvent).toBeGreaterThan(close);
+
+		// Retry while herdr is still flaky: stays pending, attempts accumulate.
+		const retry1 = await m.retryTaskCleanup(details.run.id, taskId, stubCtx);
+		expect(retry1.ok).toBe(false);
+		if (!retry1.ok) expect(retry1.reason).toMatch(/cleanup still failing/);
+		expect(m.getRun(details.run.id)!.tasks[0]!.cleanupPending?.attempts).toBe(2);
+
+		// Non-pending tasks are refused.
+		const nothing = await m.retryTaskCleanup(details.run.id, "task_9", stubCtx);
+		expect(nothing.ok).toBe(false);
+
+		// Recovery: the retry settles the marker and releases ownership.
+		fake.closeExitCode = 0;
+		const settled = await m.retryTaskCleanup(details.run.id, taskId, stubCtx);
+		expect(settled.ok).toBe(true);
+		expect(m.getRun(details.run.id)!.tasks[0]!.cleanupPending).toBeUndefined();
+		expect(rec.log).toContain("event:subagent:task-cleanup-settled:");
+
+		// Settled means settled: no second teardown attempts a pane close.
+		const again = await m.retryTaskCleanup(details.run.id, taskId, stubCtx);
+		expect(again.ok).toBe(false);
+		if (!again.ok) expect(again.reason).toMatch(/no pending cleanup/);
+		// Exactly three teardown attempts ever: initial (fail) + retry (fail) + retry (confirmed).
+		// The post-settle retry attempts none.
+		expect(fake.calls.filter((c) => c.args[0] === "pane" && c.args[1] === "close")).toHaveLength(3);
+	});
+
+	test("31. no live mutation after terminal: late pane traffic cannot revive a failed task", async () => {
+		const fake = stalledPromptFake("pane_zombie");
+		fake.closeExitCode = 1; // cleanup fails -> the pane (and its IPC connection) stay live
+		let zombie: any;
+		const origExec = fake.exec.bind(fake);
+		fake.exec = async (args: string[], options?: any) => {
+			if (args[0] === "agent" && args[1] === "prompt") {
+				// The stalled worker holds its IPC connection open across the failed round.
+				const env = fake.calls.find((c) => c.args[0] === "pane" && c.args[1] === "split")?.args ?? [];
+				const socketPath = env
+					.find((a) => String(a).startsWith("PI_SUBAGENT_SOCKET="))
+					?.slice("PI_SUBAGENT_SOCKET=".length);
+				if (socketPath) {
+					zombie = createConnection(socketPath, () => {});
+					zombie.on("error", () => {});
+				}
+			}
+			return origExec(args, options);
+		};
+
+		const m = new SubagentManager(stubPi, fake);
+		const details = m.startInBackground({ agent: "zombie", task: "t31", runtime: "herdr" }, stubCtx);
+
+		// Wait until the task is terminal-failed (published only after the cleanup attempt).
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "failed")).toBe(true);
+		const env = fake.calls.find((c) => c.args[0] === "pane" && c.args[1] === "split")?.args ?? [];
+		const pick = (name: string) => env.find((a) => String(a).startsWith(`${name}=`))?.slice(name.length + 1);
+		const msg = (body: Record<string, unknown>) =>
+			JSON.stringify({
+				runId: pick("PI_SUBAGENT_RUN_ID"),
+				taskId: pick("PI_SUBAGENT_TASK_ID"),
+				token: pick("PI_SUBAGENT_TOKEN"),
+				...body,
+			});
+
+		// Late traffic: the stalled worker reports "working", then even "completed".
+		try {
+			zombie.write(`${msg({ type: "status", status: "working" })}\n`);
+			zombie.write(`${msg({ type: "completed", finalText: "ZOMBIE OUTPUT" })}\n`);
+			zombie.write(`${msg({ type: "message_end", finalText: "ZOMBIE OUTPUT", stopReason: "stop" })}\n`);
+		} catch {}
+		await new Promise((r) => setTimeout(r, 150));
+
+		const task = m.getRun(details.run.id)!.tasks[0]!;
+		expect(task.status).toBe("failed");
+		expect(task.finalText).toBeUndefined();
+		expect(m.getRun(details.run.id)!.status).toBe("failed");
+
+		try {
+			zombie.destroy();
+		} catch {}
+		expect(m.getRun(details.run.id)!.tasks[0]!.status).toBe("failed");
+	});
+
+	test("32. accept idempotency: a settled accept never re-closes; a no-binding accept finalizes", async () => {
+		const { fake } = reviewLoopFake();
+		const m = new SubagentManager(stubPi, fake);
+		const details = m.startInBackground({ agent: "idem", task: "t32", runtime: "herdr" }, stubCtx);
+		const taskId = details.run.tasks[0]!.id;
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "completed")).toBe(true);
+
+		const first = await m.acceptTask(details.run.id, taskId, stubCtx);
+		const second = await m.acceptTask(details.run.id, taskId, stubCtx);
+		const third = await m.acceptTask(details.run.id, taskId, stubCtx);
+		expect(first.ok && second.ok && third.ok).toBe(true);
+		expect(fake.calls.filter((c) => c.args[0] === "pane" && c.args[1] === "close")).toHaveLength(1);
+
+		// Simulated session reload: binding lost, pane already gone — accept still finalizes truthfully.
+		const reloaded = m.getRun(details.run.id)!.tasks[0]!;
+		reloaded.acceptedAt = undefined;
+		const afterReload = await m.acceptTask(details.run.id, taskId, stubCtx);
+		expect(afterReload.ok).toBe(true);
+		expect(m.getRun(details.run.id)!.tasks[0]!.acceptedAt).toBeGreaterThan(0);
+		expect(fake.calls.filter((c) => c.args[0] === "pane" && c.args[1] === "close")).toHaveLength(1);
+	});
+
+	test("33. startup failure with failed teardown keeps the task cleanup-pending until retried", async () => {
+		const fake = new FakeHerdrRunner();
+		fake.splitResult = JSON.stringify({ result: { pane_id: "pane_start33" } });
+		fake.startExitCode = 1;
+		fake.startStderr = "pi failed to launch";
+		fake.closeExitCode = 1;
+		fake.closeStderr = "herdr wedged";
+
+		const m = new SubagentManager(stubPi, fake);
+		const details = m.startInBackground({ agent: "startee33", task: "t33", runtime: "herdr" }, stubCtx);
+		const taskId = details.run.tasks[0]!.id;
+		const run = await awaitTerminal(m, details.run.id);
+		expect(run?.status).toBe("failed");
+		const task = m.getRun(details.run.id)!.tasks[0]!;
+		expect(task.error).toContain("Failed to start Herdr agent");
+		expect(task.cleanupPending?.error).toContain("startup teardown incomplete");
+
+		fake.closeExitCode = 0;
+		const settled = await m.retryTaskCleanup(details.run.id, taskId, stubCtx);
+		expect(settled.ok).toBe(true);
+		expect(m.getRun(details.run.id)!.tasks[0]!.cleanupPending).toBeUndefined();
 	});
 });

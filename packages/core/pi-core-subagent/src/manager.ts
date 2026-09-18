@@ -30,7 +30,15 @@ import {
 	truncateText,
 } from "./format.ts";
 import { applyUpstream, resolveNeeds, runWaveScheduler } from "./graph.ts";
-import { checkHerdrEnvironment, defaultHerdrRunner, type HerdrCommandRunner, runHerdrChild } from "./herdr.ts";
+import {
+	checkHerdrEnvironment,
+	cleanupFailedHerdrTask,
+	closeOwnedHerdrPane,
+	defaultHerdrRunner,
+	type HerdrCloseResult,
+	type HerdrCommandRunner,
+	runHerdrChild,
+} from "./herdr.ts";
 import { createMailbox, type Mailbox } from "./mailbox.ts";
 import type { SubagentParamsShape, TaskInput } from "./schemas.ts";
 import {
@@ -976,6 +984,7 @@ export class SubagentManager {
 					resume,
 					runner: this.herdrRunner,
 					ownedPanes: this.ownedPanes,
+					herdrTokens: this.herdrTokens,
 					childHandlers: this.makeChildHandlers(run, task, ctx),
 					registerLiveChild: (handle) => {
 						this.liveChildren.set(key, handle);
@@ -1677,8 +1686,10 @@ export class SubagentManager {
 	}
 
 	/**
-	 * Herdr review loop: explicit lead acceptance. Finalizes a completed task — closes its pane
-	 * and releases the live binding. Idempotent. Failure/abort stay terminal and are not acceptable.
+	 * Herdr review loop: explicit lead acceptance. Finalizes a completed task transactionally (P1a):
+	 * the owned pane is closed and confirmed FIRST; only then are ownedPanes/herdrTokens released and
+	 * acceptedAt recorded. A failed close retains the live binding and returns a retryable failure.
+	 * Idempotent. Failure/abort stay terminal and are not acceptable.
 	 */
 	async acceptTask(
 		runId: string,
@@ -1702,22 +1713,79 @@ export class SubagentManager {
 			return { ok: false, reason: `${taskId} ended ${task.status} — only completed work can be accepted.` };
 		}
 
+		// Cleanup boundary first: never record acceptance (or drop the pane/token binding) for a
+		// pane we could not confirm closed — the accept stays retryable instead of pretending success.
+		const close = await this.closeOwnedPane(task);
+		if (!close.closed) {
+			return {
+				ok: false,
+				reason: `${taskId}: closing its pane failed (${close.error}). Pane binding retained — retry accept_subagent once Herdr is reachable.`,
+			};
+		}
+
 		task.acceptedAt = Date.now();
 		this.emit("subagent:task-accepted", { runId, taskId });
 		this.updateRun(run, ctx);
-		await this.closeOwnedPane(task);
 		this.persist(ctx);
 		return { ok: true, task };
 	}
 
-	private async closeOwnedPane(task: TaskSnapshot): Promise<void> {
-		const paneId = task.paneId;
-		if (!paneId || !this.ownedPanes.has(paneId)) return;
-		this.ownedPanes.delete(paneId);
-		this.herdrTokens.delete(`${task.runId}:${task.id}`);
+	private closeOwnedPane(task: TaskSnapshot): Promise<HerdrCloseResult> {
+		return closeOwnedHerdrPane(this.herdrRunner, task, {
+			ownedPanes: this.ownedPanes,
+			herdrTokens: this.herdrTokens,
+		});
+	}
+
+	/**
+	 * Retry a pending terminal cleanup (P1b): a herdr task that ended failed while its pane/agent
+	 * teardown did not complete (task.cleanupPending set, ownership retained). Reruns the cleanup
+	 * boundary — abort + close — and settles the marker only on a confirmed close. Retryable.
+	 */
+	async retryTaskCleanup(
+		runId: string,
+		taskId: string,
+		ctx?: ExtensionContext,
+	): Promise<{ ok: true; task: TaskSnapshot } | { ok: false; reason: string }> {
+		const run = this.runs.get(runId);
+		const task = run?.tasks.find((t) => t.id === taskId);
+		if (!run || !task) return { ok: false, reason: `Unknown ${runId}/${taskId}.` };
+		if ((task.runtime ?? run.runtime) !== "herdr") {
+			return { ok: false, reason: `${taskId} is not a herdr task — cleanup applies to herdr panes.` };
+		}
+		if (!TERMINAL.includes(task.status)) {
+			return { ok: false, reason: `${taskId} is still ${task.status} — stop or cancel it first.` };
+		}
+		const pending = task.cleanupPending;
+		if (!pending) return { ok: false, reason: `${taskId} has no pending cleanup.` };
+
+		let next: TaskSnapshot["cleanupPending"];
 		try {
-			await this.herdrRunner.exec(["pane", "close", paneId]);
-		} catch {}
+			next = await cleanupFailedHerdrTask(this.herdrRunner, task, {
+				ownedPanes: this.ownedPanes,
+				herdrTokens: this.herdrTokens,
+			});
+		} catch (err) {
+			next = { error: err instanceof Error ? err.message : String(err), attempts: 1, lastAttemptAt: Date.now() };
+		}
+		if (!next) {
+			task.cleanupPending = undefined;
+			this.updateRun(run, ctx);
+			this.persist(ctx);
+			this.emit("subagent:task-cleanup-settled", { runId, taskId });
+			return { ok: true, task };
+		}
+		task.cleanupPending = {
+			error: next.error,
+			attempts: (pending.attempts ?? 0) + 1,
+			lastAttemptAt: next.lastAttemptAt,
+		};
+		this.updateRun(run, ctx);
+		this.persist(ctx);
+		return {
+			ok: false,
+			reason: `${taskId}: cleanup still failing (${task.cleanupPending.error}) — pane binding retained, retry later.`,
+		};
 	}
 
 	private finishRunIfSettled(run: RunSnapshot, ctx: ExtensionContext): void {

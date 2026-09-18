@@ -64,6 +64,15 @@ export class SubagentController {
 		return cloneRun(run);
 	}
 
+	/** Retry a pending terminal cleanup on a failed herdr task (pane/agent teardown incomplete). */
+	async retryCleanup(runId: string, taskId: string, ctx?: any): Promise<RunSnapshot> {
+		const res = await this.manager.retryTaskCleanup(runId, taskId, ctx);
+		if (!res.ok) throw new Error(res.reason);
+		const run = this.manager.getRun(runId);
+		if (!run) throw new Error(`Unknown subagent run ${runId}.`);
+		return cloneRun(run);
+	}
+
 	setDefaultRuntime(runtime: SubagentRuntime): SubagentRuntime {
 		return this.manager.setDefaultRuntime(runtime);
 	}
