@@ -171,6 +171,13 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    const nextBranchKey = ctx.sessionManager.getSessionId();
+    if (runtime && session && session.branchKey() !== nextBranchKey) {
+      // Pi new conversation = fresh provider conversation. Normal turns never
+      // reach this path, so they keep their existing ChatGPT target/tab.
+      await runtime.resetConversation("pi_session_changed");
+      recordActivity("provider conversation reset for new Pi session");
+    }
     captureSession(ctx);
     await ensureServices();
     if (backgroundRefreshDone) return;

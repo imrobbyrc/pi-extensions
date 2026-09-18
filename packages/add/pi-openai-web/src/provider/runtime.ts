@@ -419,8 +419,10 @@ export class OpenAIWebRuntime {
   private async ensureConversation(descriptor: OpenAIWebModelDescriptor): Promise<ProviderConversation> {
     const wantedKey = descriptorKey(descriptor.browserModelLabel, descriptor.effort);
     const branchKey = this.deps.getBranchKey();
-    if (this.conversation && (this.conversation.descriptorKey !== wantedKey || this.conversation.branchKey !== branchKey || this.conversation.epoch !== this.leaseEpoch)) {
-      await this.resetConversation(this.conversation.descriptorKey !== wantedKey ? "descriptor_changed" : this.conversation.branchKey !== branchKey ? "pi_branch_changed" : "lease_epoch_changed");
+    // Pi session changes are handled by session_start. Keep this fallback so a
+    // missed lifecycle event cannot send one session's messages into another.
+    if (this.conversation && this.conversation.branchKey !== branchKey) {
+      await this.resetConversation("pi_branch_changed");
     }
     if (this.conversation) {
       if (this.conversation.conversationId && !isValidConversationId(this.conversation.conversationId)) {
@@ -431,6 +433,16 @@ export class OpenAIWebRuntime {
           await this.resetConversation("target_not_temporary_chat");
         }
       }
+    }
+    if (this.conversation && this.conversation.descriptorKey !== wantedKey) {
+      // Model/effort changes are provider settings, not Pi conversation
+      // boundaries. Reconfigure current target instead of opening a new tab.
+      await this.selectExact(this.conversation.client, descriptor);
+      this.conversation.descriptorKey = wantedKey;
+      this.conversation.leaseKey = `${branchKey}:${wantedKey}:epoch-${this.leaseEpoch}`;
+      this.conversation.epoch = this.leaseEpoch;
+      await this.persistResume(this.conversation);
+      this.emit("provider_model_changed_in_place", { targetId: this.conversation.targetId, model: descriptor.id });
     }
     if (!this.conversation) {
       // Reconnect first so a Pi restart can recover an existing target even when
@@ -596,8 +608,32 @@ export class OpenAIWebRuntime {
     const validated = checkpoint && checkpointIsFrom(checkpoint, source) ? checkpoint : undefined;
     await this.record(previous, "compaction", validated ? JSON.stringify(validated) : `checkpoint_invalid:${outcome.kind}`);
 
-    await this.resetConversation("compact_resume");
-    const fresh = await this.createConversation(descriptor);
+    // Recycle existing target instead of opening a visible browser tab during
+    // internal compaction. Navigation creates fresh Temporary Chat state while
+    // preserving Pi session ↔ browser target identity.
+    let fresh: ProviderConversation;
+    try {
+      await previous.client.Page.navigate({ url: toTemporaryChatUrl(this.config.chatgptUrl) });
+      await enablePage(previous.client);
+      await waitForComposer(previous.client);
+      if (!await ensureTemporaryChat(previous.client, this.config.chatgptUrl)) {
+        throw new Error("temporary_chat_recycle_failed");
+      }
+      await this.selectExact(previous.client, descriptor);
+      fresh = {
+        targetId: previous.targetId,
+        descriptorKey: descriptorKey(descriptor.browserModelLabel, descriptor.effort),
+        branchKey: previous.branchKey,
+        leaseKey: `${previous.branchKey}:${descriptorKey(descriptor.browserModelLabel, descriptor.effort)}:epoch-${this.leaseEpoch}`,
+        epoch: this.leaseEpoch,
+        bootstrapped: false,
+        syncedMessageCount: 0,
+        client: previous.client
+      };
+    } catch (error) {
+      await this.resetConversation("compact_resume");
+      throw error;
+    }
     const bootstrap = compactionBootstrapPrompt(validated ?? canonicalHistoryFallback(canonicalContext ?? this.canonicalContext));
     const bootstrapBaseline = await readTurnState(fresh.client);
     this.conversation = fresh;
