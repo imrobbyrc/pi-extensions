@@ -108,6 +108,22 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…[truncated ${text.length - max} chars]`;
 }
 
+function sleepUntil(delayMs: number, signal: AbortSignal | undefined, deadlineMs: number): Promise<void> {
+  const waitMs = Math.max(0, Math.min(delayMs, deadlineMs - Date.now()));
+  if (!signal) return sleep(waitMs);
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    timer = setTimeout(done, waitMs);
+    if (signal.aborted) done();
+    else signal.addEventListener("abort", done, { once: true });
+  });
+}
+
 function messageText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -635,6 +651,7 @@ export class OpenAIWebRuntime {
       if (controller.expired()) {
         const error = `provider_turn_timeout after ${controller.turnTimeoutMs}ms`;
         await stopGeneration(conversation.client).catch(() => {});
+        await this.deps.stopHarness?.().catch(() => {});
         controller.transition("failed", error);
         return { kind: "failed", error };
       }
@@ -733,14 +750,15 @@ export class OpenAIWebRuntime {
         } else {
           const error = `provider_turn_stalled after ${controller.stallTimeoutMs}ms without progress`;
           await stopGeneration(conversation.client).catch(() => {});
+          await this.deps.stopHarness?.().catch(() => {});
           controller.transition("failed", error);
           return { kind: "failed", error };
         }
       }
-      await sleep(watchPollDelayMs(
+      await sleepUntil(watchPollDelayMs(
         { stopVisible: state.stopVisible, busy: state.busy, textChanged: markdownChanged, harnessActive },
         this.config
-      ));
+      ), options.signal, controller.startedAtMs + controller.turnTimeoutMs);
     }
   }
 }
