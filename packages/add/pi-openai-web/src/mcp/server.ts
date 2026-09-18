@@ -13,6 +13,7 @@ type HerdrMcpAdapter = {
   run(request: { goal: string; workers: HerdrWorker[]; workerModel?: string; workerThinking?: string; handoff?: string }): Promise<{ id: string; status: string; workers: Array<{ id: string; state: string }> }>;
   status(runId?: string): any;
   correct(runId: string, workerId: string, instructions: string): any;
+  accept(runId: string, workerId: string): any;
   stop(runId?: string): any;
 };
 
@@ -78,9 +79,10 @@ export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
   "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers, and envelope string verbatim.",
   "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
-  "status — read persisted run lifecycle (workers, panes, baselines, failures, correction turns).",
-  "correct — send bounded correction instructions to one exact existing worker pane.",
-  "stop — stop a run and close its panes (omit run_id to reap all owned panes).",
+  "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
+  "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
+  "accept — accept one completed worker's work: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
+  "stop — stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
   "Workers always run as Pi agents (kind=pi); openai-web worker models are rejected."
 ].join(" ");
 
@@ -187,7 +189,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         title: "Herdr harness execution",
         description: HERDR_TOOL_DESCRIPTION,
         inputSchema: z.object({
-          action: z.enum(["plan", "run", "status", "correct", "stop"]),
+          action: z.enum(["plan", "run", "status", "correct", "accept", "stop"]),
           goal: herdrText(HERDR_GOAL_MAX).optional(),
           workers: herdrWorkers.optional(),
           gates: herdrGates.optional(),
@@ -218,7 +220,14 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         if (action === "correct") {
           if (!run_id || !worker_id || !instructions) throw new Error("herdr correct requires run_id, worker_id, and instructions.");
           const run = await deps.subagent.correct(run_id, worker_id, instructions);
-          return text({ ok: true, run_id: run.id, status: run.status, corrections: run.corrections });
+          const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
+          return text({ ok: true, run_id: run.id, status: run.status, corrections: task?.corrections ?? 0, accepted: task?.acceptedAt ? true : undefined });
+        }
+        if (action === "accept") {
+          if (!run_id || !worker_id) throw new Error("herdr accept requires run_id and worker_id.");
+          const run = await deps.subagent.accept(run_id, worker_id);
+          const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
+          return text({ ok: true, run_id: run.id, status: run.status, worker: { id: worker_id, state: task?.status ?? "completed", accepted_at: task?.acceptedAt } });
         }
         // stop
         const result = await deps.subagent.stop(run_id);

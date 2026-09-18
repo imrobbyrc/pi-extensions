@@ -10,7 +10,7 @@ One product, one flow:
 
 - **OpenAI Web Lead (always on)** — ChatGPT Web behaves like a native Pi model through `/model openai-web/<id>`, with dynamic model/effort discovery, exact browser selection, bounded context, and structured checkpoint compaction.
 - **Strict lead tools** — the Lead sees exactly seven MCP tools: six bounded read-only workspace inspections plus one Pi-native `herdr` execution tool. No shell, no writes, no subagent spawning, no browser worker tabs.
-- **Asynchronous native Herdr** — one `herdr` MCP tool with `run | status | correct | stop` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes.
+- **Asynchronous native Herdr** — one `herdr` MCP tool with `run | status | correct | accept | stop` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
 
 The former planner subsystem (`/planner`, task store, submit_plan/submit_review protocol, browser worker tabs, Pi subagent delegation) has been removed.
 
@@ -28,13 +28,13 @@ Select a discovered ChatGPT Web model/effort as your active Pi model:
 /model openai-web/gpt-5-6-sol-medium
 ```
 
-ChatGPT Web streams responses natively into Pi. The Lead Architect contract is injected into every provider turn: the Lead reasons, decomposes work, and — only after its mandatory planning gate (design graph + independent critique) — submits a worker decomposition through the `herdr` tool. Pi shows you the plan, asks for explicit confirmation, then Herdr splits panes and starts Pi workers. The Lead inspects `git_status`/`git_diff` afterwards, sends bounded `correct` turns to exact worker panes when needed, and reports the result.
+ChatGPT Web streams responses natively into Pi. The Lead Architect contract is injected into every provider turn: the Lead reasons, decomposes work, and — only after its mandatory planning gate (design graph + independent critique) — submits a worker decomposition through the `herdr` tool. Pi shows you the plan, asks for explicit confirmation, then Herdr splits panes and starts Pi workers. The Lead inspects `git_status`/`git_diff` afterwards, sends bounded `correct` rounds to the worker's own pane until the work is good, `accept`s each approved worker to close its pane, and reports the result.
 
 ```text
 Lead turn → herdr run (1–4 workers, DAG, ownership scopes)
           → explicit TUI confirmation in Pi
           → Herdr panes, Pi workers (kind=pi)
-          → herdr status / correct / stop
+          → herdr status / correct (same pane, repeatable) / accept (finalize)
           → Lead reviews diff → result
 ```
 
@@ -151,7 +151,7 @@ Strict frozen allowlist — the only tools the Lead can see:
 | `repo_map` | read-only | Bounded directory tree |
 | `git_status` | read-only | Git status |
 | `git_diff` | read-only | Git diff (staged or unstaged) |
-| `herdr` | **mutating** | `run \| status \| correct \| stop` — Pi-native worker execution |
+| `herdr` | **mutating** | `run \| status \| correct \| accept \| stop` — Pi-native worker execution |
 
 The `herdr` tool is honestly annotated (`readOnlyHint: false`, `destructiveHint: true`). Everything else is read-only. There are no shell, edit, write, install, migration, git-mutation, or subagent tools at any endpoint.
 
@@ -194,10 +194,10 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
 ### Lifecycle
 
 - `run` returns the run handle immediately; execution continues in the background.
-- `status` reads the persisted run lifecycle (workers, panes, baselines, failures, correction turns).
-- `correct` sends bounded instructions to one exact existing worker pane and requires fresh turn evidence (`state_change_seq` must advance) — the same worker is reused, never a replacement.
-- `stop` stops a run and closes its owned panes (omit `run_id` to reap all owned panes).
-- Restart recovery never replays: an interrupted run is marked failed, worker identities stay persisted so corrections can reuse the exact panes.
+- `status` reads the persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed herdr worker stays live in its pane awaiting review — it is never auto-cleaned while reviewable.
+- `correct` sends bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session (same agent, accumulated context) and completes again for re-review — repeatable, the round count shows in `status`; a still-running worker is steered mid-flight. The worker is always reused, never replaced.
+- `accept` accepts one completed worker's work: marks it accepted and closes its pane (idempotent). This is the required finalization for every approved worker.
+- `stop` stops a run and closes its owned panes, including unaccepted completed workers (omit `run_id` to reap all owned panes).
 
 ## Provider features
 

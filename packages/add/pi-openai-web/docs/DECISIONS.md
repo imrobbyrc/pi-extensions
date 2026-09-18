@@ -3,7 +3,8 @@
 > **Supersession notice (ADR-016, V3).** The planner subsystem, browser worker tabs,
 > and the Pi subagent bridge were removed. The product is now: always-on OpenAI Web
 > Lead Architect + strict bounded lead tools + asynchronous native Herdr
-> `run|status|correct|stop` + Herdr-managed Pi workers only. ADR-004, ADR-006,
+> `run|status|correct|accept|stop` (supervised review loop; see ADR-016 consequences)
+> + Herdr-managed Pi workers only. ADR-004, ADR-006,
 > ADR-008, ADR-009, ADR-010, ADR-011, ADR-013, and ADR-015 describe that removed
 > architecture and are **superseded**; they are retained below, clearly labeled, as
 > decision history only. Current guidance lives in ADR-016 and the still-valid ADRs
@@ -14,7 +15,7 @@
 Decision: collapse the product into one flow. The `openai-web` provider is the
 always-on Lead Architect; the MCP surface is a strict frozen allowlist (six bounded
 read-only workspace tools plus one `herdr` tool); worker execution is exclusively
-the asynchronous native `herdr` tool with `run|status|correct|stop` actions over
+the asynchronous native `herdr` tool with `run|status|correct|accept|stop` actions over
 Herdr-managed Pi agents (`--kind pi`). Removed entirely: `/planner` and
 `/chatgpt-plan-*` commands, the task store, `submit_plan`/`submit_plan_revision`/
 `submit_review` protocol writes, browser worker tabs (`spawn_worker`,
@@ -29,9 +30,14 @@ Consequences carried forward:
   `harnessAutoApproveHerdrRun` is explicitly configured; a human "no" is final.
 - Worker contracts stay bounded: 1–4 workers, DAG validation, non-overlapping
   `owns` scopes, `openai-web` worker models rejected.
-- `correct` reuses the exact worker pane and demands fresh turn evidence
-  (`state_change_seq` advance) — V2.2's same-worker-correction semantics survive in
-  tool form; the planner review loop around them does not.
+- `correct` reuses the exact worker pane: a completed herdr worker reopens in its
+  SAME pane/session via the core review loop (`correctTask`) and completes again
+  for re-review — repeatable, same agent, accumulated context. V2.2's
+  same-worker-correction semantics survive in tool form; the planner review loop
+  around them does not.
+- `accept` finalizes a completed worker: marks it accepted and closes its pane
+  (idempotent). Completed workers stay live in their panes until accepted or
+  stopped — `status` never auto-cleans a reviewable worker.
 - Restart recovery never replays: interrupted runs are marked failed with worker
   identities preserved for pane reuse.
 - `PLANNER_*` environment variable names and the `~/.pi/chatgpt-planner` state dir

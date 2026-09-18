@@ -1,6 +1,28 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 
+// Structural snapshots (controller is typed loosely by the local .d.ts; the
+// shapes come from @imrobbyrc/pi-core-subagent TaskSnapshot/RunSnapshot).
+type AdapterTaskSnapshot = { id: string; status: string; runtime?: string; acceptedAt?: number; paneId?: string };
+type AdapterRunSnapshot = { id: string; runtime: string; status: string; tasks: AdapterTaskSnapshot[] };
+
+const TERMINAL_RUN_STATUS = ["completed", "failed", "aborted"];
+
+/** A finished herdr worker kept live in its pane for lead review (core review loop). */
+function isReviewableWorker(run: AdapterRunSnapshot, task: AdapterTaskSnapshot): boolean {
+  return (task.runtime ?? run.runtime) === "herdr" && task.status === "completed" && !task.acceptedAt;
+}
+
+/**
+ * Review-loop surface the adapter requires from the controller (core package API:
+ * correctTask/acceptTask). Declared structurally so typechecking holds in every
+ * program that includes this file, regardless of module-resolution order.
+ */
+interface ReviewCapableController {
+  correct(runId: string, taskId: string, message: string, ctx: unknown): unknown;
+  accept(runId: string, taskId: string, ctx?: unknown): Promise<unknown>;
+}
+
 /** Captured session UI able to pose an explicit confirmation to the human. */
 export type HerdrConfirmUi = { hasUI: boolean; confirm: (title: string, message: string) => Promise<boolean> };
 
@@ -64,16 +86,49 @@ export class SubagentMcpAdapter {
 
   status(runId?: string) {
     const result = this.controller.status(runId);
-    // Completed workers no longer need panes or in-memory run history. Keep the
-    // snapshot returned above for the caller, then clear only when no run lives.
-    if (!this.controller.hasActiveRun()) this.controller.shutdown();
+    // Completed herdr workers stay live in their panes for lead review. Shut
+    // down (and thereby close owned panes) only once nothing is active AND
+    // nothing reviewable remains — i.e. every completed worker was accepted.
+    if (!this.controller.hasActiveRun() && !this.hasReviewableWorker()) this.controller.shutdown();
     return result;
   }
-  correct(runId: string, workerId: string, instructions: string) { return this.controller.steer(runId, workerId, instructions); }
+
+  private hasReviewableWorker(): boolean {
+    return (this.controller.status() as AdapterRunSnapshot[]).some((run) =>
+      run.tasks.some((task) => isReviewableWorker(run, task))
+    );
+  }
+
+  /** Lead review: a completed herdr worker reopens in its SAME pane/session via the core review loop; a still-running worker is steered. */
+  correct(runId: string, workerId: string, instructions: string) {
+    const ctx = this.context();
+    const run = this.controller.status(runId) as AdapterRunSnapshot;
+    const task = run.tasks.find((candidate: AdapterTaskSnapshot) => candidate.id === workerId);
+    // Completed (reviewable) and already-accepted herdr workers go through the
+    // core review API — the latter yields its precise "already accepted" refusal.
+    if (task && (isReviewableWorker(run, task) || task.acceptedAt)) {
+      if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before reviewing herdr workers.");
+      return (this.controller as unknown as ReviewCapableController).correct(runId, workerId, instructions, ctx);
+    }
+    return this.controller.steer(runId, workerId, instructions);
+  }
+
+  /** Explicit acceptance: finalizes a completed herdr worker — marks it accepted and closes its pane. Idempotent. */
+  async accept(runId: string, workerId: string) {
+    const ctx = this.context();
+    if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before accepting herdr workers.");
+    return (this.controller as unknown as ReviewCapableController).accept(runId, workerId, ctx);
+  }
+
   stop(runId?: string) {
     if (runId) return this.controller.cancel(runId);
-    const runs = this.controller.status();
-    for (const run of runs) if (!["completed", "failed", "aborted"].includes(run.status)) this.controller.cancel(run.id);
-    return this.controller.status();
+    const runs = this.controller.status() as AdapterRunSnapshot[];
+    const stopped = runs.map((run) =>
+      TERMINAL_RUN_STATUS.includes(run.status) ? run : this.controller.cancel(run.id)
+    );
+    // Force-terminal: with nothing left running, reap every owned pane —
+    // including reviewable completed workers the lead chose not to accept.
+    if (!this.controller.hasActiveRun()) this.controller.shutdown();
+    return stopped;
   }
 }

@@ -10,7 +10,7 @@ Maintain a **Pi-native harness** where the user runs an always-on **ChatGPT Web 
 /model openai-web/<id>
 ```
 
-The Lead reasons about architecture, inspects the local repository through a strict bounded MCP allowlist, and delegates all implementation to **Herdr-managed Pi workers** via the asynchronous native `herdr` tool (`run | status | correct | stop`). Pi remains the coding harness and the only mutation/command authority.
+The Lead reasons about architecture, inspects the local repository through a strict bounded MCP allowlist, and delegates all implementation to **Herdr-managed Pi workers** via the asynchronous native `herdr` tool (`run | status | correct | accept | stop`). Pi remains the coding harness and the only mutation/command authority.
 
 The project must remain standalone. Do **not** import, vendor, fork, or add a runtime dependency on `XiaoDuoYa/codex-with-chatgpt`.
 
@@ -18,7 +18,7 @@ The project must remain standalone. Do **not** import, vendor, fork, or add a ru
 
 1. **Always-on OpenAI Web Lead.** The `openai-web` provider is the Lead Architect. Its contract is injected into every provider turn; it is not an optional mode.
 2. **Strict tool allowlist.** The Lead sees exactly seven MCP tools: `read_file`, `list_directory`, `search_workspace`, `repo_map`, `git_status`, `git_diff` (read-only) plus `herdr` (mutating, honestly annotated `readOnlyHint: false` / `destructiveHint: true`). No shell, write/edit, install, migration, git-mutation, or subagent tools at any endpoint.
-3. **Asynchronous native Herdr.** `herdr run` validates a bounded 1–4 worker contract (DAG, non-overlapping `owns` scopes), requires explicit TUI confirmation, and returns a run handle immediately. `status`, `correct`, and `stop` operate on persisted runs. Headless runs fail closed unless `HARNESS_AUTO_APPROVE_HERDR_RUN=true`; a human "no" is final.
+3. **Asynchronous native Herdr.** `herdr run` validates a bounded 1–4 worker contract (DAG, non-overlapping `owns` scopes), requires explicit TUI confirmation, and returns a run handle immediately. `status`, `correct`, `accept`, and `stop` operate on persisted runs. A completed worker stays live in its pane for review: `correct` reopens it in the same pane and it completes again (repeatable); `accept` finalizes it and closes the pane (idempotent). Headless runs fail closed unless `HARNESS_AUTO_APPROVE_HERDR_RUN=true`; a human "no" is final.
 4. **Herdr Pi workers only.** Workers run as Pi agents (`herdr agent start --kind pi`). `openai-web` models are rejected as worker models. Workers cannot spawn panes, delegate, switch models, or commit/push/deploy; out-of-scope source mutations fail closed.
 5. **No planner, no browser workers, no Pi subagent.** The planner subsystem, browser worker tabs, and the `list_pi_tools`/`call_pi_tool` bridge were removed in V3. Do not reintroduce them. Superseded history lives in `docs/DECISIONS.md` (ADR-016 notice) and the labeled history section of `ROADMAP.md`.
 
@@ -49,8 +49,8 @@ Do not read/export cookies or credentials. Continue using a dedicated browser `-
 V3 architecture is implemented and tested (126 tests passing). Shipped:
 
 - Always-on Lead Architect contract with per-scope lead profile persistence (project/global/session).
-- Strict frozen MCP allowlist with the single `herdr` tool (`run | status | correct | stop`).
-- Herdr run store with no-replay restart recovery; correction turns reuse exact worker panes with fresh `state_change_seq` evidence.
+- Strict frozen MCP allowlist with the single `herdr` tool (`run | status | correct | accept | stop`).
+- Supervised review loop via the core package API: completed herdr workers stay live in their panes; `correct` reuses the exact worker pane/session and the worker completes again for re-review; `accept` finalizes and closes the pane. Failure/abort/stop stay force-terminal.
 - Provider substrate: dynamic model/effort discovery with last-known-good cache, exact browser selection, bounded context bootstrap, structured checkpoint compaction, durable transcripts, resume metadata.
 - Explicit TUI confirmation gate for `herdr run`; shutdown reaps all session-owned Herdr panes.
 
