@@ -137,7 +137,11 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
     if (!infrastructure) {
       const cfg = await config();
       if (!subagents) throw new Error("subagent_controller_unavailable");
-      const subagentAdapter = new SubagentMcpAdapter(subagents, () => subagentContext);
+      const subagentAdapter = new SubagentMcpAdapter(
+        subagents,
+        () => subagentContext,
+        async () => uiContext?.hasUI === true && await uiContext.confirm("Run Herdr workers?", "Start planned worker execution now?")
+      );
       infrastructure = new HarnessRuntime(cfg, () => createHarnessMcpFactory({
         config: cfg,
         workspaceRoot: process.cwd(),

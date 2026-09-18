@@ -2,11 +2,16 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 
 export class SubagentMcpAdapter {
-  constructor(private readonly controller: SubagentController, private readonly context: () => ExtensionContext | undefined) {}
+  constructor(
+    private readonly controller: SubagentController,
+    private readonly context: () => ExtensionContext | undefined,
+    private readonly confirm: () => Promise<boolean>
+  ) {}
 
   async run(request: { goal: string; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn: string[] }>; workerModel?: string; workerThinking?: string; handoff?: string }) {
     const ctx = this.context();
     if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before delegating work.");
+    if (!(await this.confirm())) throw new Error("herdr_confirmation_required: explicit Pi TUI confirmation declined or unavailable.");
     const tasks = request.workers.map((worker) => ({
       id: worker.id,
       agent: worker.id,
