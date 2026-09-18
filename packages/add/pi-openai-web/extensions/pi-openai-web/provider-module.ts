@@ -140,7 +140,10 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       const subagentAdapter = new SubagentMcpAdapter(
         subagents,
         () => subagentContext,
-        async () => uiContext?.hasUI === true && await uiContext.confirm("Run Herdr workers?", "Start planned worker execution now?")
+        {
+          ui: () => uiContext,
+          autoApprove: () => cfg.harnessAutoApproveHerdrRun === true
+        }
       );
       infrastructure = new HarnessRuntime(cfg, () => createHarnessMcpFactory({
         config: cfg,
