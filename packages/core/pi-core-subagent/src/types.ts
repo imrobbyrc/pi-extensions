@@ -56,6 +56,12 @@ export interface TaskSnapshot {
 	corrections?: number;
 	/** Herdr review loop: set when the lead explicitly accepted the completed work (finalizes the pane). */
 	acceptedAt?: number;
+	/**
+	 * Herdr terminal-cleanup metadata (P1b). Present ONLY while a failed task's pane/agent teardown
+	 * did not complete: the terminal `failed` state is then explicitly cleanup-pending (ownership
+	 * retained, retry via `retryTaskCleanup`). Absent means fully settled.
+	 */
+	cleanupPending?: { error: string; attempts: number; lastAttemptAt: number };
 }
 
 export interface RunSnapshot {

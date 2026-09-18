@@ -307,7 +307,7 @@ Background (default) + intercom — the run returns a runId immediately; you sta
 - **`herdr`**: Spawns each subagent into a dedicated Herdr multiplexer pane using `herdr pane split` and `herdr agent start` with child talk tools bridged over a Unix domain socket.
   - Requires running inside Herdr with `HERDR_ENV=1`.
   - Full parity with inprocess mode: supports graph waves, worktrees, `ask_parent`, `notify_parent`, sibling mailbox messages, steering, and cancellation.
-  - Panes remain open after completion for inspection; only startup failures prior to a usable session clean up the pane.
+  - Panes remain open after **completion** for inspection/review; **failed** panes are torn down by the terminal-cleanup boundary before the failure is published (abort + close; a failed teardown keeps the task `cleanupPending` — ownership retained, retry via `retryTaskCleanup`). Only startup failures prior to a usable session clean up the pane.
 
 #### Supervised review loop (herdr-only)
 
@@ -315,9 +315,9 @@ A completed herdr worker stays **live and reviewable** in its pane — the leade
 
 1. The worker finishes → task `completed`, pane + session retained (status semantics unchanged; `TERMINAL` untouched).
 2. `review_subagent(runId, taskId, message)` — correction round: the SAME pane and registered agent are re-prompted in place (no re-split, no re-start; the child reconnects over its stable per-task socket). The task reopens, applies the feedback, and completes again for re-review. Repeatable — work accumulates on the task's branch; `task.corrections` counts rounds.
-3. `accept_subagent(runId, taskId)` — explicit acceptance: marks `task.acceptedAt`, closes the pane, releases the live binding. Idempotent.
+3. `accept_subagent(runId, taskId)` — explicit acceptance: closes the owned pane and, only once the close is **confirmed**, marks `task.acceptedAt` and releases the live binding. Idempotent. A failed close (e.g. Herdr unreachable) is a retryable failure that retains the pane binding — accept again once Herdr is back.
 
-Failure/abort stay terminal (use `resume_subagent`, which still spawns a fresh pane); `subagent_cancel` and session shutdown force-clean all panes the run owns. Inprocess tasks are unaffected: `resume_subagent` still refuses completed tasks (`spawn a new task instead`). Corrections require a live pane binding, so after a session reload they refuse with a pointer to `resume_subagent`. Manager API: `correctTask(...)` / `acceptTask(...)`; controller: `correct(...)` / `accept(...)`.
+Failure/abort stay terminal (use `resume_subagent`, which still spawns a fresh pane); `subagent_cancel` and session shutdown force-clean all panes the run owns. A failed herdr task publishes its terminal state only after its pane/agent cleanup boundary: if that teardown fails, the task carries an explicit `cleanupPending` marker (ownership retained) and `retryTaskCleanup(runId, taskId)` re-runs it — the failed state is never presented as fully settled while the worker's pane may still be live. Late pane traffic after a terminal state is ignored. Inprocess tasks are unaffected: `resume_subagent` still refuses completed tasks (`spawn a new task instead`). Corrections require a live pane binding, so after a session reload they refuse with a pointer to `resume_subagent`. Manager API: `correctTask(...)` / `acceptTask(...)` / `retryTaskCleanup(...)`; controller: `correct(...)` / `accept(...)` / `retryCleanup(...)`.
 
 ### Child talk tools (always on)
 
