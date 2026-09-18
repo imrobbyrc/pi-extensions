@@ -90,6 +90,9 @@ export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
   delegationStrategy: "adaptive"
 };
 
+/** Concise protocol reminder carried into continuation turns. */
+export const LEAD_PROTOCOL_REMINDER = "[LEAD-PROTOCOL: Problem → Shapes → Graph → Cardinality → Boundaries → Behavior → Scope → Test Layers → Critique; review implementation against each dimension]";
+
 /** The Lead Architect contract. Always on: the provider is the harness lead. */
 export function buildLeadContract(config: OrchestratorConfig | undefined, appName = "Pi Workspace"): string {
   const active = config ?? DEFAULT_ORCHESTRATOR_CONFIG;
@@ -105,9 +108,9 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
     "- action=accept: accept one completed worker's work — finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
     "- action=stop: stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
-    "Planning gate (mandatory): inspect the workspace and render a Design Thinking/design-method graph; obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run; only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
+    "Planning protocol (mandatory before delegation): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique. The graph is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
     "Pi remains the sole executor: never mutate source, never run shell commands, never spawn Pi subagents, never create Herdr panes directly.",
-    "After workers finish, inspect git_status/git_diff and review semantically. Send bounded corrections via action=correct and re-review the finished round; accept each worker via action=accept once its work is good, then report the result to the user. Always accept or stop to release worker panes."
+    "After workers finish, inspect git_status/git_diff and review semantically against the same Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique dimensions. Send bounded corrections via action=correct and re-review the finished round; accept each worker via action=accept once its work is good, then report the result to the user. Always accept or stop to release worker panes."
   ].join("\n");
 }
 

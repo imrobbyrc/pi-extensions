@@ -376,10 +376,15 @@ test("OpenAIWebRuntime injects the always-on Lead contract into buildPrompt", ()
   assert.match(prompt1, /read_file, list_directory, search_workspace, repo_map, git_status, git_diff, herdr/);
   assert.match(prompt1, /never spawn Pi subagents/);
   assert.match(prompt1, /Plan an architecture/);
+  for (const section of ["Problem", "Shapes", "Graph", "Cardinality", "Boundaries", "Behavior", "Scope", "Test Layers", "Critique"]) {
+    assert.match(prompt1, new RegExp(section));
+  }
+  assert.match(prompt1, /review semantically against the same Problem, Shapes, Graph/);
 
-  // Continuation (bootstrapped) carries the lead reminder.
+  // Continuation (bootstrapped) carries the concise protocol reminder.
   const prompt2 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Next step" }] }, { bootstrapped: true, syncedMessageCount: 0 });
   assert.match(prompt2, /\[LEAD-MODE: active/);
+  assert.match(prompt2, /\[LEAD-PROTOCOL: Problem .* Critique;/);
   assert.match(prompt2, /zai\/glm-5\.3/);
   assert.match(prompt2, /Next step/);
 

@@ -16,7 +16,7 @@ import { descriptorKey } from "./model-ids.js";
 import { canonicalHistoryFallback, checkpointIsFrom, compactionBootstrapPrompt, compactionDecision, DEFAULT_COMPACTION_CONFIG, estimateTokens, HANDOFF_BRIEF_PROMPT, parseCompactionCheckpoint, type CompactionConfig } from "./compaction.js";
 import { SessionStore } from "./session-store.js";
 import type { OpenAIWebModelDescriptor } from "./types.js";
-import { buildLeadContract, type OrchestratorConfig } from "./orchestrator.js";
+import { buildLeadContract, LEAD_PROTOCOL_REMINDER, type OrchestratorConfig } from "./orchestrator.js";
 import type { ProviderResumeMetadata, ProviderResumeStore } from "./resume.js";
 
 /** Centralized limits for the deliberately lean provider bootstrap. */
@@ -549,9 +549,10 @@ export class OpenAIWebRuntime {
       ].join("\n");
     }
     const lead = this.deps.getOrchestratorConfig?.();
-    const leadReminder = `[LEAD-MODE: active (worker: ${lead?.workerModel ?? "default"}, thinking: ${lead?.workerThinking ?? "default"}, workers: ${lead?.maxParallelWorkers ?? 3}, strategy: ${lead?.delegationStrategy ?? "adaptive"})]\n`;
+    const leadReminder = `[LEAD-MODE: active (worker: ${lead?.workerModel ?? "default"}, thinking: ${lead?.workerThinking ?? "default"}, workers: ${lead?.maxParallelWorkers ?? 3}, strategy: ${lead?.delegationStrategy ?? "adaptive"})]`;
     return [
       leadReminder,
+      LEAD_PROTOCOL_REMINDER,
       "Continuing the same Pi conversation; only the new user message batch follows.",
       "",
       `<user>\n${truncate(userBatch, BOOTSTRAP_LIMITS.userBatchMax)}\n</user>`
