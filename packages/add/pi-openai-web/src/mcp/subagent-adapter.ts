@@ -10,13 +10,14 @@ export class SubagentMcpAdapter {
     const tasks = request.workers.map((worker) => ({
       id: worker.id,
       agent: worker.id,
-      task: `${worker.objective}\n\nOwned paths (must not modify outside these paths): ${worker.owns.join(", ")}`,
+      task: `${request.handoff ? `${request.handoff}\n\n` : ""}${worker.objective}\n\nOwned paths (must not modify outside these paths): ${worker.owns.join(", ")}`,
       write: true,
       ...(request.workerModel ? { model: request.workerModel } : {}),
       ...(request.workerThinking ? { thinking: request.workerThinking } : {}),
       ...(worker.dependsOn.length ? { needs: worker.dependsOn } : {})
     }));
-    const run = this.controller.run({ tasks, runtime: "herdr", prompt: request.handoff }, ctx);
+    // Tasks mode rejects top-level prompt; planning context travels with each task.
+    const run = this.controller.run({ tasks, runtime: "herdr" }, ctx);
     return { id: run.id, status: run.status, workers: run.tasks.map((task: { id: string; status: string }) => ({ id: task.id, state: task.status })) };
   }
 
