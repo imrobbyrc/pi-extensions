@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Socket } from "node:net";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -182,6 +182,15 @@ export function getHerdrChildEntryPath(): string {
 	return resolve(thisDir, "herdr-child.ts");
 }
 
+/**
+ * Deterministic per-task IPC directory. Correction rounds re-listen on the same socket path so the
+ * pane's child extension (which has this path baked into its env at split time) reconnects to us.
+ */
+export function herdrTaskDir(runId: string, taskId: string): string {
+	const safe = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+	return join(tmpdir(), "pi-herdr", `${safe(runId)}.${safe(taskId)}`);
+}
+
 export interface LiveHerdrChild {
 	abort(): void;
 	dispose(): void;
@@ -214,14 +223,113 @@ export interface RunHerdrChildOptions {
 	autoLimit: boolean;
 	defaultRuntimeMs: number;
 	unlimitedRuntimeMs: number;
+	/** Auth token for the child IPC socket. Pass the round-1 token on correction rounds so the pane's child (env-baked token) still authenticates. */
+	token?: string;
+	/** Reuse a live pane + registered agent (correction round) instead of splitting a new pane and starting a new agent. */
+	reuse?: { paneId: string; herdrAgent: string };
+}
+
+async function startHerdrPaneAndAgent(
+	opts: RunHerdrChildOptions,
+	server: Server,
+	socketPath: string,
+	token: string,
+	tempDir: string,
+): Promise<{ paneId: string; herdrAgent: string }> {
+	let paneId: string | undefined;
+	let herdrAgent: string | undefined;
+	try {
+		const parentPane = process.env.HERDR_PANE_ID;
+		const direction = await determineSplitDirection(opts.runner, parentPane);
+		const splitArgs = [
+			"pane",
+			"split",
+			"--current",
+			"--direction",
+			direction,
+			"--cwd",
+			opts.childCwd,
+			"--no-focus",
+			"--env",
+			"PI_SUBAGENT_CHILD=1",
+			"--env",
+			`PI_SUBAGENT_RUN_ID=${opts.run.id}`,
+			"--env",
+			`PI_SUBAGENT_TASK_ID=${opts.task.id}`,
+			"--env",
+			`PI_SUBAGENT_SOCKET=${socketPath}`,
+			"--env",
+			`PI_SUBAGENT_TOKEN=${token}`,
+		];
+
+		const splitRes = await opts.runner.exec(splitArgs);
+		if (splitRes.exitCode !== 0) {
+			throw new Error(`Failed to split Herdr pane: ${splitRes.stderr || `exit code ${splitRes.exitCode}`}`);
+		}
+		paneId = extractPaneId(splitRes.stdout);
+		opts.task.paneId = paneId;
+		opts.ownedPanes.add(paneId);
+
+		herdrAgent = generateHerdrAgentName(opts.task.agent, opts.task.id, opts.run.id);
+		opts.task.herdrAgent = herdrAgent;
+
+		const appendPrompt = [opts.prompt?.trim(), opts.subagentInstruction].filter(Boolean).join("\n\n");
+		const promptFile = join(tempDir, "append-prompt.txt");
+		writeFileSync(promptFile, appendPrompt, "utf8");
+
+		const childEntry = getHerdrChildEntryPath();
+		const enabledTools = Array.from(new Set([...opts.tools, ...CHILD_TALK_TOOLS]));
+		const startArgs = ["agent", "start", herdrAgent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--"];
+		if (opts.model) {
+			startArgs.push("--model", `${opts.model.provider}/${opts.model.id}`);
+		}
+		if (opts.thinking && opts.thinking !== "off") {
+			startArgs.push("--thinking", opts.thinking);
+		}
+		if (enabledTools.length > 0) {
+			startArgs.push("--tools", enabledTools.join(","));
+		}
+		startArgs.push(
+			"--no-extensions",
+			"-e",
+			childEntry,
+			"--append-system-prompt",
+			promptFile,
+			"--name",
+			`subagent: ${opts.task.agent}`,
+		);
+		if (opts.resume?.sessionFile) {
+			startArgs.push("--session", opts.resume.sessionFile);
+		}
+
+		const startRes = await opts.runner.exec(startArgs);
+		if (startRes.exitCode !== 0) {
+			await opts.runner.exec(["pane", "close", paneId]).catch(() => {});
+			opts.ownedPanes.delete(paneId);
+			throw new Error(`Failed to start Herdr agent: ${startRes.stderr || `exit code ${startRes.exitCode}`}`);
+		}
+	} catch (startupErr) {
+		try {
+			server.close();
+		} catch {}
+		try {
+			rmSync(tempDir, { recursive: true, force: true });
+		} catch {}
+		throw startupErr;
+	}
+	return { paneId: paneId!, herdrAgent: herdrAgent! };
 }
 
 export async function runHerdrChild(opts: RunHerdrChildOptions): Promise<void> {
 	await checkHerdrEnvironment(opts.runner);
 
-	const tempDir = mkdtempSync(join(tmpdir(), "pi-herdr-"));
+	const token = opts.token ?? randomBytes(16).toString("hex");
+	const tempDir = herdrTaskDir(opts.run.id, opts.task.id);
+	mkdirSync(tempDir, { recursive: true });
 	const socketPath = join(tempDir, "ipc.sock");
-	const token = randomBytes(16).toString("hex");
+	try {
+		rmSync(socketPath, { force: true });
+	} catch {}
 
 	let childSocket: Socket | undefined;
 	let childCompleted: { finalText?: string; usage?: UsageStats } | undefined;
@@ -352,84 +460,15 @@ export async function runHerdrChild(opts: RunHerdrChildOptions): Promise<void> {
 	let paneId: string | undefined;
 	let herdrAgent: string | undefined;
 
-	try {
-		const parentPane = process.env.HERDR_PANE_ID;
-		const direction = await determineSplitDirection(opts.runner, parentPane);
-		const splitArgs = [
-			"pane",
-			"split",
-			"--current",
-			"--direction",
-			direction,
-			"--cwd",
-			opts.childCwd,
-			"--no-focus",
-			"--env",
-			"PI_SUBAGENT_CHILD=1",
-			"--env",
-			`PI_SUBAGENT_RUN_ID=${opts.run.id}`,
-			"--env",
-			`PI_SUBAGENT_TASK_ID=${opts.task.id}`,
-			"--env",
-			`PI_SUBAGENT_SOCKET=${socketPath}`,
-			"--env",
-			`PI_SUBAGENT_TOKEN=${token}`,
-		];
-
-		const splitRes = await opts.runner.exec(splitArgs);
-		if (splitRes.exitCode !== 0) {
-			throw new Error(`Failed to split Herdr pane: ${splitRes.stderr || `exit code ${splitRes.exitCode}`}`);
-		}
-		paneId = extractPaneId(splitRes.stdout);
+	if (opts.reuse) {
+		// Correction round: the pane and its registered agent are still live — re-prompt them in place.
+		paneId = opts.reuse.paneId;
+		herdrAgent = opts.reuse.herdrAgent;
 		opts.task.paneId = paneId;
-		opts.ownedPanes.add(paneId);
-
-		herdrAgent = generateHerdrAgentName(opts.task.agent, opts.task.id, opts.run.id);
 		opts.task.herdrAgent = herdrAgent;
-
-		const appendPrompt = [opts.prompt?.trim(), opts.subagentInstruction].filter(Boolean).join("\n\n");
-		const promptFile = join(tempDir, "append-prompt.txt");
-		writeFileSync(promptFile, appendPrompt, "utf8");
-
-		const childEntry = getHerdrChildEntryPath();
-		const enabledTools = Array.from(new Set([...opts.tools, ...CHILD_TALK_TOOLS]));
-		const startArgs = ["agent", "start", herdrAgent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--"];
-		if (opts.model) {
-			startArgs.push("--model", `${opts.model.provider}/${opts.model.id}`);
-		}
-		if (opts.thinking && opts.thinking !== "off") {
-			startArgs.push("--thinking", opts.thinking);
-		}
-		if (enabledTools.length > 0) {
-			startArgs.push("--tools", enabledTools.join(","));
-		}
-		startArgs.push(
-			"--no-extensions",
-			"-e",
-			childEntry,
-			"--append-system-prompt",
-			promptFile,
-			"--name",
-			`subagent: ${opts.task.agent}`,
-		);
-		if (opts.resume?.sessionFile) {
-			startArgs.push("--session", opts.resume.sessionFile);
-		}
-
-		const startRes = await opts.runner.exec(startArgs);
-		if (startRes.exitCode !== 0) {
-			await opts.runner.exec(["pane", "close", paneId]).catch(() => {});
-			opts.ownedPanes.delete(paneId);
-			throw new Error(`Failed to start Herdr agent: ${startRes.stderr || `exit code ${startRes.exitCode}`}`);
-		}
-	} catch (startupErr) {
-		try {
-			server.close();
-		} catch {}
-		try {
-			rmSync(tempDir, { recursive: true, force: true });
-		} catch {}
-		throw startupErr;
+		opts.ownedPanes.add(paneId);
+	} else {
+		({ paneId, herdrAgent } = await startHerdrPaneAndAgent(opts, server, socketPath, token, tempDir));
 	}
 
 	try {

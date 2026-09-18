@@ -101,3 +101,15 @@ export const SteerParam = Type.Object({
 	taskId: Type.Optional(Type.String({ description: "Specific task id; defaults to all still-running tasks" })),
 	message: Type.String({ description: "Steering message to inject into the child's session" }),
 });
+export const ReviewParam = Type.Object({
+	runId: Type.String(),
+	taskId: Type.String({ description: "Completed herdr task to correct" }),
+	message: Type.String({
+		description:
+			"Lead review feedback: what to fix. Delivered to the same pane/session; the task completes again for re-review.",
+	}),
+});
+export const AcceptParam = Type.Object({
+	runId: Type.String({ description: "Run id from subagent()" }),
+	taskId: Type.String({ description: "Completed herdr task to accept" }),
+});

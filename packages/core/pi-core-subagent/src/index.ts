@@ -5,10 +5,12 @@ import { waveNotation } from "./graph.ts";
 import { cloneRun, getOrCreateSubagentManager, type ParkedMsg, type SubagentManager } from "./manager.ts";
 import { createPeekPane, type PeekTask } from "./peek.ts";
 import {
+	AcceptParam,
 	AwaitParam,
 	ReplyParam,
 	ResultParam,
 	ResumeParam,
+	ReviewParam,
 	RunIdParam,
 	SteerParam,
 	SubagentParams,
@@ -198,6 +200,7 @@ export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 			"A failed task interrupts you immediately as a steering message — handle it in the same turn (resume, swap model, re-dispatch) instead of finishing the plan on a broken intermediate result. Completes and aborts queue as follow-ups.",
 			"autoAwait:true only when this SAME turn must consume the result immediately. await_subagent is for syncing with your own parallel work — not the default follow-up to a spawn.",
 			"A task that failed mid-work (provider error, rate limit, timeout) keeps its session file and branch: resume_subagent(runId, taskId, model?) revives it with full context — prefer that over respawning. Respawn only when it never started (no session file).",
+			"Herdr review loop: a completed herdr worker stays live in its pane. review_subagent(runId, taskId, message) delivers corrections there and the worker completes again for re-review (repeatable); accept_subagent(runId, taskId) accepts the work, closes the pane, and finalizes. Always accept or cancel to release panes.",
 		],
 		parameters: SubagentParams,
 		executionMode: "parallel",
@@ -452,6 +455,54 @@ export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 					{
 						type: "text",
 						text: `Resumed ${runId}/${taskId} (${res.task.agent})${model ? ` on ${model}` : ""} from ${res.task.sessionFile}${res.task.branch ? `, branch ${res.task.branch}` : ""}.\nNext: subagent_status("${runId}") to confirm it is running; completion will notify you.`,
+					},
+				],
+				details: { run: run ? cloneRun(run) : undefined },
+			};
+		},
+	});
+
+	pi.registerTool<typeof ReviewParam, { run?: RunSnapshot }>({
+		name: "review_subagent",
+		label: "Review Subagent",
+		description:
+			"Send lead review feedback to a COMPLETED herdr worker: it reopens in the SAME pane and session (same agent, same context), applies the corrections, and completes again for re-review. Repeatable — work accumulates on its branch. Herdr runtime only.",
+		promptSnippet: "Correct a finished herdr worker in its own pane.",
+		parameters: ReviewParam,
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { runId, taskId, message } = params as { runId: string; taskId: string; message: string };
+			const res = manager.correctTask(runId, taskId, ctx, { message });
+			if (!res.ok) return { content: [{ type: "text", text: res.reason }], isError: true, details: {} };
+			const run = manager.getRun(runId);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Correction round ${res.task.corrections} started for ${runId}/${taskId} (${res.task.agent}) in its original pane. Completion will notify you — then review again or accept_subagent("${runId}", "${taskId}").`,
+					},
+				],
+				details: { run: run ? cloneRun(run) : undefined },
+			};
+		},
+	});
+
+	pi.registerTool<typeof AcceptParam, { run?: RunSnapshot }>({
+		name: "accept_subagent",
+		label: "Accept Subagent",
+		description:
+			"Accept a completed herdr worker's work: finalizes the review loop — marks it accepted and closes its pane. Idempotent. After acceptance the task is done; spawn new tasks for further work.",
+		promptSnippet: "Accept finished herdr work and close its pane.",
+		parameters: AcceptParam,
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { runId, taskId } = params as { runId: string; taskId: string };
+			const res = await manager.acceptTask(runId, taskId, ctx);
+			if (!res.ok) return { content: [{ type: "text", text: res.reason }], isError: true, details: {} };
+			const run = manager.getRun(runId);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Accepted ${runId}/${taskId} (${res.task.agent}) — pane closed, review loop finalized.`,
 					},
 				],
 				details: { run: run ? cloneRun(run) : undefined },

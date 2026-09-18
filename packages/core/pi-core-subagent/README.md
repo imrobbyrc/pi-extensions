@@ -309,6 +309,16 @@ Background (default) + intercom — the run returns a runId immediately; you sta
   - Full parity with inprocess mode: supports graph waves, worktrees, `ask_parent`, `notify_parent`, sibling mailbox messages, steering, and cancellation.
   - Panes remain open after completion for inspection; only startup failures prior to a usable session clean up the pane.
 
+#### Supervised review loop (herdr-only)
+
+A completed herdr worker stays **live and reviewable** in its pane — the leader closes the loop explicitly:
+
+1. The worker finishes → task `completed`, pane + session retained (status semantics unchanged; `TERMINAL` untouched).
+2. `review_subagent(runId, taskId, message)` — correction round: the SAME pane and registered agent are re-prompted in place (no re-split, no re-start; the child reconnects over its stable per-task socket). The task reopens, applies the feedback, and completes again for re-review. Repeatable — work accumulates on the task's branch; `task.corrections` counts rounds.
+3. `accept_subagent(runId, taskId)` — explicit acceptance: marks `task.acceptedAt`, closes the pane, releases the live binding. Idempotent.
+
+Failure/abort stay terminal (use `resume_subagent`, which still spawns a fresh pane); `subagent_cancel` and session shutdown force-clean all panes the run owns. Inprocess tasks are unaffected: `resume_subagent` still refuses completed tasks (`spawn a new task instead`). Corrections require a live pane binding, so after a session reload they refuse with a pointer to `resume_subagent`. Manager API: `correctTask(...)` / `acceptTask(...)`; controller: `correct(...)` / `accept(...)`.
+
 ### Child talk tools (always on)
 
 | Tool | Meaning |

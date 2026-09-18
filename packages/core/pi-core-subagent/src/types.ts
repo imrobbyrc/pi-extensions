@@ -52,6 +52,10 @@ export interface TaskSnapshot {
 	runtime?: SubagentRuntime;
 	paneId?: string;
 	herdrAgent?: string;
+	/** Herdr review loop: how many correction rounds this task has received. */
+	corrections?: number;
+	/** Herdr review loop: set when the lead explicitly accepted the completed work (finalizes the pane). */
+	acceptedAt?: number;
 }
 
 export interface RunSnapshot {

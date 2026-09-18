@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Herdr supervised review loop:** a completed herdr worker stays live in its pane for lead review. `review_subagent(runId, taskId, message)` reopens it with corrections in the SAME pane and registered agent (no re-split/re-start; deterministic per-task IPC dir + reused round-1 token so the pane's child extension reconnects), and it completes again for re-review — repeatable, `task.corrections` counts rounds. `accept_subagent(runId, taskId)` is the explicit finalization: sets `task.acceptedAt`, closes the owned pane, releases the live binding (idempotent). Failure/abort remain terminal; `subagent_cancel` and `clearRuns` force-close owned panes; inprocess semantics untouched (`resume_subagent` still refuses completed tasks; corrections/acceptance are herdr-scoped and refuse politely when no live pane binding exists, e.g. after a session reload). Manager API: `correctTask`/`acceptTask`; controller: `correct`/`accept`.
+
 (Entries below cover 1.3.43–1.3.49; the section was never rotated per release. Newest first:)
 
 - **Herdr runtime (`runtime: "herdr"`):** opt-in support for running subagents inside dedicated Herdr multiplexer panes (`herdr pane split` + `herdr agent start`). Initial default is `inprocess`; `/subagents runtime` opens a persisted default-runtime picker and `/subagents runtime herdr|inprocess` sets it directly, while explicit tool-call values override it. Provides full functional parity with inprocess mode (intercom, mailbox, graph waves, worktrees, cancel, steering) over an isolated Unix domain socket child extension. Panes remain open on success or failure for user inspection; un-startable panes are cleaned up automatically. Requires `HERDR_ENV=1`.

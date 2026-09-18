@@ -48,6 +48,22 @@ export class SubagentController {
 		return cloneRun(this.manager.getRun(runId)!);
 	}
 
+	correct(runId: string, taskId: string, message: string, ctx: any): RunSnapshot {
+		const res = this.manager.correctTask(runId, taskId, ctx, { message });
+		if (!res.ok) throw new Error(res.reason);
+		const run = this.manager.getRun(runId);
+		if (!run) throw new Error(`Unknown subagent run ${runId}.`);
+		return cloneRun(run);
+	}
+
+	async accept(runId: string, taskId: string, ctx?: any): Promise<RunSnapshot> {
+		const res = await this.manager.acceptTask(runId, taskId, ctx);
+		if (!res.ok) throw new Error(res.reason);
+		const run = this.manager.getRun(runId);
+		if (!run) throw new Error(`Unknown subagent run ${runId}.`);
+		return cloneRun(run);
+	}
+
 	setDefaultRuntime(runtime: SubagentRuntime): SubagentRuntime {
 		return this.manager.setDefaultRuntime(runtime);
 	}

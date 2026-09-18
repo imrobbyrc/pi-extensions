@@ -63,12 +63,13 @@ export default function (pi: ExtensionAPI): void {
 		}
 	}
 
-	let reconnectAttempts = 0;
-	const maxReconnectAttempts = 20;
+	let reconnectDelay = 200;
+	const RECONNECT_DELAY_FLOOR_MS = 200;
+	const RECONNECT_DELAY_CAP_MS = 5000;
 	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
 	function setupSocket(): void {
-		if (connected || reconnectAttempts >= maxReconnectAttempts) return;
+		if (connected || reconnectTimer) return;
 		try {
 			if (socket) {
 				try {
@@ -77,7 +78,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			socket = createConnection(childSocketPath, () => {
 				connected = true;
-				reconnectAttempts = 0;
+				reconnectDelay = RECONNECT_DELAY_FLOOR_MS;
 				send({ type: "hello", runId: childRunId, taskId: childTaskId, token: childToken });
 			});
 
@@ -112,12 +113,15 @@ export default function (pi: ExtensionAPI): void {
 	}
 
 	function scheduleReconnect(): void {
-		if (reconnectTimer || connected || reconnectAttempts >= maxReconnectAttempts) return;
-		reconnectAttempts++;
+		// Reconnect forever (bounded backoff): the pane outlives each prompt round, and a later
+		// correction round re-listens on the same socket path. The loop dies with the pane process.
+		if (reconnectTimer || connected) return;
+		const delay = reconnectDelay;
+		reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_DELAY_CAP_MS);
 		reconnectTimer = setTimeout(() => {
 			reconnectTimer = undefined;
 			setupSocket();
-		}, 200);
+		}, delay);
 	}
 
 	setupSocket();

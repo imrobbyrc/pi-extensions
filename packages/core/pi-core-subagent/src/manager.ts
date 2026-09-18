@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, sep } from "node:path";
@@ -94,9 +95,9 @@ function safeRealPath(path: string): string {
 		return path;
 	}
 }
-function getParentSessionFile(ctx: ExtensionContext): string | undefined {
+function getParentSessionFile(ctx: ExtensionContext | undefined): string | undefined {
 	try {
-		return ctx.sessionManager.getSessionFile?.();
+		return ctx?.sessionManager.getSessionFile?.();
 	} catch {
 		return undefined;
 	}
@@ -233,6 +234,8 @@ interface ResumeInput {
 	sessionFile: string;
 	branch?: string;
 	message: string;
+	/** Herdr review loop: re-prompt the live pane/agent instead of splitting a fresh pane. */
+	reusePane?: boolean;
 }
 
 interface ChildEventState {
@@ -309,6 +312,8 @@ export class SubagentManager {
 	private readonly instanceNonce = Math.random().toString(36).slice(2, 8);
 	private cleared = false;
 	private ownedPanes = new Set<string>();
+	/** Herdr review loop: per-task child IPC tokens. Presence marks a live pane binding (lost on session reload). */
+	private herdrTokens = new Map<string, string>();
 
 	private autoLimit = false;
 	private _defaultRuntime: SubagentRuntime = "inprocess";
@@ -427,6 +432,10 @@ export class SubagentManager {
 		for (const t of this.widgetTimers.values()) clearTimeout(t);
 		this.widgetTimers.clear();
 		this.widgetRuns = [];
+		// Session end: our panes must not outlive the manager that owns them.
+		for (const paneId of this.ownedPanes) void this.herdrRunner.exec(["pane", "close", paneId]).catch(() => {});
+		this.ownedPanes.clear();
+		this.herdrTokens.clear();
 	}
 
 	async restoreFromSidecar(ctx: ExtensionContext): Promise<void> {
@@ -488,7 +497,7 @@ export class SubagentManager {
 			this.scheduleWidget(this.listRuns()[0], ctx);
 		}
 	}
-	private persist(ctx: ExtensionContext): void {
+	private persist(ctx?: ExtensionContext): void {
 		if (this.cleared) return;
 		try {
 			const parentFile = getParentSessionFile(ctx);
@@ -949,6 +958,8 @@ export class SubagentManager {
 			const subagentInstruction = `You are running as a subagent. Your bash tool already executes in the project working directory — never prefix commands with \`cd\`. Do not call subagent/delegation tools unless the parent explicitly asks. Return a concise final answer. You MAY use ask_parent only when truly blocked on information only the parent has; notify_parent for one-way updates; send_agent_message/poll_agent_messages to coordinate with siblings. Your mailbox address and siblings: ${task.roster ?? "(none)"}. Use the exact task ids (e.g. task_2) as send_agent_message targets. Siblings run independently and may start late or finish early — never block indefinitely on their replies: poll at most 5 times, then proceed with your best judgment. A gated sibling (marked ↳ waits in the graph) may not be running yet; do not wait for it. An unanswered ask_parent times out after 10 minutes — proceed with your best judgment then. When your work is done, call notify_parent ONCE with a concise result summary — key findings, verdicts, file:line evidence — so the leader can start consuming your output before the run finishes.${worktreeNote}`;
 
 			if (run.runtime === "herdr") {
+				const token = this.herdrTokens.get(key) ?? randomBytes(16).toString("hex");
+				this.herdrTokens.set(key, token);
 				await runHerdrChild({
 					run,
 					task,
@@ -982,6 +993,11 @@ export class SubagentManager {
 					autoLimit: this.autoLimit,
 					defaultRuntimeMs: DEFAULT_RUNTIME_MS,
 					unlimitedRuntimeMs: UNLIMITED_RUNTIME_MS,
+					token,
+					reuse:
+						resume?.reusePane && task.paneId && task.herdrAgent
+							? { paneId: task.paneId, herdrAgent: task.herdrAgent }
+							: undefined,
 				});
 			} else {
 				const loader = new DefaultResourceLoader({
@@ -1483,7 +1499,15 @@ export class SubagentManager {
 		if (!run || !task) return { ok: false, reason: `Unknown ${runId}/${taskId}.` };
 		if (!TERMINAL.includes(task.status))
 			return { ok: false, reason: `${taskId} is still ${task.status} — use steer_subagent.` };
-		if (task.status === "completed") return { ok: false, reason: `${taskId} completed — spawn a new task instead.` };
+		if (task.status === "completed") {
+			return {
+				ok: false as const,
+				reason:
+					(task.runtime ?? run.runtime) === "herdr"
+						? `${taskId} completed — review_subagent sends corrections in its pane; accept_subagent finalizes it.`
+						: `${taskId} completed — spawn a new task instead.`,
+			};
+		}
 		if (!task.sessionFile || !existsSync(task.sessionFile)) {
 			return { ok: false, reason: `${taskId} has no session file to resume (never started) — respawn it.` };
 		}
@@ -1551,6 +1575,149 @@ export class SubagentManager {
 				this.finishRunIfSettled(run, ctx);
 			});
 		return { ok: true, task };
+	}
+
+	/**
+	 * Herdr review loop: reopen a COMPLETED task in its original pane/session with lead correction
+	 * feedback. The live pane and its registered agent are re-prompted in place (no re-split,
+	 * no re-start); the round settles like any other and notifies for re-review. Repeatable.
+	 */
+	correctTask(
+		runId: string,
+		taskId: string,
+		ctx: ExtensionContext,
+		opts: { message: string },
+	): { ok: true; task: TaskSnapshot } | { ok: false; reason: string } {
+		const run = this.runs.get(runId);
+		const task = run?.tasks.find((t) => t.id === taskId);
+		if (!run || !task) return { ok: false, reason: `Unknown ${runId}/${taskId}.` };
+		if ((task.runtime ?? run.runtime) !== "herdr") {
+			return { ok: false, reason: `${taskId} is not a herdr task — review loops require the herdr runtime.` };
+		}
+		if (!TERMINAL.includes(task.status)) {
+			return { ok: false, reason: `${taskId} is still ${task.status} — use steer_subagent.` };
+		}
+		if (task.status !== "completed") {
+			return { ok: false, reason: `${taskId} ended ${task.status} — resume_subagent revives it in a fresh pane.` };
+		}
+		if (task.acceptedAt) {
+			return { ok: false, reason: `${taskId} was already accepted — spawn a new task for further work.` };
+		}
+		if (!task.paneId || !task.herdrAgent || !this.herdrTokens.has(`${runId}:${taskId}`)) {
+			return {
+				ok: false,
+				reason: `${taskId} has no live pane binding (workspace or session reloaded) — resume_subagent respawns it in a fresh pane.`,
+			};
+		}
+		if (this.liveChildren.has(`${runId}:${taskId}`)) return { ok: false, reason: `${taskId} is already live.` };
+		if (!TERMINAL.includes(run.status)) {
+			return { ok: false, reason: `Run ${runId} is still ${run.status} — wait for it to settle before correcting.` };
+		}
+		const feedback = opts.message?.trim();
+		if (!feedback) return { ok: false, reason: "Correction message is required." };
+
+		const tools = task.tools?.filter((t) => !(CHILD_TALK_TOOLS as readonly string[]).includes(t));
+		const write = tools?.some((t) => WRITE_CAPABLE.includes(t)) ?? false;
+		const input: TaskInput = {
+			id: task.id,
+			agent: task.agent,
+			task: task.task,
+			cwd: task.cwd,
+			write,
+			tools: tools?.length ? tools : undefined,
+			model: task.model,
+			thinking: task.thinking as TaskInput["thinking"],
+			needs: task.needs,
+		};
+		const resume: ResumeInput = {
+			sessionFile: task.sessionFile ?? "",
+			branch: task.branch,
+			message: `Lead review feedback on your completed work (correction round) — apply these corrections, then finish again:\n\n${feedback}`,
+			reusePane: true,
+		};
+
+		this.cleared = false;
+		this.turnActivity = true;
+		Object.assign(task, {
+			status: "queued" as TaskStatus,
+			error: undefined,
+			endedAt: undefined,
+			finalText: undefined,
+			notifiedParent: false,
+			diffStat: undefined,
+			changedFiles: undefined,
+			worktreeError: undefined,
+		});
+		task.corrections = (task.corrections ?? 0) + 1;
+		run.status = "running";
+		run.endedAt = undefined;
+		run.awaited = false;
+		this.settlers.set(run.id, true);
+		this.runControllers.set(run.id, new AbortController());
+		for (const t of run.tasks) this.mailboxes.open(`${run.id}:${t.id}`);
+		this.updateRun(run, ctx);
+		this.emit("subagent:task-corrected", { runId: run.id, taskId: task.id, corrections: task.corrections });
+
+		void this.runChild(run, task, input, task.task, ctx, undefined, undefined, resume)
+			.catch((err) => {
+				if (!TERMINAL.includes(task.status)) {
+					this.updateTask(
+						run,
+						task,
+						{ status: "failed", error: err instanceof Error ? err.message : String(err), endedAt: Date.now() },
+						ctx,
+					);
+				}
+			})
+			.then(() => {
+				if (run.notifyPerTask) this.notifyTask(run, task, task.status as "completed" | "failed" | "aborted");
+				this.finishRunIfSettled(run, ctx);
+			});
+		return { ok: true, task };
+	}
+
+	/**
+	 * Herdr review loop: explicit lead acceptance. Finalizes a completed task — closes its pane
+	 * and releases the live binding. Idempotent. Failure/abort stay terminal and are not acceptable.
+	 */
+	async acceptTask(
+		runId: string,
+		taskId: string,
+		ctx?: ExtensionContext,
+	): Promise<{ ok: true; task: TaskSnapshot } | { ok: false; reason: string }> {
+		const run = this.runs.get(runId);
+		const task = run?.tasks.find((t) => t.id === taskId);
+		if (!run || !task) return { ok: false, reason: `Unknown ${runId}/${taskId}.` };
+		if ((task.runtime ?? run.runtime) !== "herdr") {
+			return { ok: false, reason: `${taskId} is not a herdr task — acceptance finalizes herdr review panes.` };
+		}
+		if (task.acceptedAt) return { ok: true, task };
+		if (!TERMINAL.includes(task.status)) {
+			return {
+				ok: false,
+				reason: `${taskId} is still ${task.status} — wait for it to finish (steer or cancel if it is stuck).`,
+			};
+		}
+		if (task.status !== "completed") {
+			return { ok: false, reason: `${taskId} ended ${task.status} — only completed work can be accepted.` };
+		}
+
+		task.acceptedAt = Date.now();
+		this.emit("subagent:task-accepted", { runId, taskId });
+		this.updateRun(run, ctx);
+		await this.closeOwnedPane(task);
+		this.persist(ctx);
+		return { ok: true, task };
+	}
+
+	private async closeOwnedPane(task: TaskSnapshot): Promise<void> {
+		const paneId = task.paneId;
+		if (!paneId || !this.ownedPanes.has(paneId)) return;
+		this.ownedPanes.delete(paneId);
+		this.herdrTokens.delete(`${task.runId}:${task.id}`);
+		try {
+			await this.herdrRunner.exec(["pane", "close", paneId]);
+		} catch {}
 	}
 
 	private finishRunIfSettled(run: RunSnapshot, ctx: ExtensionContext): void {
@@ -1632,6 +1799,8 @@ export class SubagentManager {
 		this.settleRun(runId, run);
 		this.runControllers.delete(runId);
 		for (const task of run.tasks) this.mailboxes.close(`${run.id}:${task.id}`);
+		// Stop force-cleans: tear down the panes this run owns, including reviewable ones.
+		for (const task of run.tasks) void this.closeOwnedPane(task);
 		this.emit("subagent:run-completed", { runId: run.id, status: "aborted", run: cloneRun(run) });
 		return { aborted };
 	}

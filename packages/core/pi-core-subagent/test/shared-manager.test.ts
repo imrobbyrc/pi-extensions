@@ -113,6 +113,8 @@ describe("dual-package loading without duplicate native tool registration", () =
 		expect(initialTools).toContain("steer_subagent");
 		expect(initialTools).toContain("resume_subagent");
 		expect(initialTools).toContain("subagent_cancel");
+		expect(initialTools).toContain("review_subagent");
+		expect(initialTools).toContain("accept_subagent");
 
 		// 2. Load pi-openai-web extension
 		expect(() => chatGptPlannerExtension(pi as any)).not.toThrow();
@@ -136,7 +138,7 @@ describe("dual-package loading without duplicate native tool registration", () =
 		// 2. Load pi-core-subagent extension next
 		registerCoreSubagent(pi);
 		expect(pi.registeredTools).toContain("subagent");
-		expect(pi.registeredTools).toHaveLength(8);
+		expect(pi.registeredTools).toHaveLength(10);
 
 		// Controller created after also shares the same manager
 		const controller = createSubagentController(pi);
@@ -148,7 +150,7 @@ describe("dual-package loading without duplicate native tool registration", () =
 
 		registerCoreSubagent(pi);
 		const countAfterFirst = pi.registeredTools.length;
-		expect(countAfterFirst).toBe(8);
+		expect(countAfterFirst).toBe(10);
 
 		// Calling it again should be a no-op, not throw duplicate tool error
 		expect(() => registerCoreSubagent(pi)).not.toThrow();
