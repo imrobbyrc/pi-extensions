@@ -116,6 +116,24 @@ test("status auto-shutdown resumes only after the reviewable worker is accepted"
   assert.equal(calls.filter((call) => call.method === "shutdown").length, 1, "accepted worker releases the run");
 });
 
+test("status does not reap a failed worker while Herdr cleanup is pending", () => {
+  const calls: RecordedCall[] = [];
+  const run = {
+    id: "run-pending",
+    runtime: "herdr",
+    status: "failed",
+    tasks: [{ id: "w1", status: "failed", runtime: "herdr", cleanupPending: { error: "close failed", attempts: 1, lastAttemptAt: Date.now() } }]
+  };
+  const controller = {
+    status: () => structuredClone([run]),
+    hasActiveRun: () => false,
+    shutdown: () => calls.push({ method: "shutdown", args: [] })
+  };
+  const adapter = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session);
+  adapter.status();
+  assert.equal(calls.filter((call) => call.method === "shutdown").length, 0);
+});
+
 test("correct on a completed herdr worker uses the core review API with session context", async () => {
   const { adapter, calls } = loopHarness(completedHerdrRun());
   const run = adapter.correct("run-1", "w1", "tighten the boundary check") as any;
@@ -159,6 +177,25 @@ test("stop without run_id reaps reviewable panes once nothing is active", async 
   assert.equal(calls.filter((call) => call.method === "shutdown").length, 1);
 });
 
+test("stop without run_id does not reap while failed cleanup is pending", () => {
+  const calls: RecordedCall[] = [];
+  const run = {
+    id: "run-pending",
+    runtime: "herdr",
+    status: "failed",
+    tasks: [{ id: "w1", status: "failed", runtime: "herdr", cleanupPending: { error: "close failed", attempts: 1, lastAttemptAt: Date.now() } }]
+  };
+  const controller = {
+    status: () => structuredClone([run]),
+    hasActiveRun: () => false,
+    shutdown: () => calls.push({ method: "shutdown", args: [] }),
+    cancel: () => run
+  };
+  const adapter = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session);
+  adapter.stop();
+  assert.equal(calls.filter((call) => call.method === "shutdown").length, 0);
+});
+
 test("accept is delegated with session context and recorded on the task", async () => {
   const { adapter, calls } = loopHarness(completedHerdrRun());
   const run = (await adapter.accept("run-1", "w1")) as any;
@@ -167,6 +204,35 @@ test("accept is delegated with session context and recorded on the task", async 
   assert.deepEqual(accepts[0]?.args.slice(0, 2), ["run-1", "w1"]);
   assert.equal(accepts[0]?.args[2], session);
   assert.ok((run.tasks[0]?.acceptedAt ?? 0) > 0, "acceptance is recorded on the task");
+});
+
+test("accept propagates a pane-close failure instead of returning false success", async () => {
+  const controller = {
+    accept: async () => { throw new Error("pane close failed"); }
+  };
+  const adapter = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session);
+  await assert.rejects(adapter.accept("run-1", "w1"), /pane close failed/);
+});
+
+test("accept turns a manager-style failure result into a rejected provider call", async () => {
+  const controller = {
+    accept: async () => ({ ok: false, reason: "pane close failed" })
+  };
+  const adapter = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session);
+  await assert.rejects(adapter.accept("run-1", "w1"), /pane close failed/);
+});
+
+test("retryCleanup delegates to the core cleanup retry with session context", async () => {
+  const calls: RecordedCall[] = [];
+  const controller = {
+    retryCleanup: async (...args: unknown[]) => {
+      calls.push({ method: "retryCleanup", args });
+      return { id: "run-pending", status: "failed", tasks: [] };
+    }
+  };
+  const adapter = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session);
+  await adapter.retryCleanup("run-pending", "w1");
+  assert.deepEqual(calls[0]?.args, ["run-pending", "w1", session]);
 });
 
 test("stop with run_id cancels the run without touching others", async () => {

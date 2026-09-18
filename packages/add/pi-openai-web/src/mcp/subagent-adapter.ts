@@ -3,7 +3,14 @@ import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 
 // Structural snapshots (controller is typed loosely by the local .d.ts; the
 // shapes come from @imrobbyrc/pi-core-subagent TaskSnapshot/RunSnapshot).
-type AdapterTaskSnapshot = { id: string; status: string; runtime?: string; acceptedAt?: number; paneId?: string };
+type AdapterTaskSnapshot = {
+  id: string;
+  status: string;
+  runtime?: string;
+  acceptedAt?: number;
+  paneId?: string;
+  cleanupPending?: { error: string; attempts: number; lastAttemptAt: number };
+};
 type AdapterRunSnapshot = { id: string; runtime: string; status: string; tasks: AdapterTaskSnapshot[] };
 
 const TERMINAL_RUN_STATUS = ["completed", "failed", "aborted"];
@@ -11,6 +18,13 @@ const TERMINAL_RUN_STATUS = ["completed", "failed", "aborted"];
 /** A finished herdr worker kept live in its pane for lead review (core review loop). */
 function isReviewableWorker(run: AdapterRunSnapshot, task: AdapterTaskSnapshot): boolean {
   return (task.runtime ?? run.runtime) === "herdr" && task.status === "completed" && !task.acceptedAt;
+}
+
+/** A failed herdr worker whose pane teardown is still retryable. */
+function isCleanupPendingWorker(_run: AdapterRunSnapshot, task: AdapterTaskSnapshot): boolean {
+  // cleanupPending is emitted only by the core's Herdr lifecycle, but treat the
+  // marker as authoritative even if an older snapshot omitted runtime metadata.
+  return Boolean(task.cleanupPending);
 }
 
 /**
@@ -21,6 +35,7 @@ function isReviewableWorker(run: AdapterRunSnapshot, task: AdapterTaskSnapshot):
 interface ReviewCapableController {
   correct(runId: string, taskId: string, message: string, ctx: unknown): unknown;
   accept(runId: string, taskId: string, ctx?: unknown): Promise<unknown>;
+  retryCleanup?(runId: string, taskId: string, ctx?: unknown): Promise<unknown>;
 }
 
 /** Captured session UI able to pose an explicit confirmation to the human. */
@@ -89,13 +104,19 @@ export class SubagentMcpAdapter {
     // Completed herdr workers stay live in their panes for lead review. Shut
     // down (and thereby close owned panes) only once nothing is active AND
     // nothing reviewable remains — i.e. every completed worker was accepted.
-    if (!this.controller.hasActiveRun() && !this.hasReviewableWorker()) this.controller.shutdown();
+    if (!this.controller.hasActiveRun() && !this.hasReviewableWorker() && !this.hasPendingCleanup()) this.controller.shutdown();
     return result;
   }
 
   private hasReviewableWorker(): boolean {
     return (this.controller.status() as AdapterRunSnapshot[]).some((run) =>
       run.tasks.some((task) => isReviewableWorker(run, task))
+    );
+  }
+
+  private hasPendingCleanup(): boolean {
+    return (this.controller.status() as AdapterRunSnapshot[]).some((run) =>
+      run.tasks.some((task) => isCleanupPendingWorker(run, task))
     );
   }
 
@@ -117,7 +138,24 @@ export class SubagentMcpAdapter {
   async accept(runId: string, workerId: string) {
     const ctx = this.context();
     if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before accepting herdr workers.");
-    return (this.controller as unknown as ReviewCapableController).accept(runId, workerId, ctx);
+    // The core accept API rejects when pane close fails. Do not catch or turn that
+    // rejection into a successful-looking run snapshot: acceptance is transactional.
+    const result = await (this.controller as unknown as ReviewCapableController).accept(runId, workerId, ctx);
+    // Keep the provider boundary defensive for structural/older controllers that
+    // return the manager's `{ ok: false, reason }` result instead of throwing.
+    if (result && typeof result === "object" && "ok" in result && (result as { ok?: unknown }).ok === false) {
+      throw new Error(String((result as { reason?: unknown }).reason ?? "herdr accept failed"));
+    }
+    return result;
+  }
+
+  /** Retry terminal Herdr pane/agent cleanup that previously failed. */
+  async retryCleanup(runId: string, workerId: string) {
+    const ctx = this.context();
+    if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before retrying Herdr cleanup.");
+    const retry = (this.controller as unknown as ReviewCapableController).retryCleanup;
+    if (!retry) throw new Error("herdr_cleanup_retry_unavailable: core controller does not support retryCleanup.");
+    return retry.call(this.controller, runId, workerId, ctx);
   }
 
   stop(runId?: string) {
@@ -128,7 +166,7 @@ export class SubagentMcpAdapter {
     );
     // Force-terminal: with nothing left running, reap every owned pane —
     // including reviewable completed workers the lead chose not to accept.
-    if (!this.controller.hasActiveRun()) this.controller.shutdown();
+    if (!this.controller.hasActiveRun() && !this.hasPendingCleanup()) this.controller.shutdown();
     return stopped;
   }
 }
