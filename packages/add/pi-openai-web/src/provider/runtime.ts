@@ -480,7 +480,10 @@ export class OpenAIWebRuntime {
       await this.supersedeStaleTurn();
       const incomingTokens = estimateTokens(...context.messages.map(message => messageText((message as { content?: unknown }).content)));
       if (this.conversation && compactionDecision(this.contextTokens + incomingTokens, this.compactionConfig) === "compact") {
-        await this.compactConversation(descriptor, context.messages.length, context);
+        // Preserve the actual sync boundary from the existing browser conversation.
+        // The current Pi batch has not been submitted yet and must be sent after
+        // compaction resumes; passing context.messages.length would swallow it.
+        await this.compactConversation(descriptor, this.conversation.syncedMessageCount, context);
       }
       const conversation = await this.ensureConversation(descriptor);
       const prompt = this.fitComposerPrompt(this.buildPrompt(context, conversation));

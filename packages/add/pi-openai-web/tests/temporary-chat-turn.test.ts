@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { OpenAIWebRuntime } from "../src/provider/runtime.js";
+import { newUserBatch, OpenAIWebRuntime } from "../src/provider/runtime.js";
 import { MemoryProviderResumeStore } from "../src/provider/resume.js";
 import { SessionStore } from "../src/provider/session-store.js";
 import type { HarnessConfig } from "../src/types.js";
@@ -180,6 +180,52 @@ test("same Pi session reuses target; changed branch resets it", async () => {
     const newSessionTarget = (await (runtime as any).ensureConversation(descriptor)).targetId;
     assert.equal(newSessionTarget, "tab-session-2");
     assert.equal(closed, 1, "new Pi session may reset old target");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("auto compaction keeps the triggering user batch unsynced for resume", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-compaction-boundary-test-"));
+  try {
+    const runtime = new OpenAIWebRuntime({
+      config: { ...baseConfig(dir), providerCompactionMaxTokens: 1, providerContextLimitTokens: 1 },
+      catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+      ensureBrowser: async () => {},
+      getBranchKey: () => "branch-1"
+    });
+    const previous = {
+      targetId: "tab-compaction",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "lease",
+      epoch: 0,
+      bootstrapped: true,
+      // Two canonical messages are already synchronized in ChatGPT; the third
+      // message is the new batch that triggered auto compaction.
+      syncedMessageCount: 2,
+      client: {} as any
+    };
+    const runtimeAny = runtime as any;
+    runtimeAny.conversation = previous;
+    runtimeAny.contextTokens = 100;
+    let boundary: number | undefined;
+    runtimeAny.compactConversation = async (_descriptor: unknown, synced: number) => {
+      boundary = synced;
+      throw new Error("stop_after_compaction_boundary");
+    };
+
+    const context = {
+      messages: [
+        { role: "user", content: "already sent" },
+        { role: "assistant", content: "prior answer" },
+        { role: "user", content: "triggering message" }
+      ]
+    };
+    const outcome = await runtime.runTurn(descriptor, context, {});
+    assert.deepEqual(outcome, { kind: "failed", error: "stop_after_compaction_boundary" });
+    assert.equal(boundary, previous.syncedMessageCount);
+    assert.equal(newUserBatch(context, boundary!), "triggering message");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
