@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -28,10 +29,35 @@ export interface OrchestrationGates {
   critique: string;
 }
 
+// ponytail: gates are attestations (non-empty strings), not verified artifacts —
+// critique evidence comes from a prior run, the user, or first-run adversarial self-review.
+// Upgrading to verified gates requires herdr-side artifacts, not more client checks.
 export function assertOrchestrationGates(gates: OrchestrationGates | undefined): asserts gates is OrchestrationGates {
   if (!gates || !gates.graph.trim() || !gates.handoff.trim() || !gates.critique.trim()) {
-    throw new Error("orchestration_gate_required: graph, handoff, and independent critique evidence are mandatory");
+    throw new Error("orchestration_gate_required: graph, handoff, and critique evidence are mandatory");
   }
+}
+
+/** Canonical worker JSON: stable equality across dependsOn/depends_on spellings. */
+export function canonicalWorkers(workers: unknown[]): string {
+  return JSON.stringify((workers as Array<Record<string, unknown>>).map((worker) => ({
+    id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.dependsOn ?? worker.depends_on ?? []
+  })));
+}
+
+/** Stable fingerprint binding a handoff envelope to one exact goal + worker decomposition. */
+export function planFingerprint(goal: string, workers: unknown[]): string {
+  return createHash("sha256").update(`${goal}\n${canonicalWorkers(workers)}`).digest("hex").slice(0, 32);
+}
+
+/** Pi-side issuance: fresh taskId + goal/workers-bound fingerprint → handoff envelope string. */
+export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[] }>, gates: OrchestrationGates): string {
+  return buildHerdrHandoff({
+    taskId: randomUUID(),
+    planFingerprint: planFingerprint(goal, workers),
+    gates,
+    workers: workers.map((worker) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.dependsOn ?? worker.depends_on ?? [] }))
+  });
 }
 
 /** Build an explicit, task-bound provider→Herdr handoff envelope. */
@@ -72,12 +98,13 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     `You are the Lead Architect and Orchestrator. Implementation and code changes are delegated to Herdr-managed Pi worker agents (worker model: ${active.workerModel}, thinking: ${active.workerThinking}, max parallel workers: ${active.maxParallelWorkers}, strategy: ${active.delegationStrategy}).`,
     "Your responsibilities: high-level reasoning, architectural planning, task decomposition, and code review.",
     `Workspace inspection tools (the only workspace access you have): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app.`,
-    "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=run|status|correct|stop.",
-    "- action=run: submit a bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI.",
+    "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|stop.",
+    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim.",
+    "- action=run: submit the exact same goal and workers together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, corrections).",
     "- action=correct: send bounded correction instructions to one exact existing worker.",
     "- action=stop: stop a run and clean up its panes.",
-    "Planning gate (mandatory): inspect the workspace and render a Design Thinking/design-method graph; obtain an independent worker critique; only then call herdr action=run.",
+    "Planning gate (mandatory): inspect the workspace and render a Design Thinking/design-method graph; obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run; only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
     "Pi remains the sole executor: never mutate source, never run shell commands, never spawn Pi subagents, never create Herdr panes directly.",
     "After workers finish, inspect git_status/git_diff and review semantically. Send bounded corrections via action=correct only when needed; otherwise report the result to the user."
   ].join("\n");

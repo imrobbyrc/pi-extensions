@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { treeToMarkdown, type DomTreeNode } from "../src/provider/answer.js";
-import { buildBootstrapContext, BOOTSTRAP_LIMITS, latestUserMessage, newUserBatch } from "../src/provider/runtime.js";
+import { buildBootstrapContext, BOOTSTRAP_LIMITS, latestUserMessage, newUserBatch, resumeConversationMatches } from "../src/provider/runtime.js";
 import { ProviderTurnController } from "../src/provider/turn.js";
 import type { OpenAIWebModelDescriptor } from "../src/provider/types.js";
 
@@ -63,6 +63,14 @@ test("bootstrap context keeps only bounded stable Pi instructions", () => {
   assert.match(bootstrap, /…\[truncated/);
   assert.ok(bootstrap.length < BOOTSTRAP_LIMITS.systemPromptMax + 100);
   assert.doesNotMatch(bootstrap, /old request|old tool result|old answer|<pi_history>|<pi_tools>/);
+});
+
+test("resume requires the target URL to keep the persisted conversation", () => {
+  const id = "6aaaa781-ab58-83ec-8a2c-a8ca1333e221";
+  assert.equal(resumeConversationMatches(id, `https://chatgpt.com/c/${id}`), true);
+  assert.equal(resumeConversationMatches(id, "https://chatgpt.com/c/7aaaa781-ab58-83ec-8a2c-a8ca1333e221"), false);
+  assert.equal(resumeConversationMatches(id, "https://chatgpt.com/?temporary-chat=true"), false);
+  assert.equal(resumeConversationMatches(undefined, "https://chatgpt.com/?temporary-chat=true"), true);
 });
 
 test("latestUserMessage selects only the newest user request for a fresh Web conversation", () => {

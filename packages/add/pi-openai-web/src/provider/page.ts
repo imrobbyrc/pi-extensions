@@ -202,9 +202,9 @@ export async function isTemporaryChat(client: CdpClient): Promise<boolean> {
     };
   }`);
   if (!info) return false;
-  if (info.isNormalChatUrl) return false;
-  // URL parameter is navigation intent, not evidence. Require a visible
-  // Temporary Chat control so a non-temporary target fails closed.
+  // ChatGPT assigns temporary conversations a /c/<id> URL after first turn.
+  // Visible "Turn off temporary chat" control is stronger evidence than URL
+  // shape; URL parameter remains non-authoritative.
   return info.hasTurnOff;
 }
 
@@ -222,8 +222,7 @@ export async function ensureTemporaryChat(client: CdpClient, chatgptUrl?: string
   if (clicked === true) {
     const confirmed = await waitFor(client, `() => {
       const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
-      const isNormalChatUrl = /\\/c\\/[^/?#]+/i.test(location.href);
-      return !isNormalChatUrl && hasTurnOff;
+      return hasTurnOff;
     }`, 3_000);
     if (confirmed) return true;
   }
@@ -235,8 +234,7 @@ export async function ensureTemporaryChat(client: CdpClient, chatgptUrl?: string
 
   return waitFor(client, `() => {
     const hasTurnOff = Boolean(document.querySelector('button[aria-label="Turn off temporary chat"]'));
-    const isNormalChatUrl = /\\/c\\/[^/?#]+/i.test(location.href);
-    return !isNormalChatUrl && hasTurnOff;
+    return hasTurnOff;
   }`, 5_000);
 }
 

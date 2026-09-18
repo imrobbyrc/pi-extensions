@@ -40,6 +40,9 @@ export class SubagentMcpAdapter {
     } else if (this.gate?.autoApprove() !== true) {
       throw new Error("herdr_run_blocked: no UI captured for explicit confirmation and harnessAutoApproveHerdrRun is not explicitly enabled (fail closed).");
     }
+    // Replay guard: check before the synchronous controller call. Mark only
+    // after success so startup failures remain retryable; no await occurs
+    // between check and run, so concurrent duplicates cannot both pass.
     const handoff = request.handoff?.trim();
     if (handoff && this.consumedHandoffs.has(handoff)) {
       throw new Error("orchestration_handoff_replay: handoff already consumed.");

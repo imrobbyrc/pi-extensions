@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint } from "../provider/orchestrator.js";
 type HerdrWorker = { id: string; objective: string; owns: string[]; dependsOn: string[] };
 
 type HerdrMcpAdapter = {
@@ -68,9 +68,16 @@ const herdrWorkers = z.array(z.object({
   depends_on: z.array(herdrText(100)).max(HERDR_LIST_MAX)
 })).min(1).max(4);
 
+const herdrGates = z.object({
+  graph: herdrText(HERDR_ITEM_MAX),
+  handoff: herdrText(HERDR_ITEM_MAX),
+  critique: herdrText(HERDR_ITEM_MAX)
+});
+
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
-  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (explicit TUI confirmation in Pi; returns a run handle immediately).",
+  "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers, and envelope string verbatim.",
+  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction turns).",
   "correct — send bounded correction instructions to one exact existing worker pane.",
   "stop — stop a run and close its panes (omit run_id to reap all owned panes).",
@@ -86,19 +93,10 @@ export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[
   if (!input.workers?.length) throw new Error("herdr run requires 1-4 workers.");
   if (!input.handoff?.trim()) throw new Error("herdr run requires planning handoff.");
   const parsed = parseHerdrHandoff(input.handoff);
-  const normalize = (worker: unknown): string => {
-    const value = worker as Record<string, unknown>;
-    return JSON.stringify({
-      id: value.id,
-      objective: value.objective,
-      owns: value.owns,
-      dependsOn: value.dependsOn ?? value.depends_on
-    });
-  };
-  const expected = input.workers.map(normalize);
-  const actual = parsed.workers.map(normalize);
-  if (expected.length !== actual.length || expected.some((worker, index) => worker !== actual[index])) {
-    throw new Error("herdr run handoff workers do not match requested workers.");
+  // Task binding: the envelope's planFingerprint must be the exact hash of THIS
+  // goal + workers, so stale or borrowed envelopes from other plans are rejected.
+  if (parsed.planFingerprint !== planFingerprint(input.goal, input.workers)) {
+    throw new Error("herdr run handoff does not match this goal/workers (plan fingerprint mismatch; re-run herdr action=plan).");
   }
 }
 
@@ -189,9 +187,10 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         title: "Herdr harness execution",
         description: HERDR_TOOL_DESCRIPTION,
         inputSchema: z.object({
-          action: z.enum(["run", "status", "correct", "stop"]),
+          action: z.enum(["plan", "run", "status", "correct", "stop"]),
           goal: herdrText(HERDR_GOAL_MAX).optional(),
           workers: herdrWorkers.optional(),
+          gates: herdrGates.optional(),
           worker_model: z.string().trim().min(1).max(200).optional(),
           worker_thinking: z.string().trim().min(1).max(100).optional(),
           handoff: z.string().max(HERDR_HANDOFF_MAX).optional(),
@@ -201,7 +200,11 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
-      track(async ({ action, goal, workers, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
+      track(async ({ action, goal, workers, gates, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
+        if (action === "plan") {
+          if (!goal || !workers || !gates) throw new Error("herdr plan requires goal, workers, and planning gates {graph, handoff, critique}.");
+          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal and workers." });
+        }
         if (action === "run") {
           validateHerdrRunInput({ goal, workers, handoff });
           const mapped: HerdrWorker[] = workers.map((worker: { id: string; objective: string; owns: string[]; depends_on: string[] }) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.depends_on }));

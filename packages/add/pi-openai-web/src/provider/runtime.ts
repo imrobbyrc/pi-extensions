@@ -5,7 +5,7 @@ import { extractConversationId, isValidConversationId, toTemporaryChatUrl } from
 import type { OpenAIWebModelCatalog } from "./catalog.js";
 import { treeToMarkdown, type DomTreeNode } from "./answer.js";
 import {
-  assistantRevisionRequiresSerialization, attach, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
+  assistantRevisionRequiresSerialization, attach, currentUrl, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
   readAssistantTurnRevision, readTurnState, serializeAssistantTurn, sleep, stopGeneration, submitPrompt,
   waitForComposer, waitForConversationUrl, type AssistantTurnRevision, type CdpClient,
   type SerializedAssistantTurn, type TurnDomState
@@ -31,6 +31,10 @@ export const DEFAULT_WATCH_POLL_CADENCE = {
   idleMs: 600,
   harnessWaitMs: 1_200
 } as const;
+
+export function resumeConversationMatches(expectedId: string | undefined, url: string): boolean {
+  return !expectedId || extractConversationId(url) === expectedId;
+}
 
 export interface WatchPollInputs {
   stopVisible: boolean;
@@ -350,6 +354,9 @@ export class OpenAIWebRuntime {
       if (!isTemp) {
         throw new Error("target_not_temporary_chat");
       }
+      if (!resumeConversationMatches(metadata.conversationId, await currentUrl(client))) {
+        throw new Error("resume_conversation_id_mismatch");
+      }
 
       this.leaseEpoch = metadata.epoch;
       const conversation: ProviderConversation = {
@@ -520,7 +527,7 @@ export class OpenAIWebRuntime {
         "Contract:",
         `1. The "${this.config.chatgptAppName}" MCP app is attached to this conversation and exposes exactly seven tools: read_file, list_directory, search_workspace, repo_map, git_status, git_diff, herdr.`,
         "2. Inspect authoritative workspace state through those tools instead of guessing. Do not preload repository state speculatively.",
-        "3. Delegate implementation exclusively through herdr action=run after the planning gate. Workers are Pi agents; they execute after the user confirms in Pi's TUI.",
+        "3. Delegate implementation exclusively through herdr after the planning gate: action=plan to obtain the Pi-issued handoff envelope, then action=run with the exact same goal, workers, and that envelope verbatim. Workers are Pi agents; they execute after the user confirms in Pi's TUI.",
         "4. When no tool is needed, write your final answer directly; it is returned to the Pi user as the assistant response.",
         ...(stableContext ? ["", "Stable Pi instructions:", stableContext] : []),
         "",
