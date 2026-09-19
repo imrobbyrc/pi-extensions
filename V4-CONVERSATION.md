@@ -3156,3 +3156,31 @@ Phase 3 worker has NOT started. Main source has Phase 2, but this chat's attache
 1. Review and commit the two-file stale-response fix (run broader `pi-openai-web` tests + tsc first).
 2. Re-plan Phase 4 with the action-enum test included in worker ownership; no repeated respawns on the old contradictory plan.
 3. Implement/review/merge Phase 4, then proceed to Phase 5 evidence-gated acceptance.
+
+---
+
+## V4 Resume Checkpoint — 2026-09-19 (current, supersedes stale 12:44 statements)
+
+This section is the authoritative current state. The 12:44 WIB checkpoint above is preserved as history; where it disagrees, this section wins.
+
+### Authoritative current state
+- Phase 1 ExecutionSpec: merged.
+- Phase 2 declarative WorkerSlice: merged.
+- Phase 3 typed DecisionGraph -> deterministic ExecutionSpec: merged.
+- Phase 4 Verification/Evidence layer: NOT implemented and NOT merged. No active Herdr run remains.
+
+### Corrections to the 12:44 checkpoint
+- The stale-response fix is no longer an uncommitted local modification: it is merged into `main` (commit `7e199f09`, "fix(openai-web): complete stable rendered turns"), and the current `main` working tree is clean — nothing pending to preserve before any reset/checkout.
+- Consequence: stable, non-busy rendered text can now complete a turn after stability even when ChatGPT's copy/completion action is absent.
+
+### Aborted Phase-4 runs — do not resume
+- `run_mu7wwyvi_k2fczr`, `run_mu7x2ls5_vcbj1c`, `run_mu7x6rxy_6m1t1b`, `run_mu7x8tjm_i5dvhx`, and `run_mu7xfxko_4rkn0w` all aborted. None may be resumed; Phase 4 requires a fresh re-plan.
+
+### Stale-response root cause and current source behavior
+- Root cause: browser-rendered/serialized assistant text could be visibly final while provider completion stayed blocked, because the old runtime only emitted a completed transition when ChatGPT's copy/completion action — bound to the current assistant identity — was mounted. Without that action, no completed transition occurred, so the turn could later stall.
+- Current behavior in `packages/add/pi-openai-web/src/provider/runtime.ts`: `semanticCompletion` (copy action visible AND matching current response identity) remains the preferred signal; the fallback completes only when `completionActionVisible` is false, text is non-empty, the page is non-busy, and `stablePolls >= 2`. This preserves protection against stale/remounted completion actions.
+
+### Next V4 order
+1. Restart Phase 4 fresh from the frozen design. Keep it observational only: VerificationReport artifact plus pure `inspect`/`verify`; no acceptance transitions.
+2. Evidence-gated accept remains reserved for Phase 5.
+
