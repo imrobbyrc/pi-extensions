@@ -24,7 +24,12 @@ import {
   assertWorkerSlice,
   assertOrchestrationGates,
   assertExecutionSpec,
+  assertDecisionGraph,
+  assertSpecSourceExclusive,
+  compileDecisionGraph,
   canonicalExecutionSpec,
+  DECISION_GRAPH_AXES,
+  DECISION_GRAPH_VALUE_MAX,
   EXECUTION_SPEC_KEY_MAX,
   EXECUTION_SPEC_MAX_ENTRIES,
   EXECUTION_SPEC_VALUE_MAX,
@@ -303,6 +308,80 @@ test("Lead contract documents declarative worker slices and execution_spec deriv
   assert.match(prompt, /worker slices derive from it/);
   assert.match(prompt, /workers cannot invent requirements/);
   assert.match(prompt, /each worker's prompt receives its assigned immutable slice/);
+});
+
+// --- DecisionGraph compile authority (Phase 3) ---
+
+const decisionGraph = {
+  problem: "preserve Lead planning decisions deterministically",
+  shapes: "exact nine-axis DecisionGraph compiled into the ExecutionSpec",
+  graph: "validate graph -> compile -> existing fingerprint/handoff -> run validation",
+  cardinality: "0..1 graph, exactly 9 axes, 1 compiled spec",
+  boundaries: "Lead authors the graph; Pi validates and compiles; workers cannot redesign",
+  behavior: "deterministic compile, strict shape, drift fails closed",
+  scope: "orchestrator and MCP contract only",
+  verification: "focused schema, compiler, and drift tests",
+  critique: "compile into the existing Phase-1 authority path"
+};
+
+test("assertDecisionGraph accepts exactly nine bounded non-blank axes and nothing else", () => {
+  const normalized = assertDecisionGraph(decisionGraph);
+  assert.deepEqual(normalized, decisionGraph);
+  assert.deepEqual(Object.keys(normalized), [...DECISION_GRAPH_AXES], "normalized in fixed axis order");
+  const without = (axis: keyof typeof decisionGraph) => { const clone = { ...decisionGraph }; delete clone[axis]; return clone; };
+  for (const bad of [
+    null, undefined, 42, "graph", [],
+    without("problem"),
+    { ...decisionGraph, risk: "extra axis" },
+    { ...decisionGraph, shapes: "  " },
+    { ...decisionGraph, cardinality: 7 },
+    { ...decisionGraph, critique: "x".repeat(DECISION_GRAPH_VALUE_MAX + 1) }
+  ]) {
+    assert.throws(() => assertDecisionGraph(bad), /decision_graph_invalid/, `graph ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("compileDecisionGraph maps the nine axes verbatim into one canonical ExecutionSpec", () => {
+  const spec = compileDecisionGraph(assertDecisionGraph(decisionGraph));
+  assert.deepEqual(Object.keys(spec).sort(), DECISION_GRAPH_AXES.map((axis) => `decision.${axis}`).sort());
+  for (const axis of DECISION_GRAPH_AXES) assert.equal(spec[`decision.${axis}`], decisionGraph[axis]);
+  // The compiled form is itself a valid Phase-1 spec: the existing authority path accepts it unchanged.
+  assert.deepEqual(assertExecutionSpec(spec), spec);
+  // Deterministic: axis key order in the input never matters.
+  const reshuffled = { critique: decisionGraph.critique, problem: decisionGraph.problem, scope: decisionGraph.scope, behavior: decisionGraph.behavior, shapes: decisionGraph.shapes, verification: decisionGraph.verification, boundaries: decisionGraph.boundaries, graph: decisionGraph.graph, cardinality: decisionGraph.cardinality };
+  assert.deepEqual(compileDecisionGraph(assertDecisionGraph(reshuffled)), spec);
+  assert.equal(canonicalExecutionSpec(compileDecisionGraph(assertDecisionGraph(reshuffled))), canonicalExecutionSpec(spec));
+  // The fingerprint binds the compiled form, so equivalent graphs produce identical fingerprints.
+  assert.equal(planFingerprint("ship phase 3", [legacyWorker], compileDecisionGraph(assertDecisionGraph(reshuffled))), planFingerprint("ship phase 3", [legacyWorker], spec));
+});
+
+test("issueHerdrHandoff compiles a decision_graph into the envelope's spec slot", () => {
+  const gates = { graph: "graph", handoff: "brief", critique: "independent" };
+  const compiled = compileDecisionGraph(assertDecisionGraph(decisionGraph));
+  const envelope = issueHerdrHandoff("goal", [legacyWorker], gates, undefined, decisionGraph);
+  const parsed = parseHerdrHandoff(envelope);
+  assert.deepEqual(parsed.executionSpec, compiled, "envelope embeds the compiled spec");
+  assert.equal(parsed.planFingerprint, planFingerprint("goal", [legacyWorker], compiled));
+  // Graph-shaped issuance still validates the graph itself.
+  assert.throws(() => issueHerdrHandoff("goal", [legacyWorker], gates, undefined, { ...decisionGraph, scope: "" }), /decision_graph_invalid/);
+  assert.throws(() => issueHerdrHandoff("goal", [legacyWorker], gates, undefined, "not a graph"), /decision_graph_invalid/);
+});
+
+test("decision_graph and execution_spec are mutually exclusive at issuance", () => {
+  const gates = { graph: "graph", handoff: "brief", critique: "independent" };
+  assert.throws(() => issueHerdrHandoff("goal", [legacyWorker], gates, { runtime: "node" }, decisionGraph), /decision_graph_exclusive/);
+  assert.throws(() => assertSpecSourceExclusive({ runtime: "node" }, decisionGraph), /decision_graph_exclusive/);
+  assert.doesNotThrow(() => assertSpecSourceExclusive(undefined, decisionGraph));
+  assert.doesNotThrow(() => assertSpecSourceExclusive({ runtime: "node" }, undefined));
+});
+
+test("Lead contract documents the decision_graph contract", () => {
+  const prompt = buildLeadContract(undefined);
+  assert.match(prompt, /decision_graph/);
+  assert.match(prompt, /problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique/);
+  assert.match(prompt, /mutually exclusive/);
+  assert.match(prompt, /mechanically compiled/);
+  assert.match(prompt, /a changed, added, or removed decision_graph is rejected/);
 });
 
 test("Lead contract is unconditional and forbids subagent delegation", () => {

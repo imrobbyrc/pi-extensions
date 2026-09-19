@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers } from "../src/mcp/server.js";
-import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX } from "../src/provider/orchestrator.js";
+import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph } from "../src/mcp/server.js";
+import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, assertDecisionGraph, compileDecisionGraph, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX } from "../src/provider/orchestrator.js";
 import { SubagentMcpAdapter } from "../src/mcp/subagent-adapter.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -127,6 +127,63 @@ test("worker slice metadata schema bounds at the MCP boundary", () => {
   assert.equal(herdrWorkers.safeParse([{ ...worker, requirements: ["x".repeat(WORKER_METADATA_ITEM_MAX + 1)] }]).success, false, "oversized item rejected");
   assert.equal(herdrWorkers.safeParse([{ ...worker, behaviors: Array.from({ length: WORKER_METADATA_LIST_MAX + 1 }, (_, i) => `b${i}`) }]).success, false, "too many entries rejected");
   assert.ok(herdrWorkers.safeParse([{ ...worker, behaviors: Array.from({ length: WORKER_METADATA_LIST_MAX }, (_, i) => `b${i}`) }]).success, "list bound is inclusive");
+});
+
+// --- DecisionGraph plan/run binding (Phase 3) ---
+
+const decisionGraph = {
+  problem: "fix the bug without regressions",
+  shapes: "one focused worker over the failing module",
+  graph: "validate -> plan -> run -> review",
+  cardinality: "0..1 graph, exactly 9 axes",
+  boundaries: "worker owns src only",
+  behavior: "fail closed on graph drift",
+  scope: "src",
+  verification: "focused herdr-gate tests",
+  critique: "one worker suffices"
+};
+
+test("decision_graph schema bounds at the MCP boundary", () => {
+  assert.ok(herdrDecisionGraph.safeParse(decisionGraph).success);
+  const { shapes: _shapes, ...missing } = decisionGraph;
+  assert.equal(herdrDecisionGraph.safeParse(missing).success, false, "missing axis rejected");
+  assert.equal(herdrDecisionGraph.safeParse({ ...decisionGraph, risk: "extra" }).success, false, "extra axis rejected");
+  assert.equal(herdrDecisionGraph.safeParse({ ...decisionGraph, problem: " " }).success, false, "blank axis rejected");
+  assert.equal(herdrDecisionGraph.safeParse({ ...decisionGraph, problem: 42 }).success, false, "non-string axis rejected");
+  assert.equal(herdrDecisionGraph.safeParse({ ...decisionGraph, problem: "x".repeat(DECISION_GRAPH_VALUE_MAX + 1) }).success, false, "oversized axis rejected");
+});
+
+test("herdr plan/run bind decision_graph immutably through the compiled spec", () => {
+  const handoff = issueHerdrHandoff(base.goal, base.workers, gates, undefined, decisionGraph);
+  // Same graph → accepted.
+  assert.doesNotThrow(() => validateHerdrRunInput({ ...base, decision_graph: decisionGraph, handoff }));
+  // Equivalent graph with reshuffled axis order → identical canonical compile → accepted.
+  const reshuffled = { scope: decisionGraph.scope, problem: decisionGraph.problem, critique: decisionGraph.critique, graph: decisionGraph.graph, verification: decisionGraph.verification, cardinality: decisionGraph.cardinality, behavior: decisionGraph.behavior, shapes: decisionGraph.shapes, boundaries: decisionGraph.boundaries };
+  assert.doesNotThrow(() => validateHerdrRunInput({ ...base, decision_graph: reshuffled, handoff }));
+  // Changed axis after plan fails closed.
+  assert.throws(() => validateHerdrRunInput({ ...base, decision_graph: { ...decisionGraph, scope: "everything" }, handoff }), /decision_graph differs/);
+  // Removed graph after plan fails closed.
+  assert.throws(() => validateHerdrRunInput({ ...base, handoff }), /execution_spec differs/);
+  // Added graph to a graph-less plan fails closed.
+  assert.throws(() => validateHerdrRunInput({ ...base, decision_graph: decisionGraph, handoff: validHandoff }), /decision_graph differs/);
+  // Added graph to a direct-spec plan fails closed.
+  const specHandoff = issueHerdrHandoff(base.goal, base.workers, gates, spec);
+  assert.throws(() => validateHerdrRunInput({ ...base, decision_graph: decisionGraph, handoff: specHandoff }), /decision_graph differs/);
+  // Structural graph drift (extra axis) still fails before any comparison runs.
+  assert.throws(() => validateHerdrRunInput({ ...base, decision_graph: { ...decisionGraph, extra: "x" }, handoff }), /decision_graph_invalid/);
+});
+
+test("decision_graph and execution_spec are mutually exclusive at plan and run validation", () => {
+  assert.throws(() => issueHerdrHandoff(base.goal, base.workers, gates, spec, decisionGraph), /decision_graph_exclusive/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, decision_graph: decisionGraph, handoff: validHandoff }), /decision_graph_exclusive/);
+});
+
+test("decision_graph plans bind the deterministic compiled fingerprint", () => {
+  const handoff = issueHerdrHandoff(base.goal, base.workers, gates, undefined, decisionGraph);
+  const parsed = parseHerdrHandoff(handoff);
+  const compiled = compileDecisionGraph(assertDecisionGraph(decisionGraph));
+  assert.equal(parsed.planFingerprint, planFingerprint(base.goal, base.workers, compiled));
+  assert.deepEqual(parsed.executionSpec, compiled, "the envelope carries the compiled spec as its single authority");
 });
 
 // --- Explicit confirmation boundary (SubagentMcpAdapter.run) ---

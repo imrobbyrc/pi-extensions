@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, canonicalExecutionSpec, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type WorkerSlice } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, compileDecisionGraph, canonicalExecutionSpec, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type WorkerSlice } from "../provider/orchestrator.js";
 type HerdrWorker = WorkerSlice;
 
 type HerdrMcpAdapter = {
@@ -87,10 +87,15 @@ const herdrGates = z.object({
 export const herdrExecutionSpec = z.record(z.string().min(1).max(EXECUTION_SPEC_KEY_MAX), herdrText(EXECUTION_SPEC_VALUE_MAX))
   .refine((spec) => Object.keys(spec).length >= 1 && Object.keys(spec).length <= EXECUTION_SPEC_MAX_ENTRIES, { message: `execution_spec must contain 1-${EXECUTION_SPEC_MAX_ENTRIES} entries or be omitted` });
 
+/** Optional Phase-3 decision graph: exactly the nine bounded non-blank axes, extra keys rejected. */
+export const herdrDecisionGraph = z.strictObject(
+  Object.fromEntries(DECISION_GRAPH_AXES.map((axis) => [axis, herdrText(DECISION_GRAPH_VALUE_MAX)])) as Record<(typeof DECISION_GRAPH_AXES)[number], z.ZodString>
+);
+
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
-  "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), execution_spec (when provided), and envelope string verbatim. With an execution_spec present, worker slice lists derive from it — workers cannot invent requirements.",
-  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's execution_spec verbatim (when present), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
+  "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), execution_spec or decision_graph (whichever was provided), and envelope string verbatim. A decision_graph carries your planning decisions as exactly nine non-blank axes (problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique), is mutually exclusive with execution_spec, and is compiled deterministically into the plan's execution spec — worker slice lists derive from that compiled spec, so workers cannot invent requirements.",
+  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's execution_spec or decision_graph verbatim (whichever the plan included — a changed, added, or removed decision_graph is rejected), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
   "accept — accept one completed worker's work: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
@@ -104,16 +109,21 @@ export const HERDR_TOOL_DESCRIPTION = [
  * Returns the envelope's validated WorkerSlices: they are the single source of
  * truth for worker prompts (fingerprint-bound to this exact request).
  */
-export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; execution_spec?: unknown; handoff?: string }): { workers: WorkerSlice[] } {
+export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; execution_spec?: unknown; decision_graph?: unknown; handoff?: string }): { workers: WorkerSlice[] } {
   if (!input.goal) throw new Error("herdr run requires goal.");
   if (!input.workers?.length) throw new Error("herdr run requires 1-4 workers.");
   if (!input.handoff?.trim()) throw new Error("herdr run requires planning handoff.");
-  const executionSpec = assertExecutionSpec(input.execution_spec);
+  assertSpecSourceExclusive(input.execution_spec, input.decision_graph);
+  // Phase-3 binding: a run-time decision_graph is compiled HERE, never taken
+  // from a caller-asserted spec, so any graph drift against the plan fails closed.
+  const executionSpec = input.decision_graph !== undefined ? compileDecisionGraph(assertDecisionGraph(input.decision_graph)) : assertExecutionSpec(input.execution_spec);
   const parsed = parseHerdrHandoff(input.handoff);
   // Spec binding: the envelope's embedded spec must equal THIS run's spec exactly —
   // adding, removing, or changing it after plan fails closed.
   if (canonicalExecutionSpec(parsed.executionSpec) !== canonicalExecutionSpec(executionSpec)) {
-    throw new Error("herdr run execution_spec differs from the plan's execution_spec (re-run herdr action=plan).");
+    throw new Error(input.decision_graph !== undefined
+      ? "herdr run decision_graph differs from the plan's decision_graph (re-run herdr action=plan)."
+      : "herdr run execution_spec differs from the plan's execution_spec (re-run herdr action=plan).");
   }
   // Task binding: the envelope's planFingerprint must be the exact hash of THIS
   // goal + workers (+ spec), so stale or borrowed envelopes from other plans are rejected.
@@ -215,6 +225,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           workers: herdrWorkers.optional(),
           gates: herdrGates.optional(),
           execution_spec: herdrExecutionSpec.optional(),
+          decision_graph: herdrDecisionGraph.optional(),
           worker_model: z.string().trim().min(1).max(200).optional(),
           worker_thinking: z.string().trim().min(1).max(100).optional(),
           handoff: z.string().max(HERDR_HANDOFF_MAX).optional(),
@@ -224,16 +235,17 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
-      track(async ({ action, goal, workers, gates, execution_spec, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
+      track(async ({ action, goal, workers, gates, execution_spec, decision_graph, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
         if (action === "plan") {
           if (!goal || !workers || !gates) throw new Error("herdr plan requires goal, workers, and planning gates {graph, handoff, critique}.");
-          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and execution_spec (when provided)." });
+          assertSpecSourceExclusive(execution_spec, decision_graph);
+          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and execution_spec or decision_graph (whichever was provided)." });
         }
         if (action === "run") {
           // The envelope's authorized slices are the single source of truth for
           // what each worker is told — already fingerprint-bound to this exact
           // goal/workers/spec, so run-time args can never drift from the plan.
-          const authorized = validateHerdrRunInput({ goal, workers, execution_spec, handoff });
+          const authorized = validateHerdrRunInput({ goal, workers, execution_spec, decision_graph, handoff });
           const run = await deps.subagent.run({ goal, workers: authorized.workers, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}), ...(handoff ? { handoff } : {}) });
           return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
         }
