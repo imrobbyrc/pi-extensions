@@ -139,6 +139,11 @@ export class SubagentMcpAdapter {
     return result;
   }
 
+  /** Purely observational run inspection for `herdr verify`: raw controller status with NO adapter lifecycle logic — never shuts down, reaps, or mutates a run. */
+  inspect(runId?: string) {
+    return this.controller.status(runId);
+  }
+
   private hasReviewableWorker(): boolean {
     return (this.controller.status() as AdapterRunSnapshot[]).some((run) =>
       run.tasks.some((task) => isReviewableWorker(run, task))

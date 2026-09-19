@@ -91,8 +91,8 @@ function loopHarness(runState: any, contextGetter: () => ExtensionContext | unde
     }
   };
   const adapter = new SubagentMcpAdapter(controller as unknown as SubagentController, contextGetter);
-  // The MCP-facing subagent dep: adapter actions plus the raw read-only
-  // inspection channel. verify MUST inspect through this seam — the adapter's
+  // The MCP-facing subagent dep: adapter actions plus the adapter's REAL
+  // read-only inspect seam. verify MUST inspect through this seam — the adapter's
   // own status() can auto-shutdown a run after acceptance (B-5).
   const mcpSubagent = {
     run: (request: any) => adapter.run(request),
@@ -100,7 +100,7 @@ function loopHarness(runState: any, contextGetter: () => ExtensionContext | unde
     correct: (runId: string, workerId: string, instructions: string) => adapter.correct(runId, workerId, instructions),
     accept: (runId: string, workerId: string) => adapter.accept(runId, workerId),
     stop: (runId?: string) => adapter.stop(runId),
-    inspect: (runId?: string) => controller.status(runId)
+    inspect: (runId?: string) => adapter.inspect(runId)
   };
   return {
     adapter,
@@ -450,14 +450,38 @@ test("herdr verify fails closed on malformed handoffs, worker-set mismatch, prom
 
 test("herdr verify refuses adapters without a read-only inspection channel instead of routing through status", async () => {
   const harness = loopHarness(completedHerdrRun());
-  // Plain SubagentMcpAdapter: no inspect seam. verify must fail closed rather
-  // than reuse status (whose adapter implementation can auto-shutdown a run
-  // after acceptance, destroying the evidence being verified).
-  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  // An adapter dep WITHOUT the inspect seam (e.g. an older adapter). verify
+  // must fail closed rather than reuse status (whose adapter implementation
+  // can auto-shutdown a run after acceptance, destroying the evidence being verified).
+  const { adapter } = harness;
+  const inspectLess = {
+    run: (request: any) => adapter.run(request),
+    status: (runId?: string) => adapter.status(runId),
+    correct: (runId: string, workerId: string, instructions: string) => adapter.correct(runId, workerId, instructions),
+    accept: (runId: string, workerId: string) => adapter.accept(runId, workerId),
+    stop: (runId?: string) => adapter.stop(runId)
+  };
+  const herdr = (await registeredHerdrToolsFor(inspectLess))[0]!;
   const envelope = await planEnvelope(herdr.handler);
   harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
   await assert.rejects(herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }), /herdr_verify_unavailable/);
   assert.equal(harness.calls.filter((call) => call.method === "status").length, 0, "verify never consults adapter.status");
+});
+
+test("herdr verify executes through the real SubagentMcpAdapter and mutates no lifecycle", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  // The REAL production adapter — inspect seam included — as the MCP dep.
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planEnvelope(herdr.handler);
+  // Accepted run: adapter.status() WOULD auto-shutdown it; verify must stay observational.
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**", { acceptedAt: 1234567890 }));
+  const result = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  assert.equal(result.action, "verify");
+  assert.equal(result.report.quality.workers[0].accepted, true, "acceptance is observed as a fact");
+  const mutating = harness.calls.filter((call) => ["run", "steer", "correct", "accept", "cancel", "shutdown", "retryCleanup"].includes(call.method));
+  assert.deepEqual(mutating, [], "verify never touches any lifecycle transition through the real adapter");
+  // No auto-reap: the accepted run snapshot stays observable exactly as before.
+  assert.equal((harness.adapter.inspect("run-1") as any).tasks.length, 1);
 });
 
 test("herdr verify fails closed when the workspace cannot be observed", async () => {
