@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import chatGptPlannerExtension from "../../../add/pi-openai-web/extensions/pi-openai-web/index.ts";
 import { createSubagentController, SubagentController } from "../src/api.ts";
 import registerCoreSubagent from "../src/index.ts";
@@ -57,6 +57,8 @@ function createMockPi(): ExtensionAPI & {
 		eventHandlers: Record<string, AnyHandler[]>;
 	};
 }
+
+const stubCtx = { cwd: "/tmp", hasUI: false } as unknown as ExtensionContext;
 
 describe("shared manager registry", () => {
 	test("getOrCreateSubagentManager returns the same manager for the same ExtensionAPI", () => {
@@ -155,5 +157,98 @@ describe("dual-package loading without duplicate native tool registration", () =
 		// Calling it again should be a no-op, not throw duplicate tool error
 		expect(() => registerCoreSubagent(pi)).not.toThrow();
 		expect(pi.registeredTools.length).toBe(countAfterFirst);
+	});
+});
+
+describe("session handoff preservation (one-shot, manager-owned)", () => {
+	function mockPiWithManager() {
+		const pi = createMockPi();
+		const manager = getOrCreateSubagentManager(pi);
+		return { pi, manager };
+	}
+
+	function seedCompletedRun(manager: SubagentManager) {
+		const { run } = manager.createRun({ agent: "finisher", task: "t", runtime: "inprocess" }, stubCtx);
+		for (const task of run.tasks) task.status = "completed";
+		run.status = "completed";
+		return run;
+	}
+
+	test("prepareHandoff arms; the first shutdown preserves state exactly once, the second cleans", () => {
+		const { manager } = mockPiWithManager();
+		const run = seedCompletedRun(manager);
+
+		const prepared = manager.prepareHandoff();
+		expect(prepared.ok).toBe(true);
+
+		const first = manager.handleSessionShutdown();
+		expect(first.preserved).toBe(true);
+		expect(manager.getRun(run.id)).toBeDefined();
+
+		const second = manager.handleSessionShutdown();
+		expect(second.preserved).toBe(false);
+		expect(manager.getRun(run.id)).toBeUndefined();
+		expect(manager.listRuns()).toHaveLength(0);
+	});
+
+	test("preserved shutdown keeps the same manager/run binding through a recreated controller (same ExtensionAPI)", () => {
+		const { pi, manager } = mockPiWithManager();
+		const run = seedCompletedRun(manager);
+		expect(manager.prepareHandoff().ok).toBe(true);
+
+		const ctrl1 = createSubagentController(pi);
+		expect(ctrl1.manager).toBe(manager);
+		expect(manager.handleSessionShutdown().preserved).toBe(true);
+
+		// Extension reload: a NEW controller for the SAME ExtensionAPI observes the same manager and run.
+		const ctrl2 = createSubagentController(pi);
+		expect(ctrl2.manager).toBe(ctrl1.manager);
+		expect(ctrl2.status(run.id).id).toBe(run.id);
+
+		// Controller delegates pass through: re-arm, preserve again, then ordinary cleanup.
+		expect(ctrl2.prepareHandoff().ok).toBe(true);
+		expect(ctrl2.handleSessionShutdown().preserved).toBe(true);
+		expect(ctrl2.status(run.id).id).toBe(run.id);
+		expect(ctrl2.handleSessionShutdown().preserved).toBe(false);
+		expect(manager.getRun(run.id)).toBeUndefined();
+	});
+
+	test("active inprocess work rejects prepare and leaves the preservation unarmed", () => {
+		const { manager } = mockPiWithManager();
+		manager.createRun({ agent: "busy", task: "t", runtime: "inprocess" }, stubCtx); // queued = nonterminal
+
+		const prepared = manager.prepareHandoff();
+		expect(prepared.ok).toBe(false);
+		if (!prepared.ok) {
+			expect(prepared.reason).toMatch(/herdr runtime/);
+			expect(prepared.blockers.length).toBeGreaterThan(0);
+		}
+		// Unarmed: shutdown is ordinary cleanup.
+		expect(manager.handleSessionShutdown().preserved).toBe(false);
+	});
+
+	test("a rejection revokes a previously armed preservation when state becomes unsafe", () => {
+		const { manager } = mockPiWithManager();
+		seedCompletedRun(manager);
+		expect(manager.prepareHandoff().ok).toBe(true);
+		manager.createRun({ agent: "late-inprocess", task: "t", runtime: "inprocess" }, stubCtx);
+		expect(manager.prepareHandoff().ok).toBe(false);
+		expect(manager.handleSessionShutdown().preserved).toBe(false);
+	});
+
+	test("core extension session_shutdown listener consumes the one-shot preservation", async () => {
+		const { pi, manager } = mockPiWithManager();
+		registerCoreSubagent(pi); // registers the listener on the same shared manager
+		const run = seedCompletedRun(manager);
+		expect(manager.prepareHandoff().ok).toBe(true);
+
+		const handlers = pi.eventHandlers.session_shutdown ?? [];
+		expect(handlers.length).toBeGreaterThan(0);
+
+		await handlers[0]?.(undefined as any, { hasUI: false } as any);
+		expect(manager.getRun(run.id)).toBeDefined(); // preserved, not cleared
+
+		await handlers[0]?.(undefined as any, { hasUI: false } as any);
+		expect(manager.getRun(run.id)).toBeUndefined(); // ordinary cleanup
 	});
 });
