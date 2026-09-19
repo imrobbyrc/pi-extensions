@@ -591,6 +591,39 @@ export function buildVerificationReport(input: VerificationReportInput): Verific
   };
 }
 
+/** Recursive sorted-key JSON: object key-order drift can never change the hash; array order is preserved (it carries meaning). */
+function sortedKeyJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => sortedKeyJson(item)).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${sortedKeyJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * Deterministic freshness fingerprint of one VerificationReport: SHA-256 over
+ * a canonical (sorted-key) clone in which ONLY quality.workers[].accepted is
+ * omitted. Accept bookkeeping is not evidence, so accepting a worker never
+ * changes the fingerprint (accept stays idempotent under the accept gate);
+ * every other observation — corrections, worker/run statuses, workspace git
+ * status/diff, worker evidence — hashes verbatim, so any drift between a
+ * reviewed report and a freshly recomputed one is visible. Pure read: the
+ * VerificationReport shape itself is untouched.
+ */
+export function verificationFingerprint(report: VerificationReport): string {
+  const canonical = {
+    spec: report.spec,
+    design: report.design,
+    quality: {
+      run: report.quality.run,
+      workers: report.quality.workers.map(({ accepted: _accepted, ...worker }) => worker)
+    },
+    evidence: report.evidence
+  };
+  return createHash("sha256").update(sortedKeyJson(canonical)).digest("hex");
+}
+
 export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
   workerModel: "zai/glm-5.3",
   workerThinking: "high",
@@ -614,8 +647,8 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec or decision_graph (whichever the plan included, verbatim — a changed, added, or removed decision_graph is rejected) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, correction rounds). A completed worker stays live in its pane awaiting your review — nothing is auto-cleaned until you accept or stop.",
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
-    "- action=accept: accept one completed worker's work — finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
-    "- action=verify: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope) and derive a deterministic bounded VerificationReport — exactly four evidence dimensions (spec, design, quality, evidence): the compiled spec and planning gates, the authorized worker slices in work-graph order, observed run/worker lifecycle facts, and current git status/diff plus bounded run evidence. Purely observational: never a score or pass/fail, never gates acceptance, never mutates worker/run state; worker-set or prompt/envelope mismatches fail closed.",
+    "- action=accept: accept one completed worker's work — requires run_id, worker_id, the exact handoff envelope, and the verification_fingerprint returned by a prior action=verify; the report is recomputed from fresh evidence immediately before acceptance and any drift (stale report, changed workspace, corrected worker) fails closed before mutation. On match: finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
+    "- action=verify: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope) and derive a deterministic bounded VerificationReport — exactly four evidence dimensions (spec, design, quality, evidence): the compiled spec and planning gates, the authorized worker slices in work-graph order, observed run/worker lifecycle facts, and current git status/diff plus bounded run evidence. Purely observational: never a score or pass/fail, never gates acceptance, never mutates worker/run state; worker-set or prompt/envelope mismatches fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
     "- action=stop: stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
     "Planning protocol (mandatory before delegation): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique. The graph is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Derive each worker's declarative slice lists (requirements, behaviors, seams, acceptance) from that graph — and, when an execution_spec or decision_graph is present, from that compiled spec — so workers cannot invent requirements. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
     "Pi remains the sole executor: never mutate source, never run shell commands, never spawn Pi subagents, never create Herdr panes directly.",

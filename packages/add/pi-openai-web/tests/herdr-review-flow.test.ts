@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { SubagentMcpAdapter } from "../src/mcp/subagent-adapter.js";
 import { createHarnessMcpFactory, HERDR_TOOL_DESCRIPTION } from "../src/mcp/server.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
@@ -325,15 +327,166 @@ test("herdr tool registers the full action set including the observational verif
 });
 
 test("herdr accept handler requires run_id and worker_id and reports the finalized worker", async () => {
-  const { adapter } = loopHarness(completedHerdrRun());
-  const herdr = (await registeredHerdrToolsFor(adapter))[0]!;
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
   await assert.rejects(herdr.handler({ action: "accept" }), /requires run_id and worker_id/);
-  const result = parseToolText(await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1" }));
+  // Evidence gate: accept only after obtaining fresh verification evidence —
+  // a Pi-issued handoff bound to the run, then the fingerprint verify returns.
+  const envelope = await planEnvelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  const verification = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  const result = parseToolText(
+    await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: verification.verification_fingerprint })
+  );
   assert.equal(result.ok, true);
   assert.equal(result.run_id, "run-1");
   assert.equal(result.worker.id, "w1");
   assert.equal(result.worker.state, "completed");
   assert.ok(result.worker.accepted_at > 0);
+});
+
+// --- herdr accept evidence gate: wrong or stale verification evidence fails closed before mutation ---
+
+test("herdr accept without the evidence inputs rejects before any accept mutation", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planEnvelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  // Neither the handoff nor the fingerprint: fail closed before touching the lifecycle.
+  await assert.rejects(
+    herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1" }),
+    /herdr accept requires the exact Pi-issued handoff and the verification_fingerprint/
+  );
+  // Handoff present but the fingerprint omitted: still fails closed.
+  await assert.rejects(
+    herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }),
+    /herdr accept requires the exact Pi-issued handoff and the verification_fingerprint/
+  );
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0, "no evidence means no accept ever reaches the adapter");
+  assert.equal((harness.adapter.inspect("run-1") as any).tasks[0].acceptedAt, undefined, "the worker stays unaccepted");
+});
+
+test("herdr accept rejects a wrong fingerprint before any accept mutation", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planEnvelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  const verification = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  // Deterministically wrong yet schema-valid: flip the first hex digit of the fresh fingerprint.
+  const fresh = verification.verification_fingerprint as string;
+  assert.match(fresh, /^[0-9a-f]{64}$/);
+  const wrong = `${(Number.parseInt(fresh[0]!, 16) ^ 1).toString(16)}${fresh.slice(1)}`;
+  await assert.rejects(
+    herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: wrong }),
+    /herdr accept fingerprint mismatch/
+  );
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0, "a wrong fingerprint never mutates the run");
+  assert.equal((harness.adapter.inspect("run-1") as any).tasks[0].acceptedAt, undefined, "the worker stays unaccepted");
+});
+
+test("herdr accept rejects a stale fingerprint after deterministic drift, before any mutation; fresh evidence accepts exactly once", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planEnvelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  const stale = (parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }))).verification_fingerprint as string;
+  // Deterministic harness mutations (setRun), never ambient git dirtiness: each
+  // drift changes one evidence fact the reviewed fingerprint no longer matches.
+  const drifts: Array<[string, Record<string, unknown>]> = [
+    ["a correction round landed on the worker", { corrections: 2 }],
+    ["the worker status changed", { status: "running" }],
+    ["the worker's final evidence text changed", { finalText: "reworked summary" }]
+  ];
+  for (const [label, extra] of drifts) {
+    harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**", extra));
+    await assert.rejects(
+      herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: stale }),
+      { message: /herdr accept fingerprint mismatch/, name: "Error" }
+    );
+    assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0, `stale attempt after "${label}" must never mutate`);
+  }
+  assert.equal((harness.adapter.inspect("run-1") as any).tasks[0].acceptedAt, undefined, "the drifted worker stays unaccepted");
+  // Recovery: re-verify the drifted run and accept the fresh fingerprint exactly once.
+  const fresh = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  assert.notEqual(fresh.verification_fingerprint, stale, "the fresh fingerprint differs from the reviewed one");
+  const result = parseToolText(
+    await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: fresh.verification_fingerprint })
+  );
+  assert.equal(result.ok, true);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 1, "valid fresh evidence delegates accept exactly once");
+});
+
+test("herdr accept rejects a stale fingerprint after deterministic workspace git_diff drift", async () => {
+  const runGit = promisify(execFile);
+  const dir = await mkdtemp(join(tmpdir(), "pi-accept-ws-"));
+  try {
+    const git = (args: string[]) => runGit("git", ["-c", "user.email=test@example.com", "-c", "user.name=Test", ...args], { cwd: dir });
+    await git(["init", "--quiet"]);
+    await writeFile(join(dir, "tracked.txt"), "one\n", "utf-8");
+    await git(["add", "."]);
+    await git(["commit", "--quiet", "-m", "init"]);
+    const harness = loopHarness(completedHerdrRun());
+    const herdr = (await registeredHerdrToolsFor(harness.adapter, dir))[0]!;
+    const envelope = await planEnvelope(herdr.handler);
+    harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+    const stale = (parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }))).verification_fingerprint as string;
+    // Harness-controlled deterministic workspace mutation: tracked content changes,
+    // so the freshly recomputed git status/diff no longer matches the review.
+    await writeFile(join(dir, "tracked.txt"), "two\n", "utf-8");
+    await assert.rejects(
+      herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: stale }),
+      /herdr accept fingerprint mismatch/
+    );
+    assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0, "workspace drift never mutates the run");
+    assert.equal((harness.adapter.inspect("run-1") as any).tasks[0].acceptedAt, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("herdr accept: one verify fingerprint accepts worker A then worker B while accepted flags are the only report delta", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const planned = parseToolText(await herdr.handler({
+    action: "plan",
+    goal: "ship",
+    workers: [
+      { id: "wa", objective: "core", owns: ["src/core/**"], depends_on: [] },
+      { id: "wb", objective: "tests", owns: ["tests/**"], depends_on: [] }
+    ],
+    gates: planGates
+  }));
+  assert.equal(planned.ok, true);
+  const envelope = planned.handoff as string;
+  const workerPrompt = (objective: string, owns: string) => `${envelope}\n\n${objective}\n\nOwned paths (must not modify outside these paths): ${owns}`;
+  harness.setRun({
+    id: "run-1",
+    runtime: "herdr",
+    status: "completed",
+    tasks: [
+      { id: "wa", status: "completed", runtime: "herdr", task: workerPrompt("core", "src/core/**"), corrections: 0, changedFiles: ["src/core/thing.ts"], diffStat: "1 file changed" },
+      { id: "wb", status: "completed", runtime: "herdr", task: workerPrompt("tests", "tests/**"), corrections: 0, changedFiles: ["tests/thing.test.ts"], diffStat: "1 file changed" }
+    ]
+  });
+  const reviewed = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  const fingerprint = reviewed.verification_fingerprint as string;
+  assert.deepEqual(reviewed.report.quality.workers.map((worker: any) => worker.accepted), [false, false]);
+  // Accept worker A with the reviewed fingerprint.
+  const acceptedA = parseToolText(
+    await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "wa", handoff: envelope, verification_fingerprint: fingerprint })
+  );
+  assert.equal(acceptedA.ok, true);
+  // Then worker B with the SAME fingerprint: accepting A only flipped accepted
+  // bookkeeping, which the fingerprint exempts by design.
+  const acceptedB = parseToolText(
+    await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "wb", handoff: envelope, verification_fingerprint: fingerprint })
+  );
+  assert.equal(acceptedB.ok, true);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 2, "each worker's accept is delegated exactly once");
+  // Post-acceptance verify: accepted flags are the only report delta, so the run fingerprint is unchanged.
+  const after = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  assert.deepEqual(after.report.quality.workers.map((worker: any) => worker.accepted), [true, true]);
+  assert.equal(after.verification_fingerprint, fingerprint, "accept bookkeeping alone does not invalidate the run fingerprint for another worker");
 });
 
 test("herdr correct handler surfaces the task-scoped correction round count", async () => {
@@ -394,7 +547,8 @@ test("herdr verify binds the exact handoff to the run and returns the bounded fo
   assert.equal(result.report.quality.workers[0].accepted, false);
   assert.equal(result.report.evidence.workers[0].changedFiles[0], "src/thing.ts");
   assert.equal(typeof result.report.evidence.workspace.git_status, "string", "current git status is observed");
-  assert.equal(typeof result.report.evidence.workspace.git_diff, "string", "current git diff is observed");
+  const gitDiff = result.report.evidence.workspace.git_diff;
+  assert.ok(gitDiff === undefined || typeof gitDiff === "string", "git_diff is omitted on a clean workspace and a string when present");
   // Deterministic at the handler level: same run + handoff + workspace → identical report.
   const again = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
   assert.deepEqual(again.report, result.report);

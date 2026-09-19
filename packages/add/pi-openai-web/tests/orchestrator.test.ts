@@ -38,6 +38,7 @@ import {
   WORKER_METADATA_ITEM_MAX,
   WORKER_METADATA_LIST_MAX,
   buildVerificationReport,
+  verificationFingerprint,
   VERIFICATION_DIMENSIONS,
   VERIFICATION_OBSERVATION_MAX,
   VERIFICATION_CHANGED_FILES_MAX,
@@ -733,6 +734,66 @@ test("the report is deterministic: repeated builds of the same observations seri
   });
   assert.deepEqual(buildVerificationReport(input()), buildVerificationReport(input()));
   assert.equal(JSON.stringify(buildVerificationReport(input())), JSON.stringify(buildVerificationReport(input())));
+});
+
+// --- verificationFingerprint (Phase 5 accept gate: freshness of the reviewed evidence) ---
+
+/** One shared envelope: fingerprints compare facts, so the plan identity must be identical across builds. */
+const fingerprintEnvelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+
+/** Deterministic base report for fingerprint coverage: one completed worker with fixed observations. */
+function fingerprintedReport(options: { task?: Record<string, unknown>; runStatus?: string; workspace?: { gitStatus?: string; gitDiff?: string } } = {}): VerificationReport {
+  return buildVerificationReport({
+    handoff: parseHerdrHandoff(fingerprintEnvelope),
+    run: verifyRunFixture(
+      "run-1",
+      [{ id: "w1", status: "completed", task: fingerprintEnvelope, corrections: 1, changedFiles: ["src/a.ts"], diffStat: "1 file changed", ...options.task }],
+      options.runStatus ?? "completed"
+    ),
+    workspace: { gitStatus: "## main\n M src/a.ts", gitDiff: "diff --git a/src/a.ts b/src/a.ts\n+changed", ...options.workspace }
+  });
+}
+
+test("verificationFingerprint: identical reports share one 64-hex fingerprint and the report is never mutated", () => {
+  const first = fingerprintedReport();
+  const second = fingerprintedReport();
+  assert.deepEqual(first, second, "the fixture is deterministic");
+  const fingerprint = verificationFingerprint(first);
+  assert.match(fingerprint, /^[0-9a-f]{64}$/, "the fingerprint is a 64-character lowercase hex SHA-256");
+  assert.equal(verificationFingerprint(second), fingerprint, "identical reports hash identically");
+  // Pure read: fingerprinting leaves the reviewed report untouched.
+  assert.deepEqual(first, fingerprintedReport());
+});
+
+test("verificationFingerprint: accepted-only bookkeeping never changes the fingerprint", () => {
+  const base = fingerprintedReport();
+  const fingerprint = verificationFingerprint(base);
+  // Observed acceptance (acceptedAt on the raw task) is excluded from the canonical clone.
+  assert.equal(verificationFingerprint(fingerprintedReport({ task: { acceptedAt: 1234567890 } })), fingerprint);
+  // Flipping the accepted flag on the built report object alone also changes nothing.
+  const flipped = structuredClone(base);
+  flipped.quality.workers[0]!.accepted = true;
+  assert.notEqual(flipped.quality.workers[0]!.accepted, base.quality.workers[0]!.accepted, "sanity: the reports genuinely differ only in accepted");
+  assert.equal(verificationFingerprint(flipped), fingerprint, "accept bookkeeping is not evidence");
+  flipped.quality.workers[0]!.accepted = false;
+  assert.equal(verificationFingerprint(flipped), fingerprint);
+});
+
+test("verificationFingerprint: corrections, statuses, workspace git_diff, and worker finalText drift re-key it", () => {
+  const base = verificationFingerprint(fingerprintedReport());
+  const drifts: Array<[string, VerificationReport]> = [
+    ["a correction round landed on the worker", fingerprintedReport({ task: { corrections: 2 } })],
+    ["the worker status changed", fingerprintedReport({ task: { status: "running" } })],
+    ["the run status changed", fingerprintedReport({ runStatus: "running" })],
+    ["the workspace git_diff changed", fingerprintedReport({ workspace: { gitDiff: "diff --git a/src/a.ts b/src/a.ts\n+drifted" } })],
+    ["the workspace git_diff disappeared (cleaned tree)", fingerprintedReport({ workspace: { gitDiff: "" } })],
+    ["the worker finalText changed", fingerprintedReport({ task: { finalText: "worker summary" } })]
+  ];
+  for (const [label, drifted] of drifts) {
+    assert.notEqual(verificationFingerprint(drifted), base, `${label} must invalidate the reviewed fingerprint`);
+  }
+  // Each drift is its own fingerprint (no accidental collisions among the drifts themselves).
+  assert.equal(new Set(drifts.map(([, report]) => verificationFingerprint(report))).size, drifts.length);
 });
 
 test("the pure builder refuses to invent facts for a missing authorized worker", () => {
