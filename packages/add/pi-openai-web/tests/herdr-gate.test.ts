@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateHerdrRunInput, herdrExecutionSpec } from "../src/mcp/server.js";
-import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX } from "../src/provider/orchestrator.js";
+import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers } from "../src/mcp/server.js";
+import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX } from "../src/provider/orchestrator.js";
 import { SubagentMcpAdapter } from "../src/mcp/subagent-adapter.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -80,6 +80,53 @@ test("execution_spec schema bounds at the MCP boundary", () => {
   const tooMany = Object.fromEntries(Array.from({ length: EXECUTION_SPEC_MAX_ENTRIES + 1 }, (_, i) => [`k${i}`, "v"]));
   assert.equal(herdrExecutionSpec.safeParse(tooMany).success, false, "too many entries rejected");
   assert.equal(herdrExecutionSpec.safeParse({ k: 1 }).success, false, "non-string value rejected");
+});
+
+// --- Declarative worker slice binding (Phase 2) ---
+
+const sliceWorker = { id: "w1", objective: "fix", owns: ["src"], depends_on: [], requirements: ["no new dependencies"], behaviors: ["fail closed on metadata drift"], seams: ["MCP herdr tool boundary"], acceptance: ["focused tests pass"] };
+
+test("herdr run binds worker slice metadata into the plan immutably", () => {
+  const handoff = issueHerdrHandoff(base.goal, [sliceWorker], gates);
+  // Exact same goal/workers/slice → accepted.
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], handoff }));
+  // Dropping metadata after plan fails closed.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [base.workers[0]], handoff }), /fingerprint/);
+  // Changing one metadata item after plan fails closed.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [{ ...sliceWorker, requirements: ["new dependencies allowed"] }], handoff }), /fingerprint/);
+  // Adding metadata that was never planned fails closed against a metadata-free envelope.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], handoff: validHandoff }), /fingerprint/);
+});
+
+test("worker slice metadata coexists with execution_spec in one immutable plan", () => {
+  const handoff = issueHerdrHandoff(base.goal, [sliceWorker], gates, spec);
+  // Both spec and slices present and unchanged → accepted.
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], execution_spec: spec, handoff }));
+  // Drifting the spec still fails on the spec comparison first.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], execution_spec: { ...spec, suite: "full" }, handoff }), /execution_spec differs/);
+  // Drifting only the slice fails on the fingerprint.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [{ ...sliceWorker, acceptance: ["anything goes"] }], execution_spec: spec, handoff }), /fingerprint/);
+});
+
+test("herdr run returns the envelope's authorized slices as the single source of truth", () => {
+  const handoff = issueHerdrHandoff(base.goal, [sliceWorker], gates);
+  const { workers } = validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], handoff });
+  assert.deepEqual(workers, [{ id: "w1", objective: "fix", owns: ["src"], dependsOn: [], requirements: ["no new dependencies"], behaviors: ["fail closed on metadata drift"], seams: ["MCP herdr tool boundary"], acceptance: ["focused tests pass"] }]);
+  // Run args spelled with dependsOn canonicalize to the same authorized slice.
+  const respelled = validateHerdrRunInput({ goal: base.goal, workers: [{ ...sliceWorker, dependsOn: sliceWorker.depends_on, depends_on: undefined }], handoff });
+  assert.deepEqual(respelled.workers, workers);
+});
+
+test("worker slice metadata schema bounds at the MCP boundary", () => {
+  const worker = { id: "w1", objective: "fix", owns: ["src"], depends_on: [] };
+  assert.ok(herdrWorkers.safeParse([{ ...worker, requirements: ["r1"], seams: ["s1"] }]).success);
+  assert.equal(herdrWorkers.safeParse([{ ...worker, requirements: [] }]).success, false, "empty list is not a valid present slice field");
+  assert.equal(herdrWorkers.safeParse([{ ...worker, requirements: "r" }]).success, false, "non-array metadata rejected");
+  assert.equal(herdrWorkers.safeParse([{ ...worker, requirements: [42] }]).success, false, "non-string item rejected");
+  assert.equal(herdrWorkers.safeParse([{ ...worker, requirements: [" "] }]).success, false, "blank item rejected");
+  assert.equal(herdrWorkers.safeParse([{ ...worker, requirements: ["x".repeat(WORKER_METADATA_ITEM_MAX + 1)] }]).success, false, "oversized item rejected");
+  assert.equal(herdrWorkers.safeParse([{ ...worker, behaviors: Array.from({ length: WORKER_METADATA_LIST_MAX + 1 }, (_, i) => `b${i}`) }]).success, false, "too many entries rejected");
+  assert.ok(herdrWorkers.safeParse([{ ...worker, behaviors: Array.from({ length: WORKER_METADATA_LIST_MAX }, (_, i) => `b${i}`) }]).success, "list bound is inclusive");
 });
 
 // --- Explicit confirmation boundary (SubagentMcpAdapter.run) ---

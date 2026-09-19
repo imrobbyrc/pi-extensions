@@ -38,11 +38,78 @@ export function assertOrchestrationGates(gates: OrchestrationGates | undefined):
   }
 }
 
-/** Canonical worker JSON: stable equality across dependsOn/depends_on spellings. */
+/**
+ * Phase-2 declarative worker slice: optional bounded metadata lists attached to
+ * a worker. Deliberately flat string lists — no typed requirement objects, no
+ * automatic decomposition, no verification machinery — immutably bound into
+ * the plan fingerprint and handoff envelope once planned.
+ */
+export type WorkerMetadataField = "requirements" | "behaviors" | "seams" | "acceptance";
+export const WORKER_METADATA_FIELDS: readonly WorkerMetadataField[] = ["requirements", "behaviors", "seams", "acceptance"];
+
+/** Shared bounds for worker slice metadata (envelope validation and MCP schema). */
+export const WORKER_METADATA_ITEM_MAX = 2_000;
+export const WORKER_METADATA_LIST_MAX = 20;
+
+export interface WorkerSlice {
+  id: string;
+  objective: string;
+  owns: string[];
+  dependsOn: string[];
+  requirements?: string[];
+  behaviors?: string[];
+  seams?: string[];
+  acceptance?: string[];
+}
+
+function assertWorkerMetadataList(field: WorkerMetadataField, value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`worker_slice_invalid: ${field} must be an array of strings`);
+  if (value.length < 1) throw new Error(`worker_slice_invalid: ${field} must contain at least one entry or be omitted entirely`);
+  if (value.length > WORKER_METADATA_LIST_MAX) throw new Error(`worker_slice_invalid: ${field} allows at most ${WORKER_METADATA_LIST_MAX} entries`);
+  return value.map((item) => {
+    if (typeof item !== "string" || !item.trim()) throw new Error(`worker_slice_invalid: ${field} entries must be non-blank strings`);
+    if (item.length > WORKER_METADATA_ITEM_MAX) throw new Error(`worker_slice_invalid: ${field} entries must be at most ${WORKER_METADATA_ITEM_MAX} characters`);
+    return item;
+  });
+}
+
+/** Validate one worker into a canonical WorkerSlice (accepts dependsOn/depends_on); throws worker_slice_invalid on bad shapes. */
+export function assertWorkerSlice(worker: unknown): WorkerSlice {
+  if (typeof worker !== "object" || worker === null) throw new Error("worker_slice_invalid: expected a worker object");
+  const record = worker as Record<string, unknown>;
+  if (typeof record.id !== "string" || !record.id.trim()) throw new Error("worker_slice_invalid: id must be a non-blank string");
+  if (typeof record.objective !== "string" || !record.objective.trim()) throw new Error("worker_slice_invalid: objective must be a non-blank string");
+  if (!Array.isArray(record.owns) || record.owns.length < 1 || record.owns.some((path) => typeof path !== "string" || !path.trim())) throw new Error("worker_slice_invalid: owns must be a non-empty array of non-blank path strings");
+  const dependsOn = record.dependsOn ?? record.depends_on ?? [];
+  if (!Array.isArray(dependsOn) || dependsOn.some((id) => typeof id !== "string" || !id.trim())) throw new Error("worker_slice_invalid: dependsOn must be an array of non-blank worker ids");
+  const requirements = assertWorkerMetadataList("requirements", record.requirements);
+  const behaviors = assertWorkerMetadataList("behaviors", record.behaviors);
+  const seams = assertWorkerMetadataList("seams", record.seams);
+  const acceptance = assertWorkerMetadataList("acceptance", record.acceptance);
+  return {
+    id: record.id,
+    objective: record.objective,
+    owns: record.owns,
+    dependsOn,
+    ...(requirements ? { requirements } : {}),
+    ...(behaviors ? { behaviors } : {}),
+    ...(seams ? { seams } : {}),
+    ...(acceptance ? { acceptance } : {})
+  };
+}
+
+/** Canonical worker JSON: stable equality across dependsOn/depends_on spellings; present slice metadata is appended in fixed field order, so metadata-free workers hash byte-identically to the legacy form. */
 export function canonicalWorkers(workers: unknown[]): string {
-  return JSON.stringify((workers as Array<Record<string, unknown>>).map((worker) => ({
-    id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.dependsOn ?? worker.depends_on ?? []
-  })));
+  return JSON.stringify((workers as Array<Record<string, unknown>>).map((worker) => {
+    const canonical: Record<string, unknown> = {
+      id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.dependsOn ?? worker.depends_on ?? []
+    };
+    for (const field of WORKER_METADATA_FIELDS) {
+      if (worker[field] !== undefined) canonical[field] = worker[field];
+    }
+    return canonical;
+  }));
 }
 
 /**
@@ -90,26 +157,28 @@ export function planFingerprint(goal: string, workers: unknown[], executionSpec?
 }
 
 /** Pi-side issuance: fresh taskId + goal/workers/spec-bound fingerprint → handoff envelope string. */
-export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[] }>, gates: OrchestrationGates, executionSpec?: unknown): string {
+export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>, gates: OrchestrationGates, executionSpec?: unknown): string {
   const spec = assertExecutionSpec(executionSpec);
+  const slices = workers.map((worker) => assertWorkerSlice(worker));
   return buildHerdrHandoff({
     taskId: randomUUID(),
     planFingerprint: planFingerprint(goal, workers, spec),
     gates,
-    workers: workers.map((worker) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.dependsOn ?? worker.depends_on ?? [] })),
+    workers: slices,
     ...(spec ? { executionSpec: spec } : {})
   });
 }
 
-/** Build an explicit, task-bound provider→Herdr handoff envelope. */
-export function buildHerdrHandoff(input: { taskId: string; planFingerprint: string; gates?: OrchestrationGates; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn: string[] }>; executionSpec?: ExecutionSpec }): string {
+/** Build an explicit, task-bound provider→Herdr handoff envelope (workers round-trip as validated WorkerSlices). */
+export function buildHerdrHandoff(input: { taskId: string; planFingerprint: string; gates?: OrchestrationGates; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>; executionSpec?: ExecutionSpec }): string {
   assertOrchestrationGates(input.gates);
   if (!input.taskId.trim() || !input.planFingerprint.trim() || !input.workers.length) throw new Error("orchestration_handoff_invalid: task, plan fingerprint, and workers are required");
   const executionSpec = assertExecutionSpec(input.executionSpec);
-  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, ...(executionSpec ? { executionSpec } : {}), workers: input.workers, authority: "Pi" });
+  const workers = input.workers.map((worker) => assertWorkerSlice(worker));
+  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, ...(executionSpec ? { executionSpec } : {}), workers, authority: "Pi" });
 }
 
-export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: unknown[]; executionSpec?: ExecutionSpec } {
+export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: WorkerSlice[]; executionSpec?: ExecutionSpec } {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
     if (value.protocol !== "pi-provider-herdr-handoff-v1" || value.authority !== "Pi"
@@ -119,9 +188,10 @@ export function parseHerdrHandoff(text: string): { taskId: string; planFingerpri
     const gates = value.gates as OrchestrationGates | undefined;
     assertOrchestrationGates(gates);
     const executionSpec = assertExecutionSpec(value.executionSpec);
-    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers: value.workers, ...(executionSpec ? { executionSpec } : {}) };
+    const workers = (value.workers as unknown[]).map((worker) => assertWorkerSlice(worker));
+    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers, ...(executionSpec ? { executionSpec } : {}) };
   } catch (error) {
-    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid"))) throw error;
+    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid"))) throw error;
     throw new Error("orchestration_handoff_invalid: expected Pi-issued handoff envelope");
   }
 }
@@ -145,13 +215,13 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "Your responsibilities: high-level reasoning, architectural planning, task decomposition, and code review.",
     `Workspace inspection tools (the only workspace access you have): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app.`,
     "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|accept|stop.",
-    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim.",
-    "- action=run: submit the exact same goal, workers, and execution_spec (when the plan included one) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI.",
+    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the spec and workers cannot invent requirements beyond it.",
+    "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec (when the plan included one) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, correction rounds). A completed worker stays live in its pane awaiting your review — nothing is auto-cleaned until you accept or stop.",
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
     "- action=accept: accept one completed worker's work — finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
     "- action=stop: stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
-    "Planning protocol (mandatory before delegation): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique. The graph is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
+    "Planning protocol (mandatory before delegation): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique. The graph is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Derive each worker's declarative slice lists (requirements, behaviors, seams, acceptance) from that graph — and, when an execution_spec is present, from that spec — so workers cannot invent requirements. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
     "Pi remains the sole executor: never mutate source, never run shell commands, never spawn Pi subagents, never create Herdr panes directly.",
     "After workers finish, inspect git_status/git_diff and review semantically against the same Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique dimensions. Send bounded corrections via action=correct and re-review the finished round; accept each worker via action=accept once its work is good, then report the result to the user. Always accept or stop to release worker panes."
   ].join("\n");

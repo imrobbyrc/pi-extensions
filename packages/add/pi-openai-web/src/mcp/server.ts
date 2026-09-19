@@ -6,8 +6,8 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, canonicalExecutionSpec, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX } from "../provider/orchestrator.js";
-type HerdrWorker = { id: string; objective: string; owns: string[]; dependsOn: string[] };
+import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, canonicalExecutionSpec, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type WorkerSlice } from "../provider/orchestrator.js";
+type HerdrWorker = WorkerSlice;
 
 type HerdrMcpAdapter = {
   run(request: { goal: string; workers: HerdrWorker[]; workerModel?: string; workerThinking?: string; handoff?: string }): Promise<{ id: string; status: string; workers: Array<{ id: string; state: string }> }>;
@@ -62,11 +62,19 @@ export const HERDR_LIST_MAX = 50;
 
 const herdrText = (max: number) => z.string().trim().min(1).max(max);
 
-const herdrWorkers = z.array(z.object({
+/** Bounded optional slice metadata: 1..N non-blank strings or omitted entirely. */
+const herdrWorkerMetadata = z.array(herdrText(WORKER_METADATA_ITEM_MAX)).min(1).max(WORKER_METADATA_LIST_MAX);
+
+/** Bounded 1-4 worker decomposition with optional Phase-2 declarative slice lists. */
+export const herdrWorkers = z.array(z.object({
   id: herdrText(100),
   objective: herdrText(HERDR_ITEM_MAX),
   owns: z.array(herdrText(500)).min(1).max(HERDR_LIST_MAX),
-  depends_on: z.array(herdrText(100)).max(HERDR_LIST_MAX)
+  depends_on: z.array(herdrText(100)).max(HERDR_LIST_MAX),
+  requirements: herdrWorkerMetadata.optional(),
+  behaviors: herdrWorkerMetadata.optional(),
+  seams: herdrWorkerMetadata.optional(),
+  acceptance: herdrWorkerMetadata.optional()
 })).min(1).max(4);
 
 const herdrGates = z.object({
@@ -81,8 +89,8 @@ export const herdrExecutionSpec = z.record(z.string().min(1).max(EXECUTION_SPEC_
 
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
-  "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers, execution_spec (when provided), and envelope string verbatim.",
-  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition, the plan's execution_spec verbatim (when present), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
+  "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), execution_spec (when provided), and envelope string verbatim. With an execution_spec present, worker slice lists derive from it — workers cannot invent requirements.",
+  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's execution_spec verbatim (when present), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
   "accept — accept one completed worker's work: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
@@ -93,8 +101,10 @@ export const HERDR_TOOL_DESCRIPTION = [
 /**
  * Strict frozen provider tool allowlist: bounded read/list/search/repo-map/
  * git status/diff plus one Pi-native herdr tool. Never subagent/bash/edit/write.
+ * Returns the envelope's validated WorkerSlices: they are the single source of
+ * truth for worker prompts (fingerprint-bound to this exact request).
  */
-export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; execution_spec?: unknown; handoff?: string }): void {
+export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; execution_spec?: unknown; handoff?: string }): { workers: WorkerSlice[] } {
   if (!input.goal) throw new Error("herdr run requires goal.");
   if (!input.workers?.length) throw new Error("herdr run requires 1-4 workers.");
   if (!input.handoff?.trim()) throw new Error("herdr run requires planning handoff.");
@@ -110,6 +120,7 @@ export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[
   if (parsed.planFingerprint !== planFingerprint(input.goal, input.workers, executionSpec)) {
     throw new Error("herdr run handoff does not match this goal/workers (plan fingerprint mismatch; re-run herdr action=plan).");
   }
+  return { workers: parsed.workers };
 }
 
 export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity }) {
@@ -219,9 +230,11 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and execution_spec (when provided)." });
         }
         if (action === "run") {
-          validateHerdrRunInput({ goal, workers, execution_spec, handoff });
-          const mapped: HerdrWorker[] = workers.map((worker: { id: string; objective: string; owns: string[]; depends_on: string[] }) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.depends_on }));
-          const run = await deps.subagent.run({ goal, workers: mapped, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}), ...(handoff ? { handoff } : {}) });
+          // The envelope's authorized slices are the single source of truth for
+          // what each worker is told — already fingerprint-bound to this exact
+          // goal/workers/spec, so run-time args can never drift from the plan.
+          const authorized = validateHerdrRunInput({ goal, workers, execution_spec, handoff });
+          const run = await deps.subagent.run({ goal, workers: authorized.workers, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}), ...(handoff ? { handoff } : {}) });
           return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
         }
         if (action === "status") {
