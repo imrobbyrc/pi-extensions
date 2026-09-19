@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateHerdrRunInput } from "../src/mcp/server.js";
-import { issueHerdrHandoff } from "../src/provider/orchestrator.js";
+import { validateHerdrRunInput, herdrExecutionSpec } from "../src/mcp/server.js";
+import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX } from "../src/provider/orchestrator.js";
 import { SubagentMcpAdapter } from "../src/mcp/subagent-adapter.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -26,6 +26,60 @@ test("herdr run handoff is task-bound to the exact goal and workers", () => {
   assert.throws(() => validateHerdrRunInput({ ...base, handoff: otherHandoff }), /fingerprint/);
   // Tampered taskId still fails structural parsing.
   assert.throws(() => validateHerdrRunInput({ ...base, handoff: validHandoff.replace(/"taskId":"[^"]+"/, '"taskId":""') }), /handoff/);
+});
+
+// --- Optional execution_spec binding (Phase 1) ---
+
+const spec = { runtime: "node>=20", suite: "focused" };
+
+test("herdr run binds execution_spec into the plan immutably", () => {
+  const handoff = issueHerdrHandoff(base.goal, base.workers, gates, spec);
+  // Exact same goal/workers/spec → accepted.
+  assert.doesNotThrow(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff }));
+  // Key order at run time is irrelevant (deterministic canonicalization).
+  assert.doesNotThrow(() => validateHerdrRunInput({ ...base, execution_spec: { suite: spec.suite, runtime: spec.runtime }, handoff }));
+  // Removing the spec after plan fails closed.
+  assert.throws(() => validateHerdrRunInput({ ...base, handoff }), /execution_spec differs/);
+  // Changing one value after plan fails closed.
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: { ...spec, suite: "full" }, handoff }), /execution_spec differs/);
+  // Adding a spec that was never planned fails closed against a no-spec envelope.
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: validHandoff }), /execution_spec differs/);
+});
+
+test("execution_spec fingerprints are order-independent and spec-less V3 hashes stay intact", () => {
+  assert.equal(planFingerprint(base.goal, base.workers, { a: "1", b: "2" }), planFingerprint(base.goal, base.workers, { b: "2", a: "1" }));
+  assert.notEqual(planFingerprint(base.goal, base.workers, spec), planFingerprint(base.goal, base.workers));
+  assert.equal(planFingerprint(base.goal, base.workers, undefined), planFingerprint(base.goal, base.workers));
+});
+
+test("handoff envelopes embed the canonical spec deterministically and tampering fails closed", () => {
+  const envelope = issueHerdrHandoff(base.goal, base.workers, gates, { b: "2", a: "1" });
+  // Sorted-key serialization is byte-deterministic regardless of input key order.
+  assert.match(envelope, /"executionSpec":\{"a":"1","b":"2"\}/);
+  const parsed = parseHerdrHandoff(envelope);
+  assert.deepEqual(parsed.executionSpec, { a: "1", b: "2" });
+  // Tampering the embedded spec value breaks run validation both ways.
+  const tampered = envelope.replace('"a":"1"', '"a":"9"');
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: { a: "1", b: "2" }, handoff: tampered }), /execution_spec differs/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: { a: "9", b: "2" }, handoff: tampered }), /fingerprint/);
+  // A structurally invalid embedded spec is rejected at parse time.
+  assert.throws(() => parseHerdrHandoff(envelope.replace(/"executionSpec":\{[^}]*\}/, '"executionSpec":42')), /execution_spec_invalid/);
+});
+
+test("invalid execution_spec shapes fail closed at plan time", () => {
+  for (const bad of [null, [], 42, "spec", {}, { blank: "" }, { num: 7 }, { " ": "x" }]) {
+    assert.throws(() => issueHerdrHandoff(base.goal, base.workers, gates, bad), /execution_spec_invalid/, `spec ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("execution_spec schema bounds at the MCP boundary", () => {
+  assert.ok(herdrExecutionSpec.safeParse({ runtime: "node" }).success);
+  assert.equal(herdrExecutionSpec.safeParse({}).success, false, "empty spec is not a valid present spec");
+  assert.equal(herdrExecutionSpec.safeParse({ k: "v".repeat(EXECUTION_SPEC_VALUE_MAX + 1) }).success, false, "oversized value rejected");
+  assert.equal(herdrExecutionSpec.safeParse({ ["k".repeat(EXECUTION_SPEC_KEY_MAX + 1)]: "v" }).success, false, "oversized key rejected");
+  const tooMany = Object.fromEntries(Array.from({ length: EXECUTION_SPEC_MAX_ENTRIES + 1 }, (_, i) => [`k${i}`, "v"]));
+  assert.equal(herdrExecutionSpec.safeParse(tooMany).success, false, "too many entries rejected");
+  assert.equal(herdrExecutionSpec.safeParse({ k: 1 }).success, false, "non-string value rejected");
 });
 
 // --- Explicit confirmation boundary (SubagentMcpAdapter.run) ---

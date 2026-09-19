@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, canonicalExecutionSpec, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX } from "../provider/orchestrator.js";
 type HerdrWorker = { id: string; objective: string; owns: string[]; dependsOn: string[] };
 
 type HerdrMcpAdapter = {
@@ -75,10 +75,14 @@ const herdrGates = z.object({
   critique: herdrText(HERDR_ITEM_MAX)
 });
 
+/** Optional Phase-1 execution spec: a bounded string map, or omitted entirely (V3). */
+export const herdrExecutionSpec = z.record(z.string().min(1).max(EXECUTION_SPEC_KEY_MAX), herdrText(EXECUTION_SPEC_VALUE_MAX))
+  .refine((spec) => Object.keys(spec).length >= 1 && Object.keys(spec).length <= EXECUTION_SPEC_MAX_ENTRIES, { message: `execution_spec must contain 1-${EXECUTION_SPEC_MAX_ENTRIES} entries or be omitted` });
+
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
-  "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers, and envelope string verbatim.",
-  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
+  "plan — validate planning gates {graph, handoff, critique} and return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers, execution_spec (when provided), and envelope string verbatim.",
+  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition, the plan's execution_spec verbatim (when present), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
   "accept — accept one completed worker's work: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
@@ -90,14 +94,20 @@ export const HERDR_TOOL_DESCRIPTION = [
  * Strict frozen provider tool allowlist: bounded read/list/search/repo-map/
  * git status/diff plus one Pi-native herdr tool. Never subagent/bash/edit/write.
  */
-export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; handoff?: string }): void {
+export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; execution_spec?: unknown; handoff?: string }): void {
   if (!input.goal) throw new Error("herdr run requires goal.");
   if (!input.workers?.length) throw new Error("herdr run requires 1-4 workers.");
   if (!input.handoff?.trim()) throw new Error("herdr run requires planning handoff.");
+  const executionSpec = assertExecutionSpec(input.execution_spec);
   const parsed = parseHerdrHandoff(input.handoff);
+  // Spec binding: the envelope's embedded spec must equal THIS run's spec exactly —
+  // adding, removing, or changing it after plan fails closed.
+  if (canonicalExecutionSpec(parsed.executionSpec) !== canonicalExecutionSpec(executionSpec)) {
+    throw new Error("herdr run execution_spec differs from the plan's execution_spec (re-run herdr action=plan).");
+  }
   // Task binding: the envelope's planFingerprint must be the exact hash of THIS
-  // goal + workers, so stale or borrowed envelopes from other plans are rejected.
-  if (parsed.planFingerprint !== planFingerprint(input.goal, input.workers)) {
+  // goal + workers (+ spec), so stale or borrowed envelopes from other plans are rejected.
+  if (parsed.planFingerprint !== planFingerprint(input.goal, input.workers, executionSpec)) {
     throw new Error("herdr run handoff does not match this goal/workers (plan fingerprint mismatch; re-run herdr action=plan).");
   }
 }
@@ -193,6 +203,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           goal: herdrText(HERDR_GOAL_MAX).optional(),
           workers: herdrWorkers.optional(),
           gates: herdrGates.optional(),
+          execution_spec: herdrExecutionSpec.optional(),
           worker_model: z.string().trim().min(1).max(200).optional(),
           worker_thinking: z.string().trim().min(1).max(100).optional(),
           handoff: z.string().max(HERDR_HANDOFF_MAX).optional(),
@@ -202,13 +213,13 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
-      track(async ({ action, goal, workers, gates, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
+      track(async ({ action, goal, workers, gates, execution_spec, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
         if (action === "plan") {
           if (!goal || !workers || !gates) throw new Error("herdr plan requires goal, workers, and planning gates {graph, handoff, critique}.");
-          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal and workers." });
+          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and execution_spec (when provided)." });
         }
         if (action === "run") {
-          validateHerdrRunInput({ goal, workers, handoff });
+          validateHerdrRunInput({ goal, workers, execution_spec, handoff });
           const mapped: HerdrWorker[] = workers.map((worker: { id: string; objective: string; owns: string[]; depends_on: string[] }) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.depends_on }));
           const run = await deps.subagent.run({ goal, workers: mapped, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}), ...(handoff ? { handoff } : {}) });
           return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
