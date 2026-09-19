@@ -4,14 +4,17 @@ Pi-native harness with an **always-on ChatGPT Web Lead Architect**: ChatGPT Web 
 
 ## Release status
 
-**V3 architecture, implemented and tested (90 planner tests; 159 core subagent tests).**
+**V4 safety baseline, implemented and tested (229 harness tests, plus the core subagent suite in `packages/core/pi-core-subagent`).**
 
 One product, one flow:
 
 - **OpenAI Web Lead (always on)** — ChatGPT Web behaves like a native Pi model through `/model openai-web/<id>`, with dynamic model/effort discovery, exact browser selection, bounded context, and structured checkpoint compaction.
 - **Strict lead tools** — the Lead sees exactly seven MCP tools: six bounded read-only workspace inspections plus one Pi-native `herdr` execution tool. No shell, no writes, no subagent spawning, no browser worker tabs.
+- **Decision-graph planning & work-graph validation** — every plan passes the planning gates (`graph`, `handoff`, `critique`); an optional nine-axis `decision_graph` is mechanically compiled by Pi into the plan's execution spec, and every 1–4 worker decomposition is validated as one legal work graph (unique ids, acyclic dependencies, non-overlapping ownership) before a Pi-issued handoff envelope binds it to a deterministic plan fingerprint.
 - **Asynchronous native Herdr** — one `herdr` MCP tool with `plan | run | status | correct | accept | stop | verify` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
-- **Observational verification** — `herdr verify` binds the exact Pi-issued handoff envelope to one actual run and derives a deterministic bounded `VerificationReport` (exactly four dimensions: spec, design, quality, evidence) from the parsed handoff, the raw run snapshot, and current git status/diff. It is read-only evidence for review — never a score, never a pass/fail, and never an acceptance gate.
+- **Observational verification & fingerprint-bound acceptance** — `herdr verify` binds the exact Pi-issued handoff envelope to one actual run and derives a deterministic bounded `VerificationReport` (exactly four dimensions: spec, design, quality, evidence) from the parsed handoff, the raw run snapshot, and current git status/diff, plus a `verification_fingerprint` (deterministic SHA-256). The report is read-only evidence for review — never a score, never a pass/fail. `herdr accept` additionally requires that fingerprint: the report is recomputed from fresh evidence immediately before the mutation, and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated.
+
+**V5 direction — adaptive planning depth (in review; not yet landed on main).** Planning depth is being scaled to assessed risk: **low-risk** work (docs, comments, config, single-file or test-only edits) gets a compact plan (problem, scope/boundaries, behavior, verification), while **medium/high-risk** work retains the full Design Graph (nine sections, with broader verification expectations at high risk). The planning gates, work-graph rules, and the verify → fresh-fingerprint accept safety floor stay identical at every depth; only the depth adapts. Until V5 merges, the V4 baseline enforces the full planning protocol on every plan. See [Planning depth](#planning-depth-v5-adaptive-planning).
 
 The former planner subsystem (`/planner`, task store, submit_plan/submit_review protocol, browser worker tabs, Pi subagent delegation) has been removed.
 
@@ -29,13 +32,14 @@ Select a discovered ChatGPT Web model/effort as your active Pi model:
 /model openai-web/gpt-5-6-sol-medium
 ```
 
-ChatGPT Web streams responses natively into Pi. The Lead Architect contract is injected into every provider turn: the Lead reasons, decomposes work, and — only after its mandatory planning gate (design graph + independent critique) — submits a worker decomposition through the `herdr` tool. Pi shows you the plan, asks for explicit confirmation, then Herdr splits panes and starts Pi workers. The Lead inspects `git_status`/`git_diff` afterwards, sends bounded `correct` rounds to the worker's own pane until the work is good, `accept`s each approved worker to close its pane, and reports the result.
+ChatGPT Web streams responses natively into Pi. The Lead Architect contract is injected into every provider turn: the Lead reasons, assesses risk, and plans at the depth that risk justifies — always through the mandatory planning gates (`graph`, `handoff`, `critique`) — before submitting a worker decomposition through the `herdr` tool. Pi shows you the plan, asks for explicit confirmation, then Herdr splits panes and starts Pi workers. The Lead inspects `git_status`/`git_diff` afterwards, sends bounded `correct` rounds to the worker's own pane until the work is good, then `verify`s the run and `accept`s each approved worker with the fresh verification fingerprint to close its pane, and reports the result.
 
 ```text
-Lead turn → herdr run (1–4 workers, DAG, ownership scopes)
+Lead turn → herdr plan (planning gates, fingerprinted handoff envelope)
+          → herdr run (1–4 workers, DAG, ownership scopes)
           → explicit TUI confirmation in Pi
           → Herdr panes, Pi workers (kind=pi)
-          → herdr status / correct (same pane, repeatable) / accept (finalize)
+          → herdr status / correct (same pane, repeatable) / verify → accept (fresh fingerprint)
           → Lead reviews diff → result
 ```
 
@@ -100,7 +104,7 @@ Open a trusted project workspace in Pi, select a lead model, and ask for somethi
 "add a rate limiter to the API and wire up tests"
 ```
 
-The Lead inspects the workspace through MCP, renders its planning graph, then submits `herdr run`. Pi asks you to confirm the goal, workers, and worker profile before any pane starts. Nothing executes without that confirmation.
+The Lead inspects the workspace through MCP, runs its planning protocol at the assessed risk depth, then submits `herdr run`. Pi asks you to confirm the goal, workers, and worker profile before any pane starts. Nothing executes without that confirmation.
 
 ## Architecture
 
@@ -152,7 +156,7 @@ Strict frozen allowlist — the only tools the Lead can see:
 | `repo_map` | read-only | Bounded directory tree |
 | `git_status` | read-only | Git status |
 | `git_diff` | read-only | Git diff (staged or unstaged) |
-| `herdr` | **mutating** (the `verify` action is read-only) | `plan \| run \| status \| correct \| accept \| stop \| verify` — Pi-native worker execution; `verify` derives the observational VerificationReport |
+| `herdr` | **mutating** (the `verify` action is read-only) | `plan \| run \| status \| correct \| accept \| stop \| verify` — Pi-native worker execution; `verify` derives the observational VerificationReport and its `verification_fingerprint`, which `accept` requires |
 
 The `herdr` tool is honestly annotated (`readOnlyHint: false`, `destructiveHint: true`). Everything else is read-only. There are no shell, edit, write, install, migration, git-mutation, or subagent tools at any endpoint.
 
@@ -167,6 +171,20 @@ The `herdr` tool is honestly annotated (`readOnlyHint: false`, `destructiveHint:
 | Spawn panes / delegate / switch models | never | n/a | prohibited |
 
 ## Herdr execution
+
+### Planning depth (V5 adaptive planning)
+
+Planning is mandatory before delegation, and its depth scales to the risk the Lead assesses from workspace evidence. The planning gates (`graph`, `handoff`, `critique`), the work-graph rules, and the verify → fresh-fingerprint accept safety floor apply identically at every level — only the depth adapts.
+
+| Assessed risk | Planning depth |
+| --- | --- |
+| **Low** — docs, comments, config, single-file or test-only edits | Compact plan: problem, scope/boundaries, intended behavior, verification. `decision_graph`/`execution_spec` and multi-worker decomposition are optional at this level |
+| **Medium** — normal multi-surface behavioral changes (features spanning multiple files, modules, or surfaces) | Full Design Graph, in order: Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, Critique |
+| **High** — architecture, concurrency, auth/security, migrations/data integrity, lifecycle-sensitive changes, or complex multi-worker dependency work | Full Design Graph (same nine sections) plus broader verification expectations — wider test surface and explicit failure/boundary analysis |
+
+Escalate, never downgrade: inspection or new evidence revealing complexity beyond the assessed level re-rates the task and re-plans at the higher rigor before delegation, and an in-flight task is never silently downgraded to lighter review.
+
+*Status: V5 is in review and not yet landed on main — until it merges, the V4 baseline enforces the full planning protocol on every plan.*
 
 ### Contract
 
@@ -197,8 +215,8 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
 - `run` returns the run handle immediately; execution continues in the background.
 - `status` reads the persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed herdr worker stays live in its pane awaiting review — it is never auto-cleaned while reviewable.
 - `correct` sends bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session (same agent, accumulated context) and completes again for re-review — repeatable, the round count shows in `status`; a still-running worker is steered mid-flight. The worker is always reused, never replaced.
-- `accept` accepts one completed worker's work: marks it accepted and closes its pane (idempotent). This is the required finalization for every approved worker.
-- `verify` derives a post-implementation `VerificationReport` for one run: it requires `run_id` plus the exact Pi-issued handoff envelope, parses it through the existing envelope parser, and binds it to the actual run — the authorized worker set must match the run's workers and every worker task prompt must carry the exact envelope prefix; any mismatch (malformed or tampered envelope, unknown run, worker-set drift, prompt drift) fails closed with a verification-specific error. The report carries exactly four dimensions — `spec` (compiled execution spec verbatim, or an explicit legacy-absent observation for spec-less envelopes, plus the planning gates), `design` (authorized worker slices in deterministic work-graph order), `quality` (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending; volatile timestamps are omitted), and `evidence` (current `git_status`/`git_diff` observations plus bounded worker evidence already in the run snapshot). Deterministic for the same observations, and purely observational: it never calls `correct`/`accept`/`stop`, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or gates acceptance. Inspection goes through a read-only raw snapshot channel (the adapter's `inspect` seam), never through `status`, whose adapter implementation can auto-shutdown a run after acceptance.
+- `accept` accepts one completed worker's work: it requires the exact Pi-issued handoff envelope plus the `verification_fingerprint` returned by a prior `verify`; the report is recomputed from fresh evidence immediately before the mutation, and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated. On match: marks the worker accepted and closes its pane (idempotent). This is the required finalization for every approved worker.
+- `verify` derives a post-implementation `VerificationReport` for one run: it requires `run_id` plus the exact Pi-issued handoff envelope, parses it through the existing envelope parser, and binds it to the actual run — the authorized worker set must match the run's workers and every worker task prompt must carry the exact envelope prefix; any mismatch (malformed or tampered envelope, unknown run, worker-set drift, prompt drift) fails closed with a verification-specific error. The report carries exactly four dimensions — `spec` (compiled execution spec verbatim, or an explicit legacy-absent observation for spec-less envelopes, plus the planning gates), `design` (authorized worker slices in deterministic work-graph order), `quality` (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending; volatile timestamps are omitted), and `evidence` (current `git_status`/`git_diff` observations plus bounded worker evidence already in the run snapshot). Deterministic for the same observations, and purely observational: it never calls `correct`/`accept`/`stop`, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or gates acceptance. The response also carries a `verification_fingerprint` — a deterministic SHA-256 over the report with accept bookkeeping excluded — which `accept` requires verbatim as a freshness binding on the reviewed evidence. Inspection goes through a read-only raw snapshot channel (the adapter's `inspect` seam), never through `status`, whose adapter implementation can auto-shutdown a run after acceptance.
 - `stop` stops a run and closes its owned panes, including unaccepted completed workers (omit `run_id` to reap all owned panes).
 
 ## Provider features
@@ -312,4 +330,4 @@ Read [`SECURITY.md`](SECURITY.md) before exposing MCP. Key boundaries:
 
 ## Roadmap
 
-Current V3 architecture is complete and validated with 90 planner tests plus 159 core subagent tests. Remaining work and future ideas are tracked in [`ROADMAP.md`](ROADMAP.md). Historical V0–V2 milestones (planner subsystem, browser worker tabs, Pi subagent delegation) are retained there as clearly labeled superseded history.
+The V4 safety baseline — decision-graph planning, work-graph validation, observational `verify`, and fingerprint-bound fresh-evidence `accept` — is complete and validated with 229 harness tests plus the core subagent suite in `@imrobbyrc/pi-core-subagent`. V5 adaptive planning depth is in review. Remaining work and future ideas are tracked in [`ROADMAP.md`](ROADMAP.md). Historical V0–V2 milestones (planner subsystem, browser worker tabs, Pi subagent delegation) are retained there as clearly labeled superseded history.
