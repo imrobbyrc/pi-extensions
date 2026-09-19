@@ -139,3 +139,49 @@ test("herdr tool run rejects drifted slice metadata before any worker starts", a
   );
   assert.equal(runs.length, 0, "no worker may start on drifted slice metadata");
 });
+
+test("inspect returns the raw status snapshot without invoking any lifecycle transition", () => {
+  const calls: { method: string; args: unknown[] }[] = [];
+  const run = {
+    id: "run-1",
+    runtime: "herdr",
+    status: "completed",
+    tasks: [{ id: "w1", status: "completed", runtime: "herdr", paneId: "pane-1", acceptedAt: 1234567890 }]
+  };
+  const controller = {
+    status: (runId?: string) => {
+      calls.push({ method: "status", args: [runId] });
+      return structuredClone(runId ? run : [run]);
+    },
+    hasActiveRun: () => false,
+    shutdown: () => calls.push({ method: "shutdown", args: [] }),
+    correct: () => {
+      calls.push({ method: "correct", args: [] });
+      return run;
+    },
+    accept: async () => {
+      calls.push({ method: "accept", args: [] });
+      return run;
+    },
+    retryCleanup: async () => {
+      calls.push({ method: "retryCleanup", args: [] });
+      return run;
+    },
+    cancel: () => {
+      calls.push({ method: "cancel", args: [] });
+      return run;
+    }
+  };
+  const adapter = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session);
+  const snapshot = adapter.inspect("run-1") as any;
+  // Returns the exact controller status snapshot...
+  assert.equal(snapshot.id, "run-1");
+  assert.equal(snapshot.tasks[0].status, "completed");
+  assert.equal(snapshot.tasks[0].acceptedAt, 1234567890);
+  // ...and performs ONLY the raw status read: no shutdown, no cleanup retry,
+  // no correct, no accept, no stop/cancel.
+  assert.deepEqual(calls.map((call) => call.method), ["status"], "inspect performs only the raw status read");
+  // Contrast: on this fully-accepted run the adapter's status() WOULD auto-shutdown — inspect must never do so.
+  adapter.status();
+  assert.equal(calls.filter((call) => call.method === "shutdown").length, 1, "status() auto-shuts down; inspect() did not");
+});

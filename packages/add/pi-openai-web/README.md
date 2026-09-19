@@ -10,7 +10,8 @@ One product, one flow:
 
 - **OpenAI Web Lead (always on)** — ChatGPT Web behaves like a native Pi model through `/model openai-web/<id>`, with dynamic model/effort discovery, exact browser selection, bounded context, and structured checkpoint compaction.
 - **Strict lead tools** — the Lead sees exactly seven MCP tools: six bounded read-only workspace inspections plus one Pi-native `herdr` execution tool. No shell, no writes, no subagent spawning, no browser worker tabs.
-- **Asynchronous native Herdr** — one `herdr` MCP tool with `run | status | correct | accept | stop` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
+- **Asynchronous native Herdr** — one `herdr` MCP tool with `plan | run | status | correct | accept | stop | verify` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
+- **Observational verification** — `herdr verify` binds the exact Pi-issued handoff envelope to one actual run and derives a deterministic bounded `VerificationReport` (exactly four dimensions: spec, design, quality, evidence) from the parsed handoff, the raw run snapshot, and current git status/diff. It is read-only evidence for review — never a score, never a pass/fail, and never an acceptance gate.
 
 The former planner subsystem (`/planner`, task store, submit_plan/submit_review protocol, browser worker tabs, Pi subagent delegation) has been removed.
 
@@ -151,7 +152,7 @@ Strict frozen allowlist — the only tools the Lead can see:
 | `repo_map` | read-only | Bounded directory tree |
 | `git_status` | read-only | Git status |
 | `git_diff` | read-only | Git diff (staged or unstaged) |
-| `herdr` | **mutating** | `run \| status \| correct \| accept \| stop` — Pi-native worker execution |
+| `herdr` | **mutating** (the `verify` action is read-only) | `plan \| run \| status \| correct \| accept \| stop \| verify` — Pi-native worker execution; `verify` derives the observational VerificationReport |
 
 The `herdr` tool is honestly annotated (`readOnlyHint: false`, `destructiveHint: true`). Everything else is read-only. There are no shell, edit, write, install, migration, git-mutation, or subagent tools at any endpoint.
 
@@ -197,6 +198,7 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
 - `status` reads the persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed herdr worker stays live in its pane awaiting review — it is never auto-cleaned while reviewable.
 - `correct` sends bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session (same agent, accumulated context) and completes again for re-review — repeatable, the round count shows in `status`; a still-running worker is steered mid-flight. The worker is always reused, never replaced.
 - `accept` accepts one completed worker's work: marks it accepted and closes its pane (idempotent). This is the required finalization for every approved worker.
+- `verify` derives a post-implementation `VerificationReport` for one run: it requires `run_id` plus the exact Pi-issued handoff envelope, parses it through the existing envelope parser, and binds it to the actual run — the authorized worker set must match the run's workers and every worker task prompt must carry the exact envelope prefix; any mismatch (malformed or tampered envelope, unknown run, worker-set drift, prompt drift) fails closed with a verification-specific error. The report carries exactly four dimensions — `spec` (compiled execution spec verbatim, or an explicit legacy-absent observation for spec-less envelopes, plus the planning gates), `design` (authorized worker slices in deterministic work-graph order), `quality` (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending; volatile timestamps are omitted), and `evidence` (current `git_status`/`git_diff` observations plus bounded worker evidence already in the run snapshot). Deterministic for the same observations, and purely observational: it never calls `correct`/`accept`/`stop`, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or gates acceptance. Inspection goes through a read-only raw snapshot channel (the adapter's `inspect` seam), never through `status`, whose adapter implementation can auto-shutdown a run after acceptance.
 - `stop` stops a run and closes its owned panes, including unaccepted completed workers (omit `run_id` to reap all owned panes).
 
 ## Provider features

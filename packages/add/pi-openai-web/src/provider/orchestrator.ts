@@ -397,7 +397,17 @@ export function buildHerdrHandoff(input: { taskId: string; planFingerprint: stri
   return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, ...(executionSpec ? { executionSpec } : {}), workers, authority: "Pi" });
 }
 
-export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: WorkerSlice[]; order: string[]; executionSpec?: ExecutionSpec } {
+/** The validated parse result of one Pi-issued handoff envelope. */
+export interface ParsedHerdrHandoff {
+  taskId: string;
+  planFingerprint: string;
+  gates: OrchestrationGates;
+  workers: WorkerSlice[];
+  order: string[];
+  executionSpec?: ExecutionSpec;
+}
+
+export function parseHerdrHandoff(text: string): ParsedHerdrHandoff {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
     if (value.protocol !== "pi-provider-herdr-handoff-v1" || value.authority !== "Pi"
@@ -418,6 +428,169 @@ export function parseHerdrHandoff(text: string): { taskId: string; planFingerpri
   }
 }
 
+// --- VerificationReport (Phase 5: post-implementation evidence artifact) ---
+
+/** The four frozen evidence dimensions of a VerificationReport — exactly these, never ranked or scored. */
+export type VerificationDimension = "spec" | "design" | "quality" | "evidence";
+export const VERIFICATION_DIMENSIONS: readonly VerificationDimension[] = ["spec", "design", "quality", "evidence"];
+
+/** Shared bounds for verification evidence normalization. */
+export const VERIFICATION_OBSERVATION_MAX = 64_000;
+export const VERIFICATION_CHANGED_FILES_MAX = 100;
+
+/** spec dimension: the plan identity and spec facts, copied verbatim from the parsed handoff. */
+export interface VerificationSpecDimension {
+  taskId: string;
+  planFingerprint: string;
+  gates: OrchestrationGates;
+  /** Explicit mechanical observation: a spec-bearing handoff or a legacy spec-less one (never invented). */
+  specStatus: "present" | "legacy-absent";
+  executionSpec?: ExecutionSpec;
+}
+
+/** design dimension: the authorized worker slices in their deterministic work-graph order. */
+export interface VerificationDesignDimension {
+  workers: WorkerSlice[];
+  order: string[];
+}
+
+/** quality dimension: observed lifecycle facts only — no competence judgment, no pass/fail. */
+export interface VerificationQualityDimension {
+  run: { id: string; runtime?: string; status: string };
+  workers: Array<{ id: string; runtime?: string; status: string; corrections: number; accepted: boolean; cleanupPending: boolean }>;
+}
+
+/** evidence dimension: current workspace observations plus bounded worker evidence from the run snapshot. */
+export interface VerificationEvidenceDimension {
+  workspace: { git_status?: string; git_diff?: string };
+  workers: Array<{ id: string; changedFiles?: string[]; changedFilesTruncated?: true; diffStat?: string; error?: string; finalText?: string }>;
+}
+
+/** Deterministic serializable post-implementation evidence artifact. Exactly four top-level dimensions; no overall score, ranking, or verdict. */
+export interface VerificationReport {
+  spec: VerificationSpecDimension;
+  design: VerificationDesignDimension;
+  quality: VerificationQualityDimension;
+  evidence: VerificationEvidenceDimension;
+}
+
+/** Loose run observation the pure builder normalizes (unknown extra fields are ignored). */
+export interface VerificationRunObservation {
+  id: string;
+  runtime?: string;
+  status: string;
+  tasks: ReadonlyArray<Record<string, unknown>>;
+}
+
+export interface VerificationReportInput {
+  handoff: ParsedHerdrHandoff;
+  run: VerificationRunObservation;
+  workspace: { gitStatus?: string; gitDiff?: string };
+}
+
+/** Deterministic truncation: bounded observations stay faithful and reproducible (same input → same output). */
+function boundedObservation(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  if (value.length <= VERIFICATION_OBSERVATION_MAX) return value;
+  return `${value.slice(0, VERIFICATION_OBSERVATION_MAX)}\n…[verification evidence truncated: ${value.length - VERIFICATION_OBSERVATION_MAX} characters omitted]`;
+}
+
+function observedString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+/**
+ * Pure deterministic report builder: derives the bounded VerificationReport from
+ * one validated handoff, one raw run observation, and current workspace
+ * observations. Every field is copied or normalized from the inputs — nothing
+ * is invented, no lifecycle timestamps are emitted (they are volatile), and no
+ * dimension judges quality. Worker facts are reported in the handoff's
+ * deterministic work-graph order.
+ */
+export function buildVerificationReport(input: VerificationReportInput): VerificationReport {
+  const { handoff, run } = input;
+  const workerById = new Map(handoff.workers.map((worker) => [worker.id, worker] as const));
+  const taskById = new Map<string, Record<string, unknown>>();
+  for (const task of run.tasks) {
+    const id = observedString(task.id);
+    if (id !== undefined) taskById.set(id, task);
+  }
+  // Refuse to invent facts: every authorized worker must have an observed task
+  // (run↔handoff set equality is the server's fail-closed binding; this guard
+  // keeps the pure builder total-but-honest even for direct callers).
+  const orderedWorkers = handoff.order.map((id) => {
+    const worker = workerById.get(id);
+    if (!worker) throw new Error(`verification_report_invalid: handoff order references unknown worker ${JSON.stringify(id)}`);
+    return worker;
+  });
+  const orderedTasks = handoff.order.map((id) => {
+    const task = taskById.get(id);
+    if (!task) throw new Error(`verification_report_invalid: run is missing the authorized worker ${JSON.stringify(id)}`);
+    return task;
+  });
+  const qualityWorkers = orderedTasks.map((task, index) => {
+    const id = handoff.order[index] as string;
+    const runtime = observedString(task.runtime) ?? observedString(run.runtime);
+    const corrections = typeof task.corrections === "number" && Number.isFinite(task.corrections) ? task.corrections : 0;
+    return {
+      id,
+      ...(runtime ? { runtime } : {}),
+      status: observedString(task.status) ?? "unobserved",
+      corrections,
+      accepted: typeof task.acceptedAt === "number" && task.acceptedAt > 0,
+      cleanupPending: Boolean(task.cleanupPending)
+    };
+  });
+  const evidenceWorkers = orderedTasks.map((task, index) => {
+    const id = handoff.order[index] as string;
+    const changedFiles = Array.isArray(task.changedFiles)
+      ? (task.changedFiles.filter((path): path is string => typeof path === "string" && path.length > 0) as string[])
+      : [];
+    const diffStat = boundedObservation(task.diffStat);
+    const error = boundedObservation(task.error);
+    const finalText = boundedObservation(task.finalText);
+    return {
+      id,
+      ...(changedFiles.length > 0
+        ? changedFiles.length > VERIFICATION_CHANGED_FILES_MAX
+          ? { changedFiles: changedFiles.slice(0, VERIFICATION_CHANGED_FILES_MAX), changedFilesTruncated: true as const }
+          : { changedFiles }
+        : {}),
+      ...(diffStat ? { diffStat } : {}),
+      ...(error ? { error } : {}),
+      ...(finalText ? { finalText } : {})
+    };
+  });
+  const gitStatusObservation = boundedObservation(input.workspace.gitStatus);
+  const gitDiffObservation = boundedObservation(input.workspace.gitDiff);
+  const runRuntime = observedString(run.runtime);
+  return {
+    spec: {
+      taskId: handoff.taskId,
+      planFingerprint: handoff.planFingerprint,
+      gates: handoff.gates,
+      specStatus: handoff.executionSpec ? "present" : "legacy-absent",
+      ...(handoff.executionSpec ? { executionSpec: handoff.executionSpec } : {})
+    },
+    design: { workers: orderedWorkers, order: [...handoff.order] },
+    quality: {
+      run: {
+        id: run.id,
+        ...(runRuntime ? { runtime: runRuntime } : {}),
+        status: run.status
+      },
+      workers: qualityWorkers
+    },
+    evidence: {
+      workspace: {
+        ...(gitStatusObservation ? { git_status: gitStatusObservation } : {}),
+        ...(gitDiffObservation ? { git_diff: gitDiffObservation } : {})
+      },
+      workers: evidenceWorkers
+    }
+  };
+}
+
 export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
   workerModel: "zai/glm-5.3",
   workerThinking: "high",
@@ -436,12 +609,13 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     `You are the Lead Architect and Orchestrator. Implementation and code changes are delegated to Herdr-managed Pi worker agents (worker model: ${active.workerModel}, thinking: ${active.workerThinking}, max parallel workers: ${active.maxParallelWorkers}, strategy: ${active.delegationStrategy}).`,
     "Your responsibilities: high-level reasoning, architectural planning, task decomposition, and code review.",
     `Workspace inspection tools (the only workspace access you have): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app.`,
-    "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|accept|stop.",
+    "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|accept|stop|verify.",
     "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan) OR the optional decision_graph (your planning decisions as exactly nine non-blank axes — problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique — mechanically compiled by Pi into the plan's execution spec; decision_graph and execution_spec are mutually exclusive), and planning gates {graph, handoff, critique}; Pi validates the gates and the decomposition as one legal work graph — unique ids, dependencies referencing existing workers only, no cycles, and no overlapping ownership between workers that no dependency path serializes (invalid graphs fail closed with work_graph_invalid) — then returns a Pi-issued handoff envelope whose workers carry one deterministic dependency order. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec or decision_graph, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the compiled spec and workers cannot invent requirements beyond it.",
     "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec or decision_graph (whichever the plan included, verbatim — a changed, added, or removed decision_graph is rejected) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, correction rounds). A completed worker stays live in its pane awaiting your review — nothing is auto-cleaned until you accept or stop.",
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
     "- action=accept: accept one completed worker's work — finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
+    "- action=verify: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope) and derive a deterministic bounded VerificationReport — exactly four evidence dimensions (spec, design, quality, evidence): the compiled spec and planning gates, the authorized worker slices in work-graph order, observed run/worker lifecycle facts, and current git status/diff plus bounded run evidence. Purely observational: never a score or pass/fail, never gates acceptance, never mutates worker/run state; worker-set or prompt/envelope mismatches fail closed.",
     "- action=stop: stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
     "Planning protocol (mandatory before delegation): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique. The graph is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Derive each worker's declarative slice lists (requirements, behaviors, seams, acceptance) from that graph — and, when an execution_spec or decision_graph is present, from that compiled spec — so workers cannot invent requirements. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
     "Pi remains the sole executor: never mutate source, never run shell commands, never spawn Pi subagents, never create Herdr panes directly.",
