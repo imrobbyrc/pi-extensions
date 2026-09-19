@@ -3184,3 +3184,39 @@ This section is the authoritative current state. The 12:44 WIB checkpoint above 
 1. Restart Phase 4 fresh from the frozen design. Keep it observational only: VerificationReport artifact plus pure `inspect`/`verify`; no acceptance transitions.
 2. Evidence-gated accept remains reserved for Phase 5.
 
+---
+
+## V4 Resume Checkpoint — 2026-09-19 final (LATEST and AUTHORITATIVE; supersedes all earlier checkpoints where they conflict)
+
+All earlier checkpoints in this file remain intact as history. Where any earlier statement — including every prior "Phase 4 not implemented" / "Phase 5 not landed" statement — disagrees with this section, this section wins. Phase 5 is CLOSED; do not re-plan, re-run, or resume any Phase 4/5 work.
+
+### Phase 4 — landed on main
+- The Phase 4 Verification/Evidence layer is landed on `main` via merge commit `d1de44484105b6b38a1318b198d238135075bdbb`, merging reviewed verification-final tip `8a5d08a22685ebf3de02df3d81feb19deee44567` (production read-only `inspect` seam on `SubagentMcpAdapter` plus adapter and MCP `verify` regressions).
+
+### Phase 5 — evidence-gated accept: landed on main and CLOSED
+- Phase 5 is landed on `main` via merge commit `8d366b0ad03749e2c77ab29e09e4fe772b69de77`, merging reviewed phase5-regressions tip `691435d3e7d16fcfcd6bddbb073b72112d27d10c` (verification-fingerprint and accept-gate regression coverage on top of evidence-gate-core, accept-test-green, and verify-clean-tree).
+- Phase 5 semantics now live in `packages/add/pi-openai-web/src/provider/orchestrator.ts` and `src/mcp/server.ts`:
+  - `action=verify` is purely observational: a deterministic bounded VerificationReport (spec, design, quality, evidence) that never scores, never gates acceptance, never mutates worker/run state; worker-set or prompt/envelope mismatches fail closed.
+  - `verificationFingerprint(report)` is a deterministic SHA-256 over a sorted-key canonical clone of the report, omitting only `quality.workers[].accepted`.
+  - `action=accept` requires `run_id`, `worker_id`, the exact handoff envelope, and the `verification_fingerprint` from a prior `action=verify`; the report plus fingerprint are recomputed from fresh evidence immediately before any mutation, and stale/wrong evidence fails closed before mutation.
+  - Because only the accepted flag is excluded from the fingerprint, accepting a worker never re-keys the evidence: one fingerprint may sequentially accept multiple workers (accept stays idempotent under the gate).
+
+### Final regression evidence (re-confirmed on the landed main tree)
+- Focused verification-fingerprint tests: 3/3 pass (`tests/orchestrator.test.ts`).
+- `tests/herdr-review-flow.test.ts`: 29/29 pass.
+- Full `pi-openai-web` package suite: 229/229 pass.
+- `tsc --noEmit`: clean.
+
+### Landing evidence
+- Both reviewed tips (`8a5d08a2`, `691435d3`) are ancestors of `main`.
+- `git diff` reviewed tip vs its merge commit is empty for both phases — each merge landed exactly the reviewed tree (no post-review edits).
+- Working tree clean; no conflicts, no history rewrites.
+
+### Baseline and run ledger
+- `main` = `8d366b0ad03749e2c77ab29e09e4fe772b69de77` is the authoritative V4 baseline for all subsequent work.
+- Aborted run `run_mu89xy3w_7ylpkg` remains non-resumable; do not resume it.
+- Completed evidence/landing runs to cite: `run_mu8a4ox0_epms8g` and `run_mu8arjkr_g5wtoa`.
+
+### Next
+- Nothing pending for V4 Phases 1–5. Any future work starts from baseline `8d366b0ad03749e2c77ab29e09e4fe772b69de77` with a fresh plan.
+
