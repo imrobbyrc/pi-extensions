@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph } from "../src/mcp/server.js";
-import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, assertDecisionGraph, compileDecisionGraph, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX } from "../src/provider/orchestrator.js";
+import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, assertDecisionGraph, compileDecisionGraph, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX } from "../src/provider/orchestrator.js";
 import { SubagentMcpAdapter } from "../src/mcp/subagent-adapter.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -184,6 +184,83 @@ test("decision_graph plans bind the deterministic compiled fingerprint", () => {
   const compiled = compileDecisionGraph(assertDecisionGraph(decisionGraph));
   assert.equal(parsed.planFingerprint, planFingerprint(base.goal, base.workers, compiled));
   assert.deepEqual(parsed.executionSpec, compiled, "the envelope carries the compiled spec as its single authority");
+});
+
+// --- Whole work-graph fail-closed boundaries (Phase 4) ---
+
+const chain = [
+  { id: "a", objective: "do a", owns: ["src/old.ts"], depends_on: [] },
+  { id: "b", objective: "do b", owns: ["src/"], depends_on: ["a"] }
+];
+
+function forgedEnvelope(workers: unknown[]): string {
+  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", authority: "Pi", taskId: "task-forged", planFingerprint: "fp", gates, workers });
+}
+
+test("herdr run accepts a dependency-serialized chain and returns its deterministic order", () => {
+  const handoff = issueHerdrHandoff(base.goal, chain, gates);
+  const authorized = validateHerdrRunInput({ goal: base.goal, workers: chain, handoff });
+  assert.deepEqual(authorized.order, ["a", "b"], "graph-derived ordering metadata rides along with the authorized slices");
+  assert.deepEqual(authorized.workers.map((worker) => worker.id), ["a", "b"]);
+  // Independent disjoint workers are equally legal at the run boundary.
+  const independent = [
+    { id: "x", objective: "do x", owns: ["src/x.ts"], depends_on: [] },
+    { id: "y", objective: "do y", owns: ["docs/"], depends_on: [] }
+  ];
+  const independentHandoff = issueHerdrHandoff(base.goal, independent, gates);
+  assert.deepEqual(validateHerdrRunInput({ goal: base.goal, workers: independent, handoff: independentHandoff }).order, ["x", "y"]);
+});
+
+test("herdr run fails closed on graph-invalid decompositions before fingerprint comparison", () => {
+  // Duplicate ids in the submitted decomposition.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [base.workers[0], base.workers[0]], handoff: validHandoff }), /work_graph_invalid: duplicate worker id/);
+  // Dependency cycles, direct and indirect.
+  const direct = [
+    { id: "a", objective: "do a", owns: ["src/a/"], depends_on: ["b"] },
+    { id: "b", objective: "do b", owns: ["src/b/"], depends_on: ["a"] }
+  ];
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: direct, handoff: validHandoff }), /work_graph_invalid: dependency cycle/);
+  const indirect = [
+    { id: "a", objective: "do a", owns: ["src/a/"], depends_on: ["c"] },
+    { id: "b", objective: "do b", owns: ["src/b/"], depends_on: [] },
+    { id: "c", objective: "do c", owns: ["src/c/"], depends_on: ["b"] }
+  ];
+  // a -> c -> b is a legal chain; the cycle variant closes the loop through a.
+  const indirectCycle = indirect.map((worker) => worker.id === "b" ? { ...worker, depends_on: ["a"] } : worker);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: indirectCycle, handoff: validHandoff }), /dependency cycle/);
+  // Missing dependency reference.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [{ ...base.workers[0], depends_on: ["ghost"] }], handoff: validHandoff }), /unknown worker "ghost"/);
+  // Unordered ownership overlap.
+  const overlap = [
+    { id: "a", objective: "do a", owns: ["src/**"], depends_on: [] },
+    { id: "b", objective: "do b", owns: ["src/b.ts"], depends_on: [] }
+  ];
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: overlap, handoff: validHandoff }), /both own/);
+  // Over-submitted decompositions exceed the cardinality bound.
+  const five = ["a", "b", "c", "d", "e"].map((id) => ({ id, objective: `do ${id}`, owns: [`${id}/`], depends_on: [] }));
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: five, handoff: validHandoff }), /work_graph_invalid: a work graph allows 1-4 workers/);
+});
+
+test("herdr run fails closed on tampered envelopes whose workers no longer form a legal graph", () => {
+  // The submitted decomposition is a valid chain, but the envelope's own
+  // workers were forged into a cycle: parsing fails closed before any comparison.
+  const cyclicEnvelope = forgedEnvelope([
+    { id: "x", objective: "do x", owns: ["src/x/"], dependsOn: ["y"] },
+    { id: "y", objective: "do y", owns: ["src/y/"], dependsOn: ["x"] }
+  ]);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: chain, handoff: cyclicEnvelope }), /work_graph_invalid: dependency cycle/);
+  // Forged unordered ownership overlap inside the envelope.
+  const overlapEnvelope = forgedEnvelope([
+    { id: "x", objective: "do x", owns: ["src/shared.ts"], dependsOn: [] },
+    { id: "y", objective: "do y", owns: ["src/shared.ts"], dependsOn: [] }
+  ]);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: chain, handoff: overlapEnvelope }), /both own "src\/shared.ts"/);
+});
+
+test("herdr workers schema bounds the decomposition to the shared 1-4 work-graph cardinality", () => {
+  const worker = { id: "w1", objective: "fix", owns: ["src"], depends_on: [] };
+  assert.equal(herdrWorkers.safeParse(Array.from({ length: WORKER_COUNT_MAX }, (_, i) => ({ ...worker, id: `w${i + 1}`, owns: [`src-${i}/`] }))).success, true, `${WORKER_COUNT_MAX} workers are legal`);
+  assert.equal(herdrWorkers.safeParse(Array.from({ length: WORKER_COUNT_MAX + 1 }, (_, i) => ({ ...worker, id: `w${i + 1}`, owns: [`src-${i}/`] }))).success, false, "more than the work-graph bound is rejected at the MCP boundary");
 });
 
 // --- Explicit confirmation boundary (SubagentMcpAdapter.run) ---

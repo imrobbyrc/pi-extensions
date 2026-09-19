@@ -21,11 +21,13 @@ import {
   issueHerdrHandoff,
   planFingerprint,
   canonicalWorkers,
-  assertWorkerSlice,
   assertOrchestrationGates,
   assertExecutionSpec,
   assertDecisionGraph,
   assertSpecSourceExclusive,
+  assertWorkGraph,
+  assertWorkerSlice,
+  WORKER_COUNT_MAX,
   compileDecisionGraph,
   canonicalExecutionSpec,
   DECISION_GRAPH_AXES,
@@ -373,6 +375,219 @@ test("decision_graph and execution_spec are mutually exclusive at issuance", () 
   assert.throws(() => assertSpecSourceExclusive({ runtime: "node" }, decisionGraph), /decision_graph_exclusive/);
   assert.doesNotThrow(() => assertSpecSourceExclusive(undefined, decisionGraph));
   assert.doesNotThrow(() => assertSpecSourceExclusive({ runtime: "node" }, undefined));
+});
+
+// --- Whole work-graph validation (Phase 4) ---
+
+const graphGates = { graph: "graph", handoff: "brief", critique: "independent" };
+const graphSlices = (workers: Array<{ id: string; owns: string[]; dependsOn: string[] }>) => workers.map((worker) => assertWorkerSlice({ ...worker, objective: `do ${worker.id}` }));
+
+function assertRespectsDependencies(order: string[], workers: Array<{ id: string; dependsOn: string[] }>) {
+  for (const worker of workers) {
+    for (const dep of worker.dependsOn) {
+      assert.ok(order.indexOf(dep) < order.indexOf(worker.id), `${dep} must precede ${worker.id} in ${JSON.stringify(order)}`);
+    }
+  }
+}
+
+test("assertWorkGraph accepts independent workers and dependency chains with a deterministic topological order", () => {
+  const independent = graphSlices([
+    { id: "a", owns: ["src/a.ts"], dependsOn: [] },
+    { id: "b", owns: ["src/b.ts"], dependsOn: [] }
+  ]);
+  const graph = assertWorkGraph(independent);
+  assert.deepEqual(graph.order, ["a", "b"], "independent workers keep input order");
+  assert.deepEqual(assertWorkGraph(independent), graph, "the same graph always yields the identical result");
+  // respelled dependsOn/depends_on inputs normalize to the same graph and order
+  const respelled = independent.map((worker) => assertWorkerSlice({ id: worker.id, objective: worker.objective, owns: worker.owns, depends_on: worker.dependsOn }));
+  assert.deepEqual(assertWorkGraph(respelled).order, graph.order);
+
+  const chainInput = [
+    { id: "c", owns: ["src/"], dependsOn: ["b"] },
+    { id: "a", owns: ["src/x/"], dependsOn: [] },
+    { id: "b", owns: ["src/y/"], dependsOn: ["a"] }
+  ];
+  const chain = graphSlices(chainInput);
+  const chainGraph = assertWorkGraph(chain);
+  assert.deepEqual(chainGraph.order, ["a", "b", "c"], "dependencies always precede dependents");
+  assertRespectsDependencies(chainGraph.order, chainInput);
+  assert.deepEqual(assertWorkGraph(chain).order, chainGraph.order, "ordering is stable across repeated validations");
+
+  const diamond = graphSlices([
+    { id: "d", owns: ["dist/"], dependsOn: ["b", "c"] },
+    { id: "b", owns: ["src/b/"], dependsOn: ["a"] },
+    { id: "c", owns: ["src/c/"], dependsOn: ["a"] },
+    { id: "a", owns: ["src/a/"], dependsOn: [] }
+  ]);
+  const diamondOrder = assertWorkGraph(diamond).order;
+  assert.deepEqual(diamondOrder, ["a", "b", "c", "d"], "stable lowest-index tiebreak fixes one order");
+  assert.equal(WORKER_COUNT_MAX, 4, "the bound matches the documented 1-4 cardinality");
+});
+
+test("assertWorkGraph rejects duplicate ids, missing dependencies, self-dependencies, and both cycle shapes", () => {
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/a/"], dependsOn: [] },
+    { id: "a", owns: ["docs/"], dependsOn: [] }
+  ])), /work_graph_invalid: duplicate worker id "a"/);
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/"], dependsOn: ["ghost"] }
+  ])), /depends on unknown worker "ghost"/);
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/"], dependsOn: ["a"] }
+  ])), /cannot depend on itself/);
+  // direct cycle: a -> b -> a
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/a/"], dependsOn: ["b"] },
+    { id: "b", owns: ["src/b/"], dependsOn: ["a"] }
+  ])), /dependency cycle detected among workers \["a","b"\]/);
+  // indirect cycle: a -> b -> c -> a (b and c stay clean; the cycle set is reported deterministically)
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/a/"], dependsOn: ["b"] },
+    { id: "b", owns: ["src/b/"], dependsOn: ["c"] },
+    { id: "c", owns: ["src/c/"], dependsOn: ["a"] }
+  ])), /dependency cycle detected among workers \["a","b","c"\]/);
+});
+
+test("assertWorkGraph bounds the decomposition to the documented 1-4 worker cardinality", () => {
+  assert.throws(() => assertWorkGraph([]), /work_graph_invalid: a work graph allows 1-4 workers/);
+  const four = graphSlices([
+    { id: "a", owns: ["a/"], dependsOn: [] },
+    { id: "b", owns: ["b/"], dependsOn: [] },
+    { id: "c", owns: ["c/"], dependsOn: [] },
+    { id: "d", owns: ["d/"], dependsOn: [] }
+  ]);
+  assert.deepEqual(assertWorkGraph(four).order, ["a", "b", "c", "d"]);
+  assert.throws(() => assertWorkGraph([...four, ...graphSlices([{ id: "e", owns: ["e/"], dependsOn: [] }])]), /work_graph_invalid: a work graph allows 1-4 workers \(got 5\)/);
+});
+
+test("assertWorkGraph rejects obvious unordered ownership conflicts deterministically", () => {
+  // exact path equality
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/shared.ts"], dependsOn: [] },
+    { id: "b", owns: ["src/other.ts", "src/shared.ts"], dependsOn: [] }
+  ])), /workers "a" and "b" both own "src\/shared.ts" but no dependency path serializes them/);
+  // direct directory-prefix containment
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src"], dependsOn: [] },
+    { id: "b", owns: ["src/a.ts"], dependsOn: [] }
+  ])), /both own "src"/);
+  // glob-root containment: static prefix before the metacharacter demonstrably covers the other claim
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/**"], dependsOn: [] },
+    { id: "b", owns: ["src/a.ts"], dependsOn: [] }
+  ])), /both own "src\/\*\*"/);
+  // glob root vs glob root: src/** covers src/x/**
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/**"], dependsOn: [] },
+    { id: "b", owns: ["src/x/**"], dependsOn: [] }
+  ])), /both own/);
+  // path normalization: trailing slashes and ./ prefixes are still exact conflicts
+  assert.throws(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["./src/"], dependsOn: [] },
+    { id: "b", owns: ["src"], dependsOn: [] }
+  ])), /both own "src"/);
+});
+
+test("assertWorkGraph accepts serialized ownership overlap and conservatively ignores non-demonstrable shapes", () => {
+  // direct dependency serializes the overlap: b reworks what a produced
+  assert.doesNotThrow(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/**"], dependsOn: [] },
+    { id: "b", owns: ["src/"], dependsOn: ["a"] }
+  ])));
+  // transitive dependency serializes the overlap: c reaches a through b
+  assert.doesNotThrow(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src/"], dependsOn: [] },
+    { id: "b", owns: ["docs/"], dependsOn: ["a"] },
+    { id: "c", owns: ["src/old.ts"], dependsOn: ["b"] }
+  ])));
+  // sibling files under one directory: no demonstrable conflict
+  assert.doesNotThrow(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["tests/a.test.ts"], dependsOn: [] },
+    { id: "b", owns: ["tests/b.test.ts"], dependsOn: [] }
+  ])));
+  // anchored glob root does not cover another tree
+  assert.doesNotThrow(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["docs/*"], dependsOn: [] },
+    { id: "b", owns: ["src/x.ts"], dependsOn: [] }
+  ])));
+  // unanchored globs are not demonstrable conflicts (documented conservative limit)
+  assert.doesNotThrow(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["**"], dependsOn: [] },
+    { id: "b", owns: ["src/x.ts"], dependsOn: [] }
+  ])));
+  assert.doesNotThrow(() => assertWorkGraph(graphSlices([
+    { id: "a", owns: ["src*"], dependsOn: [] },
+    { id: "b", owns: ["src/x.ts"], dependsOn: [] }
+  ])));
+});
+
+test("invalid work graphs fail closed at issuance before any usable handoff is minted", () => {
+  const cyclic = [
+    { id: "a", objective: "do a", owns: ["src/a/"], depends_on: ["b"] },
+    { id: "b", objective: "do b", owns: ["src/b/"], depends_on: ["a"] }
+  ];
+  assert.throws(() => issueHerdrHandoff("goal", cyclic, graphGates), /work_graph_invalid.*cycle/);
+  assert.throws(() => issueHerdrHandoff("goal", [cyclic[0] as typeof cyclic[number]], graphGates), /unknown worker "b"/);
+  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates: graphGates, workers: cyclic }), /work_graph_invalid.*cycle/);
+  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates: graphGates, workers: [
+    { id: "a", objective: "do a", owns: ["src/x.ts"], dependsOn: [] },
+    { id: "b", objective: "do b", owns: ["src/x.ts"], dependsOn: [] }
+  ] }), /both own "src\/x.ts"/);
+});
+
+test("valid multi-worker graphs round-trip their deterministic order and legacy one-worker plans stay intact", () => {
+  const chain = [
+    { id: "a", objective: "do a", owns: ["src/"], dependsOn: [] },
+    { id: "b", objective: "do b", owns: ["src/b/"], dependsOn: ["a"] }
+  ];
+  const envelope = issueHerdrHandoff("goal", chain, graphGates);
+  const parsed = parseHerdrHandoff(envelope);
+  assert.deepEqual(parsed.order, ["a", "b"], "the envelope's slices yield their deterministic dependency order");
+  assert.deepEqual(parsed.workers.map((worker) => worker.id), ["a", "b"]);
+  assert.equal("order" in JSON.parse(envelope), false, "the wire format stays frozen; order is derived, never embedded");
+
+  // Legacy one-worker plan: identical envelope shape plus the derived single-node order.
+  const legacy = issueHerdrHandoff("goal", [{ id: "w", objective: "ship", owns: ["src/**"], depends_on: [] }], graphGates);
+  const legacyParsed = parseHerdrHandoff(legacy);
+  assert.deepEqual(legacyParsed.order, ["w"]);
+  assert.deepEqual(legacyParsed.workers, [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]);
+  assert.equal(legacyParsed.planFingerprint, planFingerprint("goal", [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]), "legacy fingerprints are unchanged by graph validation");
+});
+
+test("parseHerdrHandoff fails closed on tampered graph structure", () => {
+  // A forged envelope whose workers no longer form one legal work graph is
+  // rejected at parse time, before any caller can mint a run from it.
+  const forged = JSON.stringify({
+    protocol: "pi-provider-herdr-handoff-v1",
+    authority: "Pi",
+    taskId: "task-forged",
+    planFingerprint: "fp",
+    gates: graphGates,
+    workers: [
+      { id: "x", objective: "do x", owns: ["src/x/"], dependsOn: ["y"] },
+      { id: "y", objective: "do y", owns: ["src/y/"], dependsOn: ["x"] }
+    ]
+  });
+  assert.throws(() => parseHerdrHandoff(forged), /work_graph_invalid.*cycle/);
+  const forgedOverlap = JSON.stringify({
+    protocol: "pi-provider-herdr-handoff-v1",
+    authority: "Pi",
+    taskId: "task-forged",
+    planFingerprint: "fp",
+    gates: graphGates,
+    workers: [
+      { id: "x", objective: "do x", owns: ["src/shared.ts"], dependsOn: [] },
+      { id: "y", objective: "do y", owns: ["src/shared.ts"], dependsOn: [] }
+    ]
+  });
+  assert.throws(() => parseHerdrHandoff(forgedOverlap), /both own "src\/shared.ts"/);
+});
+
+test("Lead contract documents the whole work-graph contract", () => {
+  const prompt = buildLeadContract(undefined);
+  assert.match(prompt, /one legal work graph/);
+  assert.match(prompt, /no overlapping ownership between workers that no dependency path serializes/);
+  assert.match(prompt, /work_graph_invalid/);
 });
 
 test("Lead contract documents the decision_graph contract", () => {
