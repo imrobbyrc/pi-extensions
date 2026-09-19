@@ -83,6 +83,10 @@ const completedFrame = (identity: string, text: string): Frame => ({
   state: domState({ responseIdentities: [identity], completionActionVisible: true, completionResponseIdentity: identity }),
   tree: { tag: "p", children: [{ tag: "#text", text }] }
 });
+const renderedResponseWithoutCopyAction = (identity: string, text: string): Frame => ({
+  state: domState({ responseIdentities: [identity] }),
+  tree: { tag: "p", children: [{ tag: "#text", text }] }
+});
 
 /** Mirrors the browser-side checksum so tree-derived revisions behave like the real probe. */
 function checksum(text: string): number {
@@ -194,6 +198,21 @@ test("active harness work does not falsely stall; turn completes after silent sp
     const settled = h.graceEvents.filter(event => event.reason === "harness_settled");
     assert.ok(active.length >= 2, `expected repeated harness_active grace, got ${JSON.stringify(h.graceEvents)}`);
     assert.ok(settled.length >= 1, "expected a settle grace once harness activity ended");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("stable rendered response completes when copy action is absent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-grace-no-copy-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 1_000, turnTimeoutMs: 10_000 });
+    const frame = renderedResponseWithoutCopyAction("r1", "Rendered without copy action");
+    const h = makeWatch(cfg, [frame, frame, frame]);
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.match(outcome.markdown ?? "", /Rendered without copy action/);
+    assert.equal(h.stopClickCount(), 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

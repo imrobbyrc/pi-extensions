@@ -768,8 +768,11 @@ export class OpenAIWebRuntime {
         }
         // Copy action is ChatGPT's semantic completion signal; text stability alone can
         // observe a remounted/virtualized partial turn.
-        if (state.completionActionVisible
-          && state.completionResponseIdentity === identity
+        const semanticCompletion = state.completionActionVisible
+          && state.completionResponseIdentity === identity;
+        // ChatGPT can render a finished response without mounting its copy
+        // action. Stable, non-busy text is the fallback completion signal.
+        if ((semanticCompletion || !state.completionActionVisible)
           && stablePolls >= 2 && turnMarkdown.length > 0) {
           controller.transition("completed");
           this.emit("provider_completed", { model: controller.descriptor.id, chars: turnMarkdown.length });
