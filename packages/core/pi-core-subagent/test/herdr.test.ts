@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createConnection } from "node:net";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	checkHerdrEnvironment,
@@ -1407,5 +1407,44 @@ describe("herdr runtime", () => {
 		const settled = await m.retryTaskCleanup(details.run.id, taskId, stubCtx);
 		expect(settled.ok).toBe(true);
 		expect(m.getRun(details.run.id)!.tasks[0]!.cleanupPending).toBeUndefined();
+	});
+
+	test("34. herdrTaskDir: long ids stay within unix socket path limits, deterministic, identity-distinct", async () => {
+		// Long-path regression: macOS caps unix socket paths at ~104 bytes (sun_path) and tmpdir()
+		// alone eats a large chunk of it, so very long run/task ids must not flow into the path.
+		const longRun = `run_${"x".repeat(300)}`;
+		const longTask = `task_${"y".repeat(300)}`;
+		const dir = herdrTaskDir(longRun, longTask);
+		const socketPath = join(dir, "ipc.sock");
+		expect(socketPath.startsWith(join(tmpdir(), "pi-herdr"))).toBe(true);
+		expect(socketPath.length).toBeLessThanOrEqual(104);
+
+		// The directory component is a fixed-length, filesystem-safe digest key.
+		expect(basename(dir)).toMatch(/^[0-9a-f]{16}$/);
+
+		// Deterministic: same identity always maps to the same directory (correction rounds
+		// re-listen where the pane's child expects the socket).
+		expect(herdrTaskDir(longRun, longTask)).toBe(dir);
+		expect(herdrTaskDir("run: 1", "task/1")).toBe(herdrTaskDir("run: 1", "task/1"));
+
+		// Distinct identities map to distinct directories, including separator-ambiguous pairs.
+		const dirs = new Set(["r1", "r2"].flatMap((r) => ["t1", "t2"].map((t) => herdrTaskDir(r, t))));
+		expect(dirs.size).toBe(4);
+		expect(herdrTaskDir("a.b", "c")).not.toBe(herdrTaskDir("a", "b.c"));
+
+		// End-to-end: a real server can actually listen on the long-id socket path
+		// (runHerdrChild mkdirs the task dir before listening; mirror that here).
+		mkdirSync(dir, { recursive: true });
+		const server = createServer();
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, () => resolve());
+		});
+		try {
+			expect(existsSync(socketPath)).toBe(true);
+		} finally {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

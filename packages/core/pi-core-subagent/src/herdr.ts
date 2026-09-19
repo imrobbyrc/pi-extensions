@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -186,10 +186,16 @@ export function getHerdrChildEntryPath(): string {
 /**
  * Deterministic per-task IPC directory. Correction rounds re-listen on the same socket path so the
  * pane's child extension (which has this path baked into its env at split time) reconnects to us.
+ *
+ * macOS caps unix socket paths at ~104 bytes (sun_path) and tmpdir() alone can consume half of
+ * that, so the directory name is a fixed-length digest of the full (runId, taskId) identity — not
+ * the ids themselves. This bounds the socket path regardless of id length while keeping the same
+ * identity → same directory mapping that correction-round reconnects rely on.
  */
 export function herdrTaskDir(runId: string, taskId: string): string {
-	const safe = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
-	return join(tmpdir(), "pi-herdr", `${safe(runId)}.${safe(taskId)}`);
+	// NUL separator keeps identity pairs unambiguous: ("a.b", "c") ≠ ("a", "b.c").
+	const digest = createHash("sha256").update(`${runId}\0${taskId}`).digest("hex").slice(0, 16);
+	return join(tmpdir(), "pi-herdr", digest);
 }
 
 export interface LiveHerdrChild {
