@@ -14,6 +14,7 @@ import {
   saveOrchestratorConfig,
   formatOrchestratorBox,
   buildLeadContract,
+  LEAD_PROTOCOL_REMINDER,
   handleOrchestratorCli,
   configureOrchestratorUI,
   buildHerdrHandoff,
@@ -606,6 +607,57 @@ test("Lead contract documents the decision_graph contract", () => {
   assert.match(prompt, /a changed, added, or removed decision_graph is rejected/);
 });
 
+// --- Adaptive planning policy (V5 Phase 1: planning depth follows assessed risk) ---
+
+test("Lead contract defines the three-level adaptive planning policy with compact low-risk planning", () => {
+  const prompt = buildLeadContract(undefined);
+  // Exactly three qualitative levels are named.
+  assert.match(prompt, /Low risk/);
+  assert.match(prompt, /Medium risk/);
+  assert.match(prompt, /High risk/);
+  // Low risk permits compact planning: the four compact elements, not all nine Design Graph axes.
+  assert.match(prompt, /Low risk[\s\S]*?compact planning is sufficient/);
+  assert.match(prompt, /the problem, scope\/boundaries \(what may change and what must not\), intended behavior, and verification/);
+  assert.match(prompt, /a decision_graph or execution_spec and multi-worker decomposition are optional at this level/);
+  // The V4 planning gates and work-graph rules are not relaxed by adaptation.
+  assert.match(prompt, /the planning gates \{graph, handoff, critique\} and the work-graph rules apply identically at every level; only planning depth adapts/);
+});
+
+test("Lead contract keeps the full Design Graph mandatory for medium and high risk", () => {
+  const prompt = buildLeadContract(undefined);
+  assert.match(prompt, /Medium risk[\s\S]*?render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique/);
+  assert.match(prompt, /High risk — architecture, concurrency, auth\/security, migrations\/data integrity, lifecycle-sensitive changes, or complex multi-worker dependency work: the full Design Graph/);
+  assert.match(prompt, /broader verification expectations — wider test surface and explicit failure\/boundary analysis/);
+});
+
+test("Lead contract mandates escalation on discovered complexity and forbids silent downgrades", () => {
+  const prompt = buildLeadContract(undefined);
+  assert.match(prompt, /Escalate, never downgrade/);
+  assert.match(prompt, /raise the assessment and re-plan at the higher rigor before delegating/);
+  assert.match(prompt, /a low-risk task that grows must produce the full Design Graph/);
+  assert.match(prompt, /never silently downgrade an in-flight task to lighter review to bypass stronger gates/);
+});
+
+test("Lead contract defaults to the lightest justified depth and preserves V4 review and accept invariants", () => {
+  const prompt = buildLeadContract(undefined);
+  assert.match(prompt, /plan at the lightest level the evidence justifies/);
+  // Semantic review stays with the Lead and stays proportional to the planned dimensions.
+  assert.match(prompt, /review semantically against the dimensions you planned with/);
+  assert.match(prompt, /Send bounded corrections via action=correct/);
+  // Deterministic verification, fingerprint-gated accept, and freshness language survive adaptation.
+  assert.match(prompt, /verification_fingerprint/);
+  assert.match(prompt, /recomputed from fresh evidence immediately before acceptance/);
+  assert.match(prompt, /accept each worker via action=accept/);
+});
+
+test("LEAD_PROTOCOL_REMINDER states the adaptive policy instead of unconditional full-graph planning", () => {
+  assert.match(LEAD_PROTOCOL_REMINDER, /^\[LEAD-PROTOCOL:/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /low: compact problem\/scope\/boundaries\/behavior\/verification/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /medium\/high: full Design Graph Problem → Shapes → Graph → Cardinality → Boundaries → Behavior → Scope → Test Layers → Critique/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /escalate on discovered complexity, never downgrade in-flight/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /review against the dimensions you planned with/);
+});
+
 // --- VerificationReport (Phase 5: post-implementation evidence artifact) ---
 
 const verifyGates = { graph: "graph evidence", handoff: "handoff evidence", critique: "critique evidence" };
@@ -1002,12 +1054,13 @@ test("OpenAIWebRuntime injects the always-on Lead contract into buildPrompt", ()
   for (const section of ["Problem", "Shapes", "Graph", "Cardinality", "Boundaries", "Behavior", "Scope", "Test Layers", "Critique"]) {
     assert.match(prompt1, new RegExp(section));
   }
-  assert.match(prompt1, /review semantically against the same Problem, Shapes, Graph/);
+  assert.match(prompt1, /review semantically against the dimensions you planned with/);
 
   // Continuation (bootstrapped) carries the concise protocol reminder.
   const prompt2 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Next step" }] }, { bootstrapped: true, syncedMessageCount: 0 });
   assert.match(prompt2, /\[LEAD-MODE: active/);
-  assert.match(prompt2, /\[LEAD-PROTOCOL: Problem .* Critique;/);
+  assert.match(prompt2, /\[LEAD-PROTOCOL:.*medium\/high: full Design Graph/);
+  assert.match(prompt2, /escalate on discovered complexity, never downgrade in-flight/);
   assert.match(prompt2, /zai\/glm-5\.3/);
   assert.match(prompt2, /Next step/);
 
