@@ -18,12 +18,18 @@ import {
   configureOrchestratorUI,
   buildHerdrHandoff,
   parseHerdrHandoff,
+  issueHerdrHandoff,
+  planFingerprint,
+  canonicalWorkers,
+  assertWorkerSlice,
   assertOrchestrationGates,
   assertExecutionSpec,
   canonicalExecutionSpec,
   EXECUTION_SPEC_KEY_MAX,
   EXECUTION_SPEC_MAX_ENTRIES,
   EXECUTION_SPEC_VALUE_MAX,
+  WORKER_METADATA_ITEM_MAX,
+  WORKER_METADATA_LIST_MAX,
   type OrchestratorConfig,
   type OrchestratorState,
   type OrchestratorScope
@@ -226,6 +232,77 @@ test("handoff round-trips the optional execution_spec and legacy envelopes stay 
   assert.throws(() => parseHerdrHandoff(legacy.replace('"workers"', '"executionSpec":42,"workers"')), /execution_spec_invalid/);
   // buildHerdrHandoff itself rejects invalid specs.
   assert.throws(() => buildHerdrHandoff({ taskId: "task-4", planFingerprint: "fp4", gates, workers, executionSpec: { bad: "" } }), /execution_spec_invalid/);
+});
+
+// --- Declarative WorkerSlice (Phase 2) ---
+
+const legacyWorker = { id: "w1", objective: "fix", owns: ["src/**"], depends_on: [] };
+
+test("canonicalWorkers keeps legacy workers byte-identical and appends slice metadata deterministically", () => {
+  // Metadata-free workers serialize exactly like the frozen legacy form.
+  assert.equal(canonicalWorkers([legacyWorker]), JSON.stringify([{ id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] }]));
+  assert.equal(canonicalWorkers([{ ...legacyWorker, dependsOn: [] }]), canonicalWorkers([legacyWorker]), "dependsOn/depends_on spellings canonicalize identically");
+  const sliced = canonicalWorkers([{ ...legacyWorker, requirements: ["bounded lists"], seams: ["MCP boundary"] }]);
+  assert.match(sliced, /"dependsOn":\[\],"requirements":\["bounded lists"\],"seams":\["MCP boundary"\]/);
+  assert.equal(sliced.includes("behaviors"), false, "absent fields stay out of the canonical form");
+});
+
+test("planFingerprint binds worker slice metadata immutably and preserves legacy hashes", () => {
+  const goal = "ship phase 2";
+  const legacyHash = planFingerprint(goal, [legacyWorker]);
+  assert.equal(planFingerprint(goal, [{ ...legacyWorker, dependsOn: [] }]), legacyHash);
+  assert.equal(planFingerprint(goal, [{ ...legacyWorker, requirements: undefined }]), legacyHash, "explicitly absent metadata never changes the hash");
+  const sliced = [{ ...legacyWorker, requirements: ["r1"], acceptance: ["a1"] }];
+  assert.notEqual(planFingerprint(goal, sliced), legacyHash, "adding metadata changes the hash");
+  assert.notEqual(planFingerprint(goal, [{ ...legacyWorker, requirements: ["r2"], acceptance: ["a1"] }]), planFingerprint(goal, sliced), "changing one item changes the hash");
+});
+
+test("assertWorkerSlice validates and normalizes both dependsOn spellings", () => {
+  assert.deepEqual(assertWorkerSlice(legacyWorker), { id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] });
+  const full = assertWorkerSlice({ id: "w1", objective: "fix", owns: ["src/**"], dependsOn: ["w0"], requirements: ["r"], behaviors: ["b"], seams: ["s"], acceptance: ["a"] });
+  assert.deepEqual(full, { id: "w1", objective: "fix", owns: ["src/**"], dependsOn: ["w0"], requirements: ["r"], behaviors: ["b"], seams: ["s"], acceptance: ["a"] });
+  for (const bad of [
+    null, 42, "worker",
+    { id: " ", objective: "o", owns: ["src"] },
+    { id: "w", objective: "", owns: ["src"] },
+    { id: "w", objective: "o", owns: [] },
+    { id: "w", objective: "o", owns: [7] },
+    { id: "w", objective: "o", owns: ["src"], dependsOn: "w0" },
+    { id: "w", objective: "o", owns: ["src"], dependsOn: [""] },
+    { id: "w", objective: "o", owns: ["src"], requirements: "r" },
+    { id: "w", objective: "o", owns: ["src"], requirements: [] },
+    { id: "w", objective: "o", owns: ["src"], requirements: [""] },
+    { id: "w", objective: "o", owns: ["src"], requirements: [7] },
+    { id: "w", objective: "o", owns: ["src"], requirements: ["x".repeat(WORKER_METADATA_ITEM_MAX + 1)] },
+    { id: "w", objective: "o", owns: ["src"], seams: Array.from({ length: WORKER_METADATA_LIST_MAX + 1 }, (_, i) => `s${i}`) }
+  ]) {
+    assert.throws(() => assertWorkerSlice(bad), /worker_slice_invalid/, `worker ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("handoff envelopes round-trip complete worker slices and stay legacy-shaped without metadata", () => {
+  const gates = { graph: "graph", handoff: "brief", critique: "independent" };
+  const sliceWorker = { id: "w", objective: "ship", owns: ["src/**"], dependsOn: [], requirements: ["r1", "r2"], behaviors: ["b1"], seams: ["s1"], acceptance: ["a1"] };
+  const envelope = issueHerdrHandoff("goal", [sliceWorker], gates);
+  const parsed = parseHerdrHandoff(envelope);
+  assert.deepEqual(parsed.workers, [sliceWorker], "complete slices round-trip through the envelope");
+  // Legacy envelope keeps the exact pre-slice worker serialization.
+  const legacy = issueHerdrHandoff("goal", [{ id: "w", objective: "ship", owns: ["src/**"], depends_on: [] }], gates);
+  assert.equal(JSON.parse(legacy).workers[0].requirements, undefined);
+  assert.deepEqual(parseHerdrHandoff(legacy).workers, [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]);
+  // Tampering embedded slice metadata fails parse closed.
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"requirements":["r1","r2"]', '"requirements":"r1"')), /worker_slice_invalid/);
+  // buildHerdrHandoff itself rejects invalid slice metadata.
+  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates, workers: [{ ...sliceWorker, requirements: [] }] }), /worker_slice_invalid/);
+});
+
+test("Lead contract documents declarative worker slices and execution_spec derivation", () => {
+  const prompt = buildLeadContract(undefined);
+  assert.match(prompt, /requirements, behaviors, seams, acceptance/);
+  assert.match(prompt, /immutably bound into the plan fingerprint and handoff envelope/);
+  assert.match(prompt, /worker slices derive from it/);
+  assert.match(prompt, /workers cannot invent requirements/);
+  assert.match(prompt, /each worker's prompt receives its assigned immutable slice/);
 });
 
 test("Lead contract is unconditional and forbids subagent delegation", () => {

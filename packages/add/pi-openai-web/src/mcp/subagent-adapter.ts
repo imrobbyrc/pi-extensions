@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
+import { WORKER_METADATA_FIELDS, type WorkerMetadataField, type WorkerSlice } from "../provider/orchestrator.js";
 
 // Structural snapshots (controller is typed loosely by the local .d.ts; the
 // shapes come from @imrobbyrc/pi-core-subagent TaskSnapshot/RunSnapshot).
@@ -41,6 +42,31 @@ interface ReviewCapableController {
 /** Captured session UI able to pose an explicit confirmation to the human. */
 export type HerdrConfirmUi = { hasUI: boolean; confirm: (title: string, message: string) => Promise<boolean> };
 
+/** Deterministic prompt headers for the declarative slice fields. */
+const WORKER_SLICE_PROMPT_HEADERS: Record<WorkerMetadataField, string> = {
+  requirements: "Requirements",
+  behaviors: "Behaviors",
+  seams: "Seams",
+  acceptance: "Acceptance"
+};
+
+/**
+ * Serialize an already-authorized declarative WorkerSlice into worker-task
+ * prompt sections. Deterministic and additive: absent fields render nothing,
+ * so metadata-free workers keep the exact pre-slice prompt. This renders the
+ * slice that was fingerprint-bound at plan time — never a re-derived copy.
+ */
+export function renderWorkerSliceSections(slice: Pick<WorkerSlice, "requirements" | "behaviors" | "seams" | "acceptance">): string {
+  return WORKER_METADATA_FIELDS
+    .map((field) => {
+      const items = slice[field];
+      if (!items?.length) return "";
+      return `${WORKER_SLICE_PROMPT_HEADERS[field]} (immutable plan slice — implement within these bounds, do not expand beyond them):\n${items.map((item) => `- ${item}`).join("\n")}`;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 /**
  * Explicit confirmation boundary for `herdr run`: `ui` yields the captured
  * session UI when one exists; `autoApprove` is true only when the operator
@@ -62,7 +88,7 @@ export class SubagentMcpAdapter {
     private readonly gate?: HerdrRunGateSource
   ) {}
 
-  async run(request: { goal: string; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn: string[] }>; workerModel?: string; workerThinking?: string; handoff?: string }) {
+  async run(request: { goal: string; workers: WorkerSlice[]; workerModel?: string; workerThinking?: string; handoff?: string }) {
     const ctx = this.context();
     if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before delegating work.");
     // Confirmation boundary: the only paths past this point are an explicit
@@ -84,15 +110,20 @@ export class SubagentMcpAdapter {
     if (handoff && this.consumedHandoffs.has(handoff)) {
       throw new Error("orchestration_handoff_replay: handoff already consumed.");
     }
-    const tasks = request.workers.map((worker) => ({
-      id: worker.id,
-      agent: worker.id,
-      task: `${request.handoff ? `${request.handoff}\n\n` : ""}${worker.objective}\n\nOwned paths (must not modify outside these paths): ${worker.owns.join(", ")}`,
-      write: true,
-      ...(request.workerModel ? { model: request.workerModel } : {}),
-      ...(request.workerThinking ? { thinking: request.workerThinking } : {}),
-      ...(worker.dependsOn.length ? { needs: worker.dependsOn } : {})
-    }));
+    const tasks = request.workers.map((worker) => {
+      // Prompt propagation serializes the already-authorized slice — the exact
+      // metadata bound into the plan fingerprint and handoff envelope.
+      const sliceSections = renderWorkerSliceSections(worker);
+      return {
+        id: worker.id,
+        agent: worker.id,
+        task: `${request.handoff ? `${request.handoff}\n\n` : ""}${worker.objective}\n\nOwned paths (must not modify outside these paths): ${worker.owns.join(", ")}${sliceSections ? `\n\n${sliceSections}` : ""}`,
+        write: true,
+        ...(request.workerModel ? { model: request.workerModel } : {}),
+        ...(request.workerThinking ? { thinking: request.workerThinking } : {}),
+        ...(worker.dependsOn.length ? { needs: worker.dependsOn } : {})
+      };
+    });
     // Tasks mode rejects top-level prompt; planning context travels with each task.
     const run = this.controller.run({ tasks, runtime: "herdr" }, ctx);
     if (handoff) this.consumedHandoffs.add(handoff);
