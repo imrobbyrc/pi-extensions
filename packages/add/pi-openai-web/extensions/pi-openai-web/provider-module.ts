@@ -242,13 +242,16 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
         captureSession(ctx);
         const cfg = await config();
         const parts = args.trim().split(/\s+/).filter(Boolean);
-        if (parts[0] === "start") {
+        if (parts[0] === "start" || parts[0] === "reload") {
           const host = await ensureInfrastructure();
-          ctx.ui.setStatus("openai-web-start", "Starting ChatGPT Web infrastructure…");
+          const reload = parts[0] === "reload";
+          ctx.ui.setStatus("openai-web-start", reload ? "Reloading MCP and Secure MCP Tunnel…" : "Starting ChatGPT Web infrastructure…");
           try {
-            const snapshot = await host.startInfrastructure((message) => ctx.ui.setStatus("openai-web-start", message));
+            const snapshot = reload
+              ? await host.reloadMcpAndTunnel((message) => ctx.ui.setStatus("openai-web-start", message))
+              : await host.startInfrastructure((message) => ctx.ui.setStatus("openai-web-start", message));
             if (!snapshot.ready) throw new Error(host.tunnel.lastError ?? "openai-web infrastructure is not ready.");
-            ctx.ui.notify("openai-web infrastructure ready.", "info");
+            ctx.ui.notify(reload ? "openai-web MCP and tunnel reloaded; provider conversation preserved." : "openai-web infrastructure ready.", "info");
           } finally {
             ctx.ui.setStatus("openai-web-start", undefined);
           }

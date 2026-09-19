@@ -213,6 +213,7 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
 | `/model openai-web/<id>` | Select a discovered ChatGPT Web model/effort (Lead is always on) |
 | `/openai-web setup` | Store the Secure MCP Tunnel credential (`setup reset` clears it) |
 | `/openai-web start` | Start browser/CDP, local MCP, and the tunnel |
+| `/openai-web reload` | Hard-reload Pi-owned MCP and tunnel; preserves provider conversation |
 | `/openai-web models [refresh]` | Show (or re-discover) the model catalog |
 | `/openai-web reset` | Reset the provider conversation (next turn opens a fresh Temporary Chat) |
 | `/openai-web compact` | Compact the conversation via validated checkpoint |

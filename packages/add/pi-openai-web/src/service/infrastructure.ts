@@ -56,6 +56,25 @@ export class HarnessInfrastructureManager {
     return { mcp, tunnel, dia, ready: isHarnessReady({ mcp, tunnel, dia }) };
   }
 
+  async reloadMcpAndTunnel(onProgress?: (message: string) => void): Promise<HarnessInfrastructureStatus> {
+    if (this.stopping) throw new Error("Harness infrastructure is stopping");
+    if (this.startInFlight) await this.startInFlight;
+    this.stopping = true;
+    try {
+      for (const dependency of [this.tunnel, this.mcp]) {
+        if (dependency.managedByPi) await dependency.stop();
+      }
+      await Promise.all([
+        this.mcp.ensureStarted().then(() => onProgress?.("MCP ready")),
+        this.tunnel.ensureStarted((message) => onProgress?.(`Tunnel: ${message}`))
+      ]);
+      this.started = true;
+      return this.snapshot();
+    } finally {
+      this.stopping = false;
+    }
+  }
+
   async stopOwnedResources(): Promise<HarnessInfrastructureStatus> {
     if (this.started && !this.stopping) {
       this.stopping = true;

@@ -39,6 +39,10 @@ export class HarnessRuntime {
     return this.infrastructure.start(onProgress);
   }
 
+  async reloadMcpAndTunnel(onProgress?: (message: string) => void): Promise<HarnessInfrastructureStatus> {
+    return this.infrastructure.reloadMcpAndTunnel(onProgress);
+  }
+
   async stop(): Promise<HarnessInfrastructureStatus> {
     return this.infrastructure.stopOwnedResources();
   }
