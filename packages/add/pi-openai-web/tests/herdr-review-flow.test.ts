@@ -325,10 +325,17 @@ test("herdr tool registers the full action set including the observational verif
 });
 
 test("herdr accept handler requires run_id and worker_id and reports the finalized worker", async () => {
-  const { adapter } = loopHarness(completedHerdrRun());
-  const herdr = (await registeredHerdrToolsFor(adapter))[0]!;
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
   await assert.rejects(herdr.handler({ action: "accept" }), /requires run_id and worker_id/);
-  const result = parseToolText(await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1" }));
+  // Evidence gate: accept only after obtaining fresh verification evidence —
+  // a Pi-issued handoff bound to the run, then the fingerprint verify returns.
+  const envelope = await planEnvelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  const verification = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  const result = parseToolText(
+    await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: verification.verification_fingerprint })
+  );
   assert.equal(result.ok, true);
   assert.equal(result.run_id, "run-1");
   assert.equal(result.worker.id, "w1");
