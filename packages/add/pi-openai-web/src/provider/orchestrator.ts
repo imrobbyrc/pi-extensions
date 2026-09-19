@@ -99,6 +99,159 @@ export function assertWorkerSlice(worker: unknown): WorkerSlice {
   };
 }
 
+/** Whole work-graph result: the validated slices plus their deterministic (stable) topological order. */
+export interface WorkGraph {
+  workers: WorkerSlice[];
+  order: string[];
+}
+
+/** Bounded worker cardinality for one plan; shared by the graph validator and the MCP schema. */
+export const WORKER_COUNT_MAX = 4;
+
+function firstGlobMetachar(path: string): number {
+  for (let i = 0; i < path.length; i++) {
+    if (path[i] === "*" || path[i] === "?" || path[i] === "[") return i;
+  }
+  return -1;
+}
+
+function normalizeOwnershipPath(path: string): string {
+  let normalized = path.trim();
+  while (normalized.startsWith("./")) normalized = normalized.slice(2);
+  while (normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  return normalized;
+}
+
+/** Literal directory containment: "src" contains "src" and everything under "src/". */
+function containsPath(prefix: string, path: string): boolean {
+  if (!prefix) return false;
+  return path === prefix || path.startsWith(`${prefix}/`);
+}
+
+/**
+ * Static directory anchor before the first glob metacharacter ("src/**" -> "src").
+ * Null for plain literals (no metachar) or when the static prefix is not anchored
+ * to a directory (unanchored globs like "**" or "src*") — those are never
+ * treated as demonstrable.
+ */
+function globRoot(path: string): string | null {
+  const metachar = firstGlobMetachar(path);
+  if (metachar < 0) return null;
+  const slash = path.lastIndexOf("/", metachar);
+  return slash > 0 ? path.slice(0, slash) : null;
+}
+
+/**
+ * Conservative, documented ownership-conflict detection — deliberately NOT
+ * general glob intersection. A conflict is reported only when it is
+ * demonstrable through: exact path equality, direct directory-prefix
+ * containment, or static glob-root containment against the other claim (or
+ * its glob root). Ambiguous shapes are accepted, never guessed at.
+ * Returns the conflicting claim for deterministic error reporting.
+ */
+function ownershipClaimsConflict(left: string, right: string): string | undefined {
+  if (left === right) return left;
+  if (containsPath(left, right)) return left;
+  if (containsPath(right, left)) return right;
+  const leftRoot = globRoot(left);
+  const rightRoot = globRoot(right);
+  if (leftRoot !== null && rightRoot !== null) {
+    if (containsPath(leftRoot, rightRoot)) return left;
+    if (containsPath(rightRoot, leftRoot)) return right;
+    return undefined;
+  }
+  if (leftRoot !== null && containsPath(leftRoot, right)) return left;
+  if (rightRoot !== null && containsPath(rightRoot, left)) return right;
+  return undefined;
+}
+
+/**
+ * Phase-4 whole-graph validation: a validated worker decomposition is one
+ * legal work graph, not just N individually-shaped slices. Deterministic
+ * pipeline (identical for every caller): unique ids -> dependencies reference
+ * existing workers and never the worker itself -> acyclicity (Kahn's algorithm
+ * with a stable lowest-original-index ready choice, so the same input always
+ * yields the same order) -> ownership overlaps rejected unless a dependency
+ * path serializes the two workers -> the stable topological order is returned.
+ * Throws work_graph_invalid on any violation; never generates or rewrites slices.
+ */
+export function assertWorkGraph(slices: WorkerSlice[]): WorkGraph {
+  if (slices.length < 1 || slices.length > WORKER_COUNT_MAX) {
+    throw new Error(`work_graph_invalid: a work graph allows 1-${WORKER_COUNT_MAX} workers (got ${slices.length})`);
+  }
+  const ids = new Set<string>();
+  for (const worker of slices) {
+    if (ids.has(worker.id)) throw new Error(`work_graph_invalid: duplicate worker id ${JSON.stringify(worker.id)}`);
+    ids.add(worker.id);
+  }
+  const indexOf = new Map(slices.map((worker, index) => [worker.id, index] as const));
+  for (const worker of slices) {
+    for (const dep of worker.dependsOn) {
+      if (dep === worker.id) throw new Error(`work_graph_invalid: worker ${JSON.stringify(worker.id)} cannot depend on itself`);
+      if (!indexOf.has(dep)) throw new Error(`work_graph_invalid: worker ${JSON.stringify(worker.id)} depends on unknown worker ${JSON.stringify(dep)}`);
+    }
+  }
+  const indexOfExisting = (id: string): number => {
+    const index = indexOf.get(id);
+    if (index === undefined) throw new Error(`work_graph_invalid: worker ${JSON.stringify(id)} is not part of this graph`);
+    return index;
+  };
+  // Kahn's algorithm over at most WORKER_COUNT_MAX nodes; the lowest original
+  // index among ready workers is always emitted first, fixing one deterministic
+  // order per input graph regardless of future callers.
+  const unmetDeps = slices.map((worker) => new Set(worker.dependsOn));
+  const dependents: number[][] = slices.map(() => []);
+  slices.forEach((worker, index) => {
+    for (const dep of worker.dependsOn) (dependents[indexOfExisting(dep)] as number[]).push(index);
+  });
+  const emitted = new Array<boolean>(slices.length).fill(false);
+  const order: string[] = [];
+  for (let pass = 0; pass < slices.length; pass++) {
+    const ready = unmetDeps.findIndex((deps, index) => !emitted[index] && deps.size === 0);
+    if (ready < 0) {
+      const cyclic = slices.filter((_, index) => !emitted[index]).map((worker) => worker.id);
+      throw new Error(`work_graph_invalid: dependency cycle detected among workers ${JSON.stringify(cyclic)}`);
+    }
+    const readyWorker = slices[ready] as WorkerSlice;
+    emitted[ready] = true;
+    order.push(readyWorker.id);
+    for (const dependent of dependents[ready] ?? []) unmetDeps[dependent]?.delete(readyWorker.id);
+  }
+  // Transitive dependency reachability per worker (DAG guaranteed above).
+  const reachable: Array<Set<number>> = slices.map((worker) => {
+    const seen = new Set<number>();
+    const stack = worker.dependsOn.map((dep) => indexOfExisting(dep));
+    while (stack.length > 0) {
+      const current = stack.pop() as number;
+      if (!seen.has(current)) {
+        seen.add(current);
+        const currentWorker = slices[current] as WorkerSlice;
+        stack.push(...currentWorker.dependsOn.map((dep) => indexOfExisting(dep)));
+      }
+    }
+    return seen;
+  });
+  // Ownership overlap is legal only when a dependency path serializes the two
+  // workers (one transitively depends on the other); unordered conflicts fail.
+  for (let i = 0; i < slices.length; i++) {
+    const left = slices[i] as WorkerSlice;
+    const leftReach = reachable[i] as Set<number>;
+    for (let j = i + 1; j < slices.length; j++) {
+      const right = slices[j] as WorkerSlice;
+      if (leftReach.has(j) || (reachable[j] as Set<number>).has(i)) continue;
+      for (const leftClaim of left.owns) {
+        for (const rightClaim of right.owns) {
+          const conflict = ownershipClaimsConflict(normalizeOwnershipPath(leftClaim), normalizeOwnershipPath(rightClaim));
+          if (conflict !== undefined) {
+            throw new Error(`work_graph_invalid: workers ${JSON.stringify(left.id)} and ${JSON.stringify(right.id)} both own ${JSON.stringify(conflict)} but no dependency path serializes them`);
+          }
+        }
+      }
+    }
+  }
+  return { workers: slices, order };
+}
+
 /** Canonical worker JSON: stable equality across dependsOn/depends_on spellings; present slice metadata is appended in fixed field order, so metadata-free workers hash byte-identically to the legacy form. */
 export function canonicalWorkers(workers: unknown[]): string {
   return JSON.stringify((workers as Array<Record<string, unknown>>).map((worker) => {
@@ -221,6 +374,10 @@ export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; obj
   assertSpecSourceExclusive(executionSpec, decisionGraph);
   const spec = decisionGraph !== undefined ? compileDecisionGraph(assertDecisionGraph(decisionGraph)) : assertExecutionSpec(executionSpec);
   const slices = workers.map((worker) => assertWorkerSlice(worker));
+  // Whole-graph validation at the issuance boundary: an illegal decomposition
+  // (duplicate/missing/self dependencies, cycles, unordered ownership overlap)
+  // fails closed before Pi ever mints a usable handoff envelope.
+  assertWorkGraph(slices);
   return buildHerdrHandoff({
     taskId: randomUUID(),
     planFingerprint: planFingerprint(goal, workers, spec),
@@ -236,10 +393,11 @@ export function buildHerdrHandoff(input: { taskId: string; planFingerprint: stri
   if (!input.taskId.trim() || !input.planFingerprint.trim() || !input.workers.length) throw new Error("orchestration_handoff_invalid: task, plan fingerprint, and workers are required");
   const executionSpec = assertExecutionSpec(input.executionSpec);
   const workers = input.workers.map((worker) => assertWorkerSlice(worker));
+  assertWorkGraph(workers);
   return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, ...(executionSpec ? { executionSpec } : {}), workers, authority: "Pi" });
 }
 
-export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: WorkerSlice[]; executionSpec?: ExecutionSpec } {
+export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: WorkerSlice[]; order: string[]; executionSpec?: ExecutionSpec } {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
     if (value.protocol !== "pi-provider-herdr-handoff-v1" || value.authority !== "Pi"
@@ -250,9 +408,12 @@ export function parseHerdrHandoff(text: string): { taskId: string; planFingerpri
     assertOrchestrationGates(gates);
     const executionSpec = assertExecutionSpec(value.executionSpec);
     const workers = (value.workers as unknown[]).map((worker) => assertWorkerSlice(worker));
-    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers, ...(executionSpec ? { executionSpec } : {}) };
+    // Fail closed at parse time: a tampered envelope whose workers no longer
+    // form one legal work graph is rejected before any caller can run it.
+    const order = assertWorkGraph(workers).order;
+    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers, order, ...(executionSpec ? { executionSpec } : {}) };
   } catch (error) {
-    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid"))) throw error;
+    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid") || error.message.startsWith("work_graph_invalid"))) throw error;
     throw new Error("orchestration_handoff_invalid: expected Pi-issued handoff envelope");
   }
 }
@@ -276,7 +437,7 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "Your responsibilities: high-level reasoning, architectural planning, task decomposition, and code review.",
     `Workspace inspection tools (the only workspace access you have): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app.`,
     "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|accept|stop.",
-    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan) OR the optional decision_graph (your planning decisions as exactly nine non-blank axes — problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique — mechanically compiled by Pi into the plan's execution spec; decision_graph and execution_spec are mutually exclusive), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec or decision_graph, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the compiled spec and workers cannot invent requirements beyond it.",
+    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan) OR the optional decision_graph (your planning decisions as exactly nine non-blank axes — problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique — mechanically compiled by Pi into the plan's execution spec; decision_graph and execution_spec are mutually exclusive), and planning gates {graph, handoff, critique}; Pi validates the gates and the decomposition as one legal work graph — unique ids, dependencies referencing existing workers only, no cycles, and no overlapping ownership between workers that no dependency path serializes (invalid graphs fail closed with work_graph_invalid) — then returns a Pi-issued handoff envelope whose workers carry one deterministic dependency order. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec or decision_graph, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the compiled spec and workers cannot invent requirements beyond it.",
     "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec or decision_graph (whichever the plan included, verbatim — a changed, added, or removed decision_graph is rejected) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, correction rounds). A completed worker stays live in its pane awaiting your review — nothing is auto-cleaned until you accept or stop.",
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
