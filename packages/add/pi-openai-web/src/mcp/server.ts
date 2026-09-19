@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkerSlice } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkerSlice } from "../provider/orchestrator.js";
 type HerdrWorker = WorkerSlice;
 
 type HerdrMcpAdapter = {
@@ -106,8 +106,8 @@ export const HERDR_TOOL_DESCRIPTION = [
   "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's execution_spec or decision_graph verbatim (whichever the plan included — a changed, added, or removed decision_graph is rejected), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
-  "accept — accept one completed worker's work: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
-  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled execution spec and planning gates; explicit legacy-absent observation for spec-less envelopes), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or prompt/envelope mismatch fail closed.",
+  "accept — accept one completed worker's work: requires run_id, worker_id, the exact Pi-issued handoff envelope, and the verification_fingerprint returned by a prior verify; the report is recomputed from fresh evidence immediately before the mutation and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated. On match: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
+  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled execution spec and planning gates; explicit legacy-absent observation for spec-less envelopes), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or prompt/envelope mismatch fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
   "stop — stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
   "Workers always run as Pi agents (kind=pi); openai-web worker models are rejected."
 ].join(" ");
@@ -341,13 +341,14 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           worker_model: z.string().trim().min(1).max(200).optional(),
           worker_thinking: z.string().trim().min(1).max(100).optional(),
           handoff: z.string().max(HERDR_HANDOFF_MAX).optional(),
+          verification_fingerprint: z.string().trim().regex(/^[0-9a-f]{64}$/, "verification_fingerprint must be a 64-character lowercase hex SHA-256").optional(),
           run_id: z.string().min(8).max(64).optional(),
           worker_id: z.string().min(1).max(100).optional(),
           instructions: herdrText(HERDR_GOAL_MAX).optional()
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
-      track(async ({ action, goal, workers, gates, execution_spec, decision_graph, worker_model, worker_thinking, handoff, run_id, worker_id, instructions }) => {
+      track(async ({ action, goal, workers, gates, execution_spec, decision_graph, worker_model, worker_thinking, handoff, verification_fingerprint, run_id, worker_id, instructions }) => {
         if (action === "plan") {
           if (!goal || !workers || !gates) throw new Error("herdr plan requires goal, workers, and planning gates {graph, handoff, critique}.");
           assertSpecSourceExclusive(execution_spec, decision_graph);
@@ -373,6 +374,15 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }
         if (action === "accept") {
           if (!run_id || !worker_id) throw new Error("herdr accept requires run_id and worker_id.");
+          if (!handoff?.trim() || !verification_fingerprint) throw new Error("herdr accept requires the exact Pi-issued handoff and the verification_fingerprint from herdr action=verify.");
+          // Freshness gate: recompute the verification report from live
+          // evidence NOW and compare against the reviewed fingerprint BEFORE
+          // any mutation — accepted bookkeeping is fingerprint-exempt, so this
+          // matches exactly when nothing else in the run/workspace drifted.
+          const fresh = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
+          if (verificationFingerprint(fresh) !== verification_fingerprint) {
+            throw new Error("herdr accept fingerprint mismatch: current run/workspace evidence no longer matches the reviewed verification report (re-run herdr action=verify and accept the fresh fingerprint).");
+          }
           const run = await deps.subagent.accept(run_id, worker_id);
           const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
           return text({ ok: true, run_id: run.id, status: run.status, worker: { id: worker_id, state: task?.status ?? "completed", accepted_at: task?.acceptedAt } });
@@ -383,7 +393,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           // Never correct/accept/stop/shutdown and never adapter.status
           // (whose implementation can auto-shutdown a run after acceptance).
           const report = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
-          return text({ action: "verify", run_id, report });
+          return text({ action: "verify", run_id, verification_fingerprint: verificationFingerprint(report), report });
         }
         // stop
         const result = await deps.subagent.stop(run_id);
