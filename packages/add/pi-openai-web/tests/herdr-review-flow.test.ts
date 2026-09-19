@@ -401,7 +401,8 @@ test("herdr verify binds the exact handoff to the run and returns the bounded fo
   assert.equal(result.report.quality.workers[0].accepted, false);
   assert.equal(result.report.evidence.workers[0].changedFiles[0], "src/thing.ts");
   assert.equal(typeof result.report.evidence.workspace.git_status, "string", "current git status is observed");
-  assert.equal(typeof result.report.evidence.workspace.git_diff, "string", "current git diff is observed");
+  const gitDiff = result.report.evidence.workspace.git_diff;
+  assert.ok(gitDiff === undefined || typeof gitDiff === "string", "git_diff is omitted on a clean workspace and a string when present");
   // Deterministic at the handler level: same run + handoff + workspace → identical report.
   const again = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
   assert.deepEqual(again.report, result.report);
