@@ -14,7 +14,7 @@ One product, one flow:
 - **Asynchronous native Herdr** — one `herdr` MCP tool with `plan | run | status | correct | accept | stop | verify` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
 - **Observational verification & fingerprint-bound acceptance** — `herdr verify` binds the exact Pi-issued handoff envelope to one actual run and derives a deterministic bounded `VerificationReport` (exactly four dimensions: spec, design, quality, evidence) from the parsed handoff, the raw run snapshot, and current git status/diff, plus a `verification_fingerprint` (deterministic SHA-256). The report is read-only evidence for review — never a score, never a pass/fail. `herdr accept` additionally requires that fingerprint: the report is recomputed from fresh evidence immediately before the mutation, and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated.
 
-**V5 direction — adaptive planning depth (in review; not yet landed on main).** Planning depth is being scaled to assessed risk: **low-risk** work (docs, comments, config, single-file or test-only edits) gets a compact plan (problem, scope/boundaries, behavior, verification), while **medium/high-risk** work retains the full Design Graph (nine sections, with broader verification expectations at high risk). The planning gates, work-graph rules, and the verify → fresh-fingerprint accept safety floor stay identical at every depth; only the depth adapts. Until V5 merges, the V4 baseline enforces the full planning protocol on every plan. See [Planning depth](#planning-depth-v5-adaptive-planning).
+**V5 — adaptive planning depth (landed).** Planning depth scales to assessed risk: **low-risk** work (docs, comments, config, single-file or test-only edits) gets a compact plan (problem, scope/boundaries, behavior, verification), while **medium/high-risk** work retains the full Design Graph (nine sections, with broader verification expectations at high risk). The planning gates, work-graph rules, and the verify → fresh-fingerprint accept safety floor stay identical at every depth; only the depth adapts. See [Planning depth](#planning-depth-v5-adaptive-planning).
 
 The former planner subsystem (`/planner`, task store, submit_plan/submit_review protocol, browser worker tabs, Pi subagent delegation) has been removed.
 
@@ -184,7 +184,7 @@ Planning is mandatory before delegation, and its depth scales to the risk the Le
 
 Escalate, never downgrade: inspection or new evidence revealing complexity beyond the assessed level re-rates the task and re-plans at the higher rigor before delegation, and an in-flight task is never silently downgraded to lighter review.
 
-*Status: V5 is in review and not yet landed on main — until it merges, the V4 baseline enforces the full planning protocol on every plan.*
+*Status: V5 adaptive planning is landed on main — planning depth adapts to the assessed risk while the planning gates and safety floor stay mandatory at every level.*
 
 ### Contract
 
@@ -330,4 +330,4 @@ Read [`SECURITY.md`](SECURITY.md) before exposing MCP. Key boundaries:
 
 ## Roadmap
 
-The V4 safety baseline — decision-graph planning, work-graph validation, observational `verify`, and fingerprint-bound fresh-evidence `accept` — is complete and validated with 229 harness tests plus the core subagent suite in `@imrobbyrc/pi-core-subagent`. V5 adaptive planning depth is in review. Remaining work and future ideas are tracked in [`ROADMAP.md`](ROADMAP.md). Historical V0–V2 milestones (planner subsystem, browser worker tabs, Pi subagent delegation) are retained there as clearly labeled superseded history.
+The V4 safety baseline — decision-graph planning, work-graph validation, observational `verify`, and fingerprint-bound fresh-evidence `accept` — is complete and validated with 229 harness tests plus the core subagent suite in `@imrobbyrc/pi-core-subagent`. V5 adaptive planning depth has landed. Remaining work and future ideas are tracked in [`ROADMAP.md`](ROADMAP.md). Historical V0–V2 milestones (planner subsystem, browser worker tabs, Pi subagent delegation) are retained there as clearly labeled superseded history.
