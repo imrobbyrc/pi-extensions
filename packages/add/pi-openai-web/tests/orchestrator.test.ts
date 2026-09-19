@@ -37,6 +37,12 @@ import {
   EXECUTION_SPEC_VALUE_MAX,
   WORKER_METADATA_ITEM_MAX,
   WORKER_METADATA_LIST_MAX,
+  buildVerificationReport,
+  VERIFICATION_DIMENSIONS,
+  VERIFICATION_OBSERVATION_MAX,
+  VERIFICATION_CHANGED_FILES_MAX,
+  type VerificationReport,
+  type VerificationReportInput,
   type OrchestratorConfig,
   type OrchestratorState,
   type OrchestratorScope
@@ -597,6 +603,154 @@ test("Lead contract documents the decision_graph contract", () => {
   assert.match(prompt, /mutually exclusive/);
   assert.match(prompt, /mechanically compiled/);
   assert.match(prompt, /a changed, added, or removed decision_graph is rejected/);
+});
+
+// --- VerificationReport (Phase 5: post-implementation evidence artifact) ---
+
+const verifyGates = { graph: "graph evidence", handoff: "handoff evidence", critique: "critique evidence" };
+
+function verifyRunFixture(id: string, tasks: Array<Record<string, unknown>>, status = "completed"): VerificationReportInput["run"] {
+  return { id, runtime: "herdr", status, tasks };
+}
+
+test("buildVerificationReport exposes exactly the four frozen dimensions and never a score or verdict", () => {
+  const envelope = issueHerdrHandoff("ship phase 5", [legacyWorker], verifyGates, undefined, decisionGraph);
+  const report = buildVerificationReport({
+    handoff: parseHerdrHandoff(envelope),
+    run: verifyRunFixture("run-1", [{ id: "w1", status: "completed", task: `${envelope}\n\nfix` }]),
+    workspace: { gitStatus: "## main", gitDiff: "diff --git a/src/x b/src/x" }
+  });
+  assert.deepEqual(Object.keys(report), [...VERIFICATION_DIMENSIONS]);
+  const keys = new Set<string>();
+  const collect = (value: unknown) => {
+    if (Array.isArray(value)) value.forEach(collect);
+    else if (value && typeof value === "object") for (const [key, child] of Object.entries(value)) { keys.add(key); collect(child); }
+  };
+  collect(report);
+  for (const judgment of ["score", "rating", "rank", "verdict", "grade", "passed", "ok", "pass", "fail"]) {
+    assert.equal(keys.has(judgment), false, `no ${judgment} key exists anywhere in the report`);
+  }
+});
+
+test("spec and design derive mechanically from the parsed handoff with nothing invented", () => {
+  const compiled = compileDecisionGraph(assertDecisionGraph(decisionGraph));
+  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates, undefined, decisionGraph);
+  const handoff = parseHerdrHandoff(envelope);
+  const report = buildVerificationReport({ handoff, run: verifyRunFixture("run-1", [{ id: "w1", status: "running", task: envelope }]), workspace: {} });
+  assert.equal(report.spec.taskId, handoff.taskId);
+  assert.equal(report.spec.planFingerprint, handoff.planFingerprint);
+  assert.deepEqual(report.spec.gates, verifyGates);
+  assert.equal(report.spec.specStatus, "present");
+  assert.deepEqual(report.spec.executionSpec, compiled, "the compiled spec is reported verbatim");
+  assert.deepEqual(Object.keys(report.spec.executionSpec ?? {}).sort(), DECISION_GRAPH_AXES.map((axis) => `decision.${axis}`).sort(), "no spec entries beyond the compiled graph are invented");
+  assert.deepEqual(report.design.workers, handoff.workers, "design reports the authorized slices verbatim");
+  assert.deepEqual(report.design.order, handoff.order);
+});
+
+test("multi-worker reports cover the authorized slices in deterministic work-graph order", () => {
+  const chain = [
+    { id: "b", objective: "do b", owns: ["src/b/"], dependsOn: ["a"] },
+    { id: "a", objective: "do a", owns: ["src/a/"], dependsOn: [] }
+  ];
+  const envelope = issueHerdrHandoff("goal", chain, verifyGates);
+  const handoff = parseHerdrHandoff(envelope);
+  assert.deepEqual(handoff.order, ["a", "b"]);
+  const tasks = [
+    { id: "b", status: "completed", task: envelope },
+    { id: "a", status: "completed", task: envelope }
+  ];
+  const report = buildVerificationReport({ handoff, run: verifyRunFixture("run-9", tasks), workspace: {} });
+  assert.deepEqual(report.design.workers.map((worker) => worker.id), ["a", "b"]);
+  assert.deepEqual(report.quality.workers.map((worker) => worker.id), ["a", "b"], "quality facts follow the work-graph order, not snapshot array order");
+  assert.deepEqual(report.evidence.workers.map((worker) => worker.id), ["a", "b"]);
+});
+
+test("legacy handoffs without an execution spec report an explicit legacy-absent observation", () => {
+  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const report = buildVerificationReport({ handoff: parseHerdrHandoff(envelope), run: verifyRunFixture("run-1", [{ id: "w1", status: "completed", task: envelope }]), workspace: {} });
+  assert.equal(report.spec.specStatus, "legacy-absent");
+  assert.equal("executionSpec" in report.spec, false, "no spec is invented for a legacy envelope");
+  assert.deepEqual(report.design.workers.map((worker) => worker.id), ["w1"], "every other dimension stays fully populated");
+  assert.equal(report.quality.workers.length, 1);
+});
+
+test("quality reports observed lifecycle facts only and omits volatile timestamps", () => {
+  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const handoff = parseHerdrHandoff(envelope);
+  const build = (task: Record<string, unknown>): VerificationReport => buildVerificationReport({ handoff, run: verifyRunFixture("run-1", [task]), workspace: {} });
+  // Volatile lifecycle timestamps never enter the report: two snapshots that
+  // differ ONLY in timestamps produce the identical report.
+  assert.deepEqual(
+    build({ id: "w1", status: "completed", runtime: "herdr", task: envelope, corrections: 2, acceptedAt: 1111, startedAt: 1, endedAt: 2 }),
+    build({ id: "w1", status: "completed", runtime: "herdr", task: envelope, corrections: 2, acceptedAt: 999999, startedAt: 7, endedAt: 8 })
+  );
+  const worker = build({ id: "w1", status: "completed", task: envelope, corrections: 2, acceptedAt: 1111 }).quality.workers[0]!;
+  assert.equal(worker.accepted, true, "acceptance is a boolean fact, never a timestamp");
+  assert.equal(worker.corrections, 2);
+  assert.equal(worker.status, "completed");
+  const fresh = build({ id: "w1", status: "running", task: envelope }).quality.workers[0]!;
+  assert.equal(fresh.corrections, 0, "missing correction rounds default to zero");
+  assert.equal(fresh.accepted, false);
+  // Cleanup-pending is a boolean fact; the raw retry metadata stays out.
+  const pending = build({ id: "w1", status: "failed", task: envelope, cleanupPending: { error: "close failed", attempts: 1, lastAttemptAt: 123 } });
+  assert.equal(pending.quality.workers[0]!.cleanupPending, true);
+  assert.equal(pending.quality.workers[0]!.runtime, "herdr", "run-level runtime is observed per worker when the task omits it");
+  const serialized = JSON.stringify(pending) + JSON.stringify(worker);
+  for (const volatile of ["acceptedAt", "startedAt", "endedAt", "createdAt", "lastAttemptAt", "lastActivity"]) {
+    assert.equal(serialized.includes(volatile), false, `${volatile} must not leak into the report`);
+  }
+});
+
+test("evidence bounds workspace observations and worker evidence deterministically", () => {
+  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const handoff = parseHerdrHandoff(envelope);
+  const oversized = "x".repeat(VERIFICATION_OBSERVATION_MAX + 500);
+  const report = buildVerificationReport({
+    handoff,
+    run: verifyRunFixture("run-1", [{
+      id: "w1", status: "completed", task: envelope,
+      changedFiles: Array.from({ length: VERIFICATION_CHANGED_FILES_MAX + 40 }, (_, i) => `src/file-${i}.ts`),
+      diffStat: oversized, error: oversized, finalText: oversized
+    }]),
+    workspace: { gitStatus: oversized, gitDiff: oversized }
+  });
+  const truncation = /truncated: 500 characters omitted/;
+  for (const bounded of [report.evidence.workspace.git_status, report.evidence.workspace.git_diff, report.evidence.workers[0]!.diffStat, report.evidence.workers[0]!.error, report.evidence.workers[0]!.finalText]) {
+    assert.ok(bounded !== undefined && bounded.length <= VERIFICATION_OBSERVATION_MAX + 200, "oversized observations are bounded");
+    assert.match(bounded!, truncation);
+  }
+  assert.equal(report.evidence.workers[0]!.changedFiles?.length, VERIFICATION_CHANGED_FILES_MAX, "changed-file lists are capped");
+  assert.equal(report.evidence.workers[0]!.changedFilesTruncated, true);
+});
+
+test("the report is deterministic: repeated builds of the same observations serialize identically", () => {
+  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const handoff = parseHerdrHandoff(envelope);
+  const input = (): VerificationReportInput => ({
+    handoff,
+    run: verifyRunFixture("run-1", [{ id: "w1", status: "completed", task: envelope, corrections: 1, acceptedAt: 5, changedFiles: ["src/a.ts"], diffStat: "1 file changed" }]),
+    workspace: { gitStatus: "## main\n M src/a.ts", gitDiff: "diff --git a/src/a.ts" }
+  });
+  assert.deepEqual(buildVerificationReport(input()), buildVerificationReport(input()));
+  assert.equal(JSON.stringify(buildVerificationReport(input())), JSON.stringify(buildVerificationReport(input())));
+});
+
+test("the pure builder refuses to invent facts for a missing authorized worker", () => {
+  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const handoff = parseHerdrHandoff(envelope);
+  assert.throws(
+    () => buildVerificationReport({ handoff, run: verifyRunFixture("run-1", [{ id: "someone-else", status: "completed", task: envelope }]), workspace: {} }),
+    /verification_report_invalid: run is missing the authorized worker "w1"/
+  );
+});
+
+test("Lead contract documents the observational verify action", () => {
+  const prompt = buildLeadContract(undefined);
+  assert.match(prompt, /action=plan\|run\|status\|correct\|accept\|stop\|verify/);
+  assert.match(prompt, /action=verify: bind the exact Pi-issued handoff envelope to one run/);
+  assert.match(prompt, /spec, design, quality, evidence/);
+  assert.match(prompt, /never a score or pass\/fail/);
+  assert.match(prompt, /worker-set or prompt\/envelope mismatches fail closed/);
 });
 
 test("Lead contract is unconditional and forbids subagent delegation", () => {

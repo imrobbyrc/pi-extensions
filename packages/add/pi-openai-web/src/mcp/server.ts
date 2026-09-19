@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type WorkerSlice } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkerSlice } from "../provider/orchestrator.js";
 type HerdrWorker = WorkerSlice;
 
 type HerdrMcpAdapter = {
@@ -15,6 +15,14 @@ type HerdrMcpAdapter = {
   correct(runId: string, workerId: string, instructions: string): any;
   accept(runId: string, workerId: string): any;
   stop(runId?: string): any;
+  /**
+   * Read-only raw run-snapshot channel (core status semantics with no
+   * lifecycle side effects). `herdr verify` inspects runs through this seam
+   * ONLY: an adapter's `status` can auto-shutdown a run after acceptance,
+   * destroying the very evidence verify reports. Optional so existing
+   * adapters keep compiling; verify fails closed when it is absent.
+   */
+  inspect?(runId?: string): unknown;
 };
 
 function text(value: unknown) {
@@ -99,6 +107,7 @@ export const HERDR_TOOL_DESCRIPTION = [
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
   "accept — accept one completed worker's work: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
+  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled execution spec and planning gates; explicit legacy-absent observation for spec-less envelopes), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or prompt/envelope mismatch fail closed.",
   "stop — stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
   "Workers always run as Pi agents (kind=pi); openai-web worker models are rejected."
 ].join(" ");
@@ -136,6 +145,104 @@ export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[
     throw new Error("herdr run handoff does not match this goal/workers (plan fingerprint mismatch; re-run herdr action=plan).");
   }
   return { workers: parsed.workers, order: parsed.order };
+}
+
+function herdrErrorMessage(error: unknown): string {
+  return error instanceof Error && error.message ? error.message : String(error);
+}
+
+/**
+ * Fail-closed binding of one exact Pi-issued handoff envelope to one actual
+ * run snapshot: parse/validate the envelope through the existing parser, then
+ * prove the authorized worker set matches the run's workers exactly and every
+ * worker task prompt carries the exact envelope prefix (the prompt embeds the
+ * envelope verbatim at run time, which itself carries the plan fingerprint).
+ * Malformed/tampered envelopes, unknown or unobservable runs, worker-set
+ * mismatch, or prompt mismatch all fail closed with verification-specific
+ * errors. Pure: performs no adapter calls and mutates nothing.
+ */
+export function bindHerdrRunToHandoff(handoffText: string, runId: string, run: unknown): ParsedHerdrHandoff {
+  let parsed: ParsedHerdrHandoff;
+  try {
+    parsed = parseHerdrHandoff(handoffText);
+  } catch (error) {
+    throw new Error(`herdr_verify_handoff_invalid: ${herdrErrorMessage(error)}`);
+  }
+  const record = run as { id?: unknown; status?: unknown; tasks?: unknown } | null | undefined;
+  if (typeof record !== "object" || record === null || record.id !== runId) {
+    throw new Error(`herdr_verify_run_unavailable: no run ${JSON.stringify(runId)} is observable for verification.`);
+  }
+  if (typeof record.status !== "string" || !record.status.trim()) {
+    throw new Error(`herdr_verify_run_unavailable: run ${JSON.stringify(runId)} exposes no observable status.`);
+  }
+  if (!Array.isArray(record.tasks) || record.tasks.length === 0) {
+    throw new Error(`herdr_verify_run_unavailable: run ${JSON.stringify(runId)} exposes no observable worker tasks.`);
+  }
+  const tasks = record.tasks as Array<Record<string, unknown>>;
+  for (const task of tasks) {
+    if (typeof task?.id !== "string" || !task.id.trim() || typeof task.status !== "string" || !task.status.trim()) {
+      throw new Error(`herdr_verify_run_unavailable: every worker task of run ${JSON.stringify(runId)} must expose an observable id and status.`);
+    }
+  }
+  const authorizedIds = parsed.workers.map((worker) => worker.id).sort();
+  const observedIds = tasks.map((task) => task.id as string).sort();
+  if (JSON.stringify(authorizedIds) !== JSON.stringify(observedIds)) {
+    throw new Error(`herdr_verify_worker_mismatch: the handoff authorizes workers ${JSON.stringify(authorizedIds)} but run ${JSON.stringify(runId)} has ${JSON.stringify(observedIds)}.`);
+  }
+  for (const task of tasks) {
+    const prompt = task.task;
+    if (typeof prompt !== "string" || !prompt.startsWith(handoffText)) {
+      throw new Error(`herdr_verify_prompt_mismatch: worker ${JSON.stringify(task.id)} was not started from this exact handoff envelope (its task prompt does not carry the envelope prefix).`);
+    }
+  }
+  return parsed;
+}
+
+/** Normalize the already-bound raw snapshot into the pure builder's run input (binding validated the shape). */
+function normalizeVerifiedRun(runId: string, run: unknown): VerificationReportInput["run"] {
+  const record = run as { runtime?: unknown; status?: unknown; tasks: unknown };
+  const runtime = record.runtime;
+  return {
+    id: runId,
+    ...(typeof runtime === "string" && runtime ? { runtime } : {}),
+    status: typeof record.status === "string" && record.status ? record.status : "unobserved",
+    tasks: record.tasks as Array<Record<string, unknown>>
+  };
+}
+
+/**
+ * Observational verification for `herdr action=verify`: bind the exact
+ * Pi-issued handoff to one actual run and derive the deterministic bounded
+ * VerificationReport. Read-only by construction — raw inspection through the
+ * adapter's `inspect` seam (never `status`, which can auto-shutdown a run
+ * after acceptance), plus the frozen read-only git status/diff observation
+ * helpers that back the git_status/git_diff tools; no other shell commands,
+ * and no correct/accept/stop/shutdown or worker/run state transitions. Any
+ * mismatch or unavailable observation fails closed with a verification-specific error.
+ */
+export async function runHerdrVerification(deps: { runId: string; handoff: string; subagent: HerdrMcpAdapter; workspaceRoot: string }): Promise<VerificationReport> {
+  if (typeof deps.subagent.inspect !== "function") {
+    throw new Error("herdr_verify_unavailable: read-only run inspection is required (the adapter must expose inspect; verify never routes through status, which can auto-shutdown runs after acceptance).");
+  }
+  let run: unknown;
+  try {
+    run = await deps.subagent.inspect(deps.runId);
+  } catch (error) {
+    throw new Error(`herdr_verify_run_unavailable: ${herdrErrorMessage(error)}`);
+  }
+  const handoff = bindHerdrRunToHandoff(deps.handoff, deps.runId, run);
+  let gitStatusText: string;
+  let gitDiffText: string;
+  try {
+    [gitStatusText, gitDiffText] = await Promise.all([gitStatus(deps.workspaceRoot), gitDiff(deps.workspaceRoot)]);
+  } catch (error) {
+    throw new Error(`herdr_verify_workspace_unavailable: ${herdrErrorMessage(error)}`);
+  }
+  return buildVerificationReport({
+    handoff,
+    run: normalizeVerifiedRun(deps.runId, run),
+    workspace: { gitStatus: gitStatusText, gitDiff: gitDiffText }
+  });
 }
 
 export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity }) {
@@ -225,7 +332,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         title: "Herdr harness execution",
         description: HERDR_TOOL_DESCRIPTION,
         inputSchema: z.object({
-          action: z.enum(["plan", "run", "status", "correct", "accept", "stop"]),
+          action: z.enum(["plan", "run", "status", "correct", "accept", "stop", "verify"]),
           goal: herdrText(HERDR_GOAL_MAX).optional(),
           workers: herdrWorkers.optional(),
           gates: herdrGates.optional(),
@@ -269,6 +376,14 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           const run = await deps.subagent.accept(run_id, worker_id);
           const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
           return text({ ok: true, run_id: run.id, status: run.status, worker: { id: worker_id, state: task?.status ?? "completed", accepted_at: task?.acceptedAt } });
+        }
+        if (action === "verify") {
+          if (!run_id || !handoff?.trim()) throw new Error("herdr verify requires run_id and the exact Pi-issued handoff.");
+          // Observational only: raw inspection + read-only git observations.
+          // Never correct/accept/stop/shutdown and never adapter.status
+          // (whose implementation can auto-shutdown a run after acceptance).
+          const report = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
+          return text({ action: "verify", run_id, report });
         }
         // stop
         const result = await deps.subagent.stop(run_id);
