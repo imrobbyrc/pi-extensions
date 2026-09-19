@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { SubagentManager } from "../src/manager.ts";
+import { SubagentManager, WORKER_EXECUTION_INVARIANT } from "../src/manager.ts";
 
 const stubPi = { events: { emit() {} }, sendUserMessage() {} } as unknown as ExtensionAPI;
 const stubCtx = { cwd: "/tmp", hasUI: false } as unknown as ExtensionContext;
@@ -252,6 +252,29 @@ describe("tool precedence (issue #3)", () => {
 	});
 	test("an overridden file's tools are surfaced on the task, not silently dropped", () => {
 		expect(src).toMatch(/task\.toolsNote = `explicit tools overrode agent-file tools/);
+	});
+});
+
+describe("worker execution invariant (V5 Phase 2)", () => {
+	const src = readFileSync(new URL("../src/manager.ts", import.meta.url), "utf8");
+	test("invariant freezes the Lead plan against broadening or re-derivation", () => {
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/Lead\/parent plan as frozen/);
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/never broaden or re-derive it/);
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/inspect only what your owned slice requires/);
+	});
+	test("invariant stops on direct acceptance evidence without skipping required verification", () => {
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/stop once every acceptance criterion has direct evidence/i);
+		// Stopping is bounded by evidence, not an excuse to skip the checks that produce it.
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/stopping never skips required verification/);
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/no redundant exploration after the evidence is complete/);
+	});
+	test("invariant still permits blocker handling instead of scope expansion", () => {
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/If truly blocked, report the blocker instead of expanding scope/);
+	});
+	test("the invariant is carried into every spawned subagent's system instruction", () => {
+		// Both runtimes (herdr child and in-process loader) receive the same subagentInstruction;
+		// it must interpolate the invariant so no worker spawns without the stop rule.
+		expect(src).toMatch(/const subagentInstruction = `[\s\S]*?\$\{worktreeNote\} \$\{WORKER_EXECUTION_INVARIANT\}`;/);
 	});
 });
 

@@ -658,6 +658,44 @@ test("LEAD_PROTOCOL_REMINDER states the adaptive policy instead of unconditional
   assert.match(LEAD_PROTOCOL_REMINDER, /review against the dimensions you planned with/);
 });
 
+// --- Adaptive worker effort (V5 Phase 2: per-run thinking follows assessed risk) ---
+
+test("Lead contract maps assessed risk to per-run worker effort: low→medium, medium/high→high", () => {
+  const prompt = buildLeadContract(undefined);
+  // The action=run bullet names the exact per-run argument mapping.
+  assert.match(prompt, /action=run: submit the exact same goal[\s\S]*?worker_thinking=medium for low-risk plans, worker_thinking=high for medium\/high-risk plans/);
+  // The planning protocol restates the mapping at the same assessed risk as planning depth.
+  assert.match(prompt, /Worker effort matches the same risk assessment: run low-risk plans with worker_thinking=medium and medium\/high-risk plans with worker_thinking=high/);
+  // Adaptive effort is per-run guidance only, never a persisted decision.
+  assert.match(prompt, /it applies to that run only/);
+});
+
+test("per-run adaptive effort never rewrites an explicit user worker-thinking override", () => {
+  const prompt = buildLeadContract(undefined);
+  // The configured value is displayed as a profile default, distinct from per-run guidance.
+  assert.match(prompt, /thinking: high \(profile default/);
+  // An explicit user override wins verbatim…
+  assert.match(prompt, /honor that level verbatim/);
+  // …and the persisted configuration is never rewritten to impose adaptive guidance.
+  assert.match(prompt, /never rewrite the persisted configuration to impose adaptive guidance/);
+  // Explicitly configured values still surface as the profile default (config compatibility).
+  const custom = buildLeadContract({ workerModel: "m/x", workerThinking: "max", maxParallelWorkers: 2, delegationStrategy: "adaptive" });
+  assert.match(custom, /thinking: max \(profile default/);
+});
+
+test("DEFAULT_ORCHESTRATOR_CONFIG keeps the configurable workerThinking setting", () => {
+  assert.equal(typeof DEFAULT_ORCHESTRATOR_CONFIG.workerThinking, "string");
+  assert.equal(DEFAULT_ORCHESTRATOR_CONFIG.workerThinking, "high");
+});
+
+test("LEAD_PROTOCOL_REMINDER carries the adaptive worker-effort mapping", () => {
+  assert.match(LEAD_PROTOCOL_REMINDER, /worker_thinking=medium for low risk, worker_thinking=high for medium\/high/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /an explicit user setting wins, never rewrite persisted config/);
+  // The Phase-1 planning-depth policy wording survives alongside the new effort rule.
+  assert.match(LEAD_PROTOCOL_REMINDER, /plan at the assessed risk/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /never downgrade in-flight/);
+});
+
 // --- VerificationReport (Phase 5: post-implementation evidence artifact) ---
 
 const verifyGates = { graph: "graph evidence", handoff: "handoff evidence", critique: "critique evidence" };

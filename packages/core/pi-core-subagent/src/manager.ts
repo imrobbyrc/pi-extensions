@@ -78,6 +78,15 @@ const WRITE_CAPABLE = ["bash", "edit", "write"];
 const SAFE_TASK_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const WIDGET_THROTTLE_MS = 150;
 
+/**
+ * Worker execution invariant (V5 Phase 2): every spawned worker treats the
+ * Lead/parent plan as frozen and bounded by direct acceptance evidence. The
+ * stop rule never weakens verification — required checks produce the evidence,
+ * and only redundant exploration after that evidence is complete is forbidden.
+ */
+export const WORKER_EXECUTION_INVARIANT =
+	"Execution invariant: treat the Lead/parent plan as frozen — never broaden or re-derive it, and inspect only what your owned slice requires. Stop once every acceptance criterion has direct evidence: run the checks the plan requires to produce that evidence first (stopping never skips required verification), then finish — no redundant exploration after the evidence is complete. If truly blocked, report the blocker instead of expanding scope.";
+
 function newId(prefix: string): string {
 	return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -1026,7 +1035,7 @@ export class SubagentManager {
 			const worktreeNote = wt
 				? ` You work in an isolated git worktree (branch ${wt.branch})${task.stackedOn ? `, stacked on ${task.stackedOn} (its changes are already in your tree)` : ""}. Never run git commands that switch branches, create branches, or move the worktree (git switch/checkout/branch/worktree). The extension commits your changes when you finish. git status/diff are fine for inspecting your own changes. node_modules is a SHARED symlink to the main checkout: never install, upgrade, or delete dependencies (no npm/bun/yarn/pnpm install, no \`rm -rf node_modules\`) — those writes escape your worktree and damage the user's project. If the task truly needs a dependency change, edit the manifest only and say so in your answer.`
 				: "";
-			const subagentInstruction = `You are running as a subagent. Your bash tool already executes in the project working directory — never prefix commands with \`cd\`. Do not call subagent/delegation tools unless the parent explicitly asks. Return a concise final answer. You MAY use ask_parent only when truly blocked on information only the parent has; notify_parent for one-way updates; send_agent_message/poll_agent_messages to coordinate with siblings. Your mailbox address and siblings: ${task.roster ?? "(none)"}. Use the exact task ids (e.g. task_2) as send_agent_message targets. Siblings run independently and may start late or finish early — never block indefinitely on their replies: poll at most 5 times, then proceed with your best judgment. A gated sibling (marked ↳ waits in the graph) may not be running yet; do not wait for it. An unanswered ask_parent times out after 10 minutes — proceed with your best judgment then. When your work is done, call notify_parent ONCE with a concise result summary — key findings, verdicts, file:line evidence — so the leader can start consuming your output before the run finishes.${worktreeNote}`;
+			const subagentInstruction = `You are running as a subagent. Your bash tool already executes in the project working directory — never prefix commands with \`cd\`. Do not call subagent/delegation tools unless the parent explicitly asks. Return a concise final answer. You MAY use ask_parent only when truly blocked on information only the parent has; notify_parent for one-way updates; send_agent_message/poll_agent_messages to coordinate with siblings. Your mailbox address and siblings: ${task.roster ?? "(none)"}. Use the exact task ids (e.g. task_2) as send_agent_message targets. Siblings run independently and may start late or finish early — never block indefinitely on their replies: poll at most 5 times, then proceed with your best judgment. A gated sibling (marked ↳ waits in the graph) may not be running yet; do not wait for it. An unanswered ask_parent times out after 10 minutes — proceed with your best judgment then. When your work is done, call notify_parent ONCE with a concise result summary — key findings, verdicts, file:line evidence — so the leader can start consuming your output before the run finishes.${worktreeNote} ${WORKER_EXECUTION_INVARIANT}`;
 
 			if (run.runtime === "herdr") {
 				const token = this.herdrTokens.get(key) ?? randomBytes(16).toString("hex");
