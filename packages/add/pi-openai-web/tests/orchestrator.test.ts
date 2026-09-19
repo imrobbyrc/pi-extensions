@@ -19,6 +19,11 @@ import {
   buildHerdrHandoff,
   parseHerdrHandoff,
   assertOrchestrationGates,
+  assertExecutionSpec,
+  canonicalExecutionSpec,
+  EXECUTION_SPEC_KEY_MAX,
+  EXECUTION_SPEC_MAX_ENTRIES,
+  EXECUTION_SPEC_VALUE_MAX,
   type OrchestratorConfig,
   type OrchestratorState,
   type OrchestratorScope
@@ -189,6 +194,38 @@ test("provider to Herdr handoff requires graph, handoff, and critique gates", ()
   assert.equal(parsed.taskId, "task-1");
   assert.equal(parsed.gates.critique, "independent");
   assert.throws(() => parseHerdrHandoff(JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1" })), /orchestration_handoff_invalid/);
+});
+
+// --- Optional execution_spec (Phase 1) ---
+
+test("assertExecutionSpec validates, bounds, and normalizes to sorted canonical form", () => {
+  assert.equal(assertExecutionSpec(undefined), undefined);
+  const normalized = assertExecutionSpec({ b: "2", a: "1" });
+  assert.deepEqual(normalized, { a: "1", b: "2" });
+  assert.deepEqual(Object.keys(normalized ?? {}), ["a", "b"], "keys are sorted for deterministic serialization");
+  assert.equal(canonicalExecutionSpec(undefined), "");
+  assert.equal(canonicalExecutionSpec({ b: "2", a: "1" }), JSON.stringify([["a", "1"], ["b", "2"]]));
+  for (const bad of [null, [], 42, "spec", {}, { blank: "" }, { num: 7 }, { " ": "x" }, { ["k".repeat(EXECUTION_SPEC_KEY_MAX + 1)]: "v" }, { k: "v".repeat(EXECUTION_SPEC_VALUE_MAX + 1) }]) {
+    assert.throws(() => assertExecutionSpec(bad), /execution_spec_invalid/, `spec ${JSON.stringify(bad)} must be rejected`);
+  }
+  const tooMany = Object.fromEntries(Array.from({ length: EXECUTION_SPEC_MAX_ENTRIES + 1 }, (_, i) => [`k${i}`, "v"]));
+  assert.throws(() => assertExecutionSpec(tooMany), /execution_spec_invalid/);
+});
+
+test("handoff round-trips the optional execution_spec and legacy envelopes stay spec-free", () => {
+  const workers = [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }];
+  const gates = { graph: "graph", handoff: "brief", critique: "independent" };
+  const withSpec = buildHerdrHandoff({ taskId: "task-2", planFingerprint: "fp2", gates, workers, executionSpec: { runtime: "node" } });
+  const parsed = parseHerdrHandoff(withSpec);
+  assert.deepEqual(parsed.executionSpec, { runtime: "node" });
+  // Legacy no-spec envelope: key absent, parse yields no spec (V3 preserved).
+  const legacy = buildHerdrHandoff({ taskId: "task-3", planFingerprint: "fp3", gates, workers });
+  assert.equal("executionSpec" in JSON.parse(legacy), false);
+  assert.equal(parseHerdrHandoff(legacy).executionSpec, undefined);
+  // Injecting a structurally invalid spec into an envelope fails parse.
+  assert.throws(() => parseHerdrHandoff(legacy.replace('"workers"', '"executionSpec":42,"workers"')), /execution_spec_invalid/);
+  // buildHerdrHandoff itself rejects invalid specs.
+  assert.throws(() => buildHerdrHandoff({ taskId: "task-4", planFingerprint: "fp4", gates, workers, executionSpec: { bad: "" } }), /execution_spec_invalid/);
 });
 
 test("Lead contract is unconditional and forbids subagent delegation", () => {

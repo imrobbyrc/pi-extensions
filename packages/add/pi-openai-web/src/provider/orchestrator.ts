@@ -45,29 +45,71 @@ export function canonicalWorkers(workers: unknown[]): string {
   })));
 }
 
-/** Stable fingerprint binding a handoff envelope to one exact goal + worker decomposition. */
-export function planFingerprint(goal: string, workers: unknown[]): string {
-  return createHash("sha256").update(`${goal}\n${canonicalWorkers(workers)}`).digest("hex").slice(0, 32);
+/**
+ * Phase-1 execution spec: a minimal bounded string map (0..1 per plan), bound
+ * immutably into the plan fingerprint and handoff envelope. Deliberately kept
+ * to string values — richer structured shapes belong to a future phase and
+ * must not be frozen here.
+ */
+export type ExecutionSpec = Record<string, string>;
+
+/** Shared bounds for the execution spec (envelope validation and MCP schema). */
+export const EXECUTION_SPEC_MAX_ENTRIES = 50;
+export const EXECUTION_SPEC_KEY_MAX = 100;
+export const EXECUTION_SPEC_VALUE_MAX = 2_000;
+
+/**
+ * Validate a present execution spec and return it in canonical (sorted-key)
+ * form; `undefined` passes through unchanged so spec-less V3 plans keep working.
+ */
+export function assertExecutionSpec(spec: unknown): ExecutionSpec | undefined {
+  if (spec === undefined) return undefined;
+  if (typeof spec !== "object" || spec === null || Array.isArray(spec)) throw new Error("execution_spec_invalid: expected an object mapping string keys to string values");
+  const entries = Object.entries(spec as Record<string, unknown>);
+  if (entries.length < 1) throw new Error("execution_spec_invalid: provide at least one entry or omit execution_spec entirely");
+  if (entries.length > EXECUTION_SPEC_MAX_ENTRIES) throw new Error(`execution_spec_invalid: at most ${EXECUTION_SPEC_MAX_ENTRIES} entries`);
+  const normalized: ExecutionSpec = {};
+  for (const [key, value] of entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    if (!key.trim() || key.length > EXECUTION_SPEC_KEY_MAX) throw new Error(`execution_spec_invalid: keys must be non-blank strings of at most ${EXECUTION_SPEC_KEY_MAX} characters`);
+    if (typeof value !== "string" || !value.trim() || value.length > EXECUTION_SPEC_VALUE_MAX) throw new Error(`execution_spec_invalid: values must be non-blank strings of at most ${EXECUTION_SPEC_VALUE_MAX} characters`);
+    normalized[key] = value;
+  }
+  return normalized;
 }
 
-/** Pi-side issuance: fresh taskId + goal/workers-bound fingerprint → handoff envelope string. */
-export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[] }>, gates: OrchestrationGates): string {
+/** Deterministic canonical form: sorted entry pairs, immune to object key-order drift. */
+export function canonicalExecutionSpec(spec: ExecutionSpec | undefined): string {
+  if (!spec) return "";
+  return JSON.stringify(Object.keys(spec).sort().map((key) => [key, spec[key]]));
+}
+
+/** Stable fingerprint binding a handoff envelope to one exact goal + worker decomposition (+ optional spec). */
+export function planFingerprint(goal: string, workers: unknown[], executionSpec?: ExecutionSpec): string {
+  const spec = canonicalExecutionSpec(executionSpec);
+  return createHash("sha256").update(`${goal}\n${canonicalWorkers(workers)}${spec ? `\n${spec}` : ""}`).digest("hex").slice(0, 32);
+}
+
+/** Pi-side issuance: fresh taskId + goal/workers/spec-bound fingerprint → handoff envelope string. */
+export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[] }>, gates: OrchestrationGates, executionSpec?: unknown): string {
+  const spec = assertExecutionSpec(executionSpec);
   return buildHerdrHandoff({
     taskId: randomUUID(),
-    planFingerprint: planFingerprint(goal, workers),
+    planFingerprint: planFingerprint(goal, workers, spec),
     gates,
-    workers: workers.map((worker) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.dependsOn ?? worker.depends_on ?? [] }))
+    workers: workers.map((worker) => ({ id: worker.id, objective: worker.objective, owns: worker.owns, dependsOn: worker.dependsOn ?? worker.depends_on ?? [] })),
+    ...(spec ? { executionSpec: spec } : {})
   });
 }
 
 /** Build an explicit, task-bound provider→Herdr handoff envelope. */
-export function buildHerdrHandoff(input: { taskId: string; planFingerprint: string; gates?: OrchestrationGates; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn: string[] }> }): string {
+export function buildHerdrHandoff(input: { taskId: string; planFingerprint: string; gates?: OrchestrationGates; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn: string[] }>; executionSpec?: ExecutionSpec }): string {
   assertOrchestrationGates(input.gates);
   if (!input.taskId.trim() || !input.planFingerprint.trim() || !input.workers.length) throw new Error("orchestration_handoff_invalid: task, plan fingerprint, and workers are required");
-  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, workers: input.workers, authority: "Pi" });
+  const executionSpec = assertExecutionSpec(input.executionSpec);
+  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, ...(executionSpec ? { executionSpec } : {}), workers: input.workers, authority: "Pi" });
 }
 
-export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: unknown[] } {
+export function parseHerdrHandoff(text: string): { taskId: string; planFingerprint: string; gates: OrchestrationGates; workers: unknown[]; executionSpec?: ExecutionSpec } {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
     if (value.protocol !== "pi-provider-herdr-handoff-v1" || value.authority !== "Pi"
@@ -76,9 +118,10 @@ export function parseHerdrHandoff(text: string): { taskId: string; planFingerpri
       || !Array.isArray(value.workers) || value.workers.length === 0) throw new Error();
     const gates = value.gates as OrchestrationGates | undefined;
     assertOrchestrationGates(gates);
-    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers: value.workers };
+    const executionSpec = assertExecutionSpec(value.executionSpec);
+    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers: value.workers, ...(executionSpec ? { executionSpec } : {}) };
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith("orchestration_gate_required")) throw error;
+    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid"))) throw error;
     throw new Error("orchestration_handoff_invalid: expected Pi-issued handoff envelope");
   }
 }
@@ -102,8 +145,8 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "Your responsibilities: high-level reasoning, architectural planning, task decomposition, and code review.",
     `Workspace inspection tools (the only workspace access you have): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app.`,
     "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|accept|stop.",
-    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim.",
-    "- action=run: submit the exact same goal and workers together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI.",
+    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim.",
+    "- action=run: submit the exact same goal, workers, and execution_spec (when the plan included one) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, correction rounds). A completed worker stays live in its pane awaiting your review — nothing is auto-cleaned until you accept or stop.",
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
     "- action=accept: accept one completed worker's work — finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
