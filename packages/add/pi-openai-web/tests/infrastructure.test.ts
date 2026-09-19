@@ -74,6 +74,85 @@ test("start stays pending through tunnel connecting, resolves ready once; concur
   assert.equal(a.tunnel, "ready"); // final snapshot taken after readiness transition, not before
 });
 
+test("handoff stop preserves browser while stopping owned control plane", async () => {
+  const stops: string[] = [];
+  const manager = new HarnessInfrastructureManager(
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "mcp" }),
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "tunnel" }),
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "dia" })
+  );
+
+  await manager.start();
+  manager.preserveBrowserForHandoff();
+  const stopped = await manager.stopOwnedResources();
+
+  assert.deepEqual(stops.sort(), ["mcp", "tunnel"]);
+  assert.equal(stopped.ready, false);
+  assert.equal(stopped.dia, "ready");
+});
+
+test("handoff preservation is one-shot: a later normal lifecycle stops dia again", async () => {
+  const stops: string[] = [];
+  const manager = new HarnessInfrastructureManager(
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "mcp" }),
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "tunnel" }),
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "dia" })
+  );
+
+  await manager.start();
+  manager.preserveBrowserForHandoff();
+  await manager.stopOwnedResources(); // reload shutdown: dia preserved exactly once
+  assert.deepEqual(stops.slice().sort(), ["mcp", "tunnel"]);
+
+  stops.length = 0;
+  await manager.start();
+  await manager.stopOwnedResources(); // subsequent ordinary stop: normal dia semantics
+  assert.deepEqual(stops.slice().sort(), ["dia", "mcp", "tunnel"]);
+});
+
+test("handoff authorization is consumed even by a stop that stops nothing", async () => {
+  const stops: string[] = [];
+  const manager = new HarnessInfrastructureManager(
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "mcp" }),
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "tunnel" }),
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "dia" })
+  );
+
+  manager.preserveBrowserForHandoff();
+  await manager.stopOwnedResources(); // never started: no-op stop, still consumes the intent
+  assert.deepEqual(stops, []);
+
+  await manager.start();
+  await manager.stopOwnedResources();
+  assert.deepEqual(stops.slice().sort(), ["dia", "mcp", "tunnel"]); // dia NOT preserved
+});
+
+test("handoff authorization is consumed even when a stop throws mid-flight", async () => {
+  const stops: string[] = [];
+  let tunnelStopFails = true;
+  const failingTunnel: InfrastructureDependency = {
+    probe: async () => "ready" as ResourceState,
+    ensureStarted: async () => "ready" as ResourceState,
+    get managedByPi() { return true; },
+    stop: async () => { if (tunnelStopFails) throw new Error("tunnel stop failed"); stops.push("tunnel"); }
+  };
+  const manager = new HarnessInfrastructureManager(
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "mcp" }),
+    failingTunnel,
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "dia" })
+  );
+
+  await manager.start();
+  manager.preserveBrowserForHandoff();
+  await assert.rejects(manager.stopOwnedResources()); // dia skipped, tunnel throws, stop exits early
+  assert.deepEqual(stops, []);
+
+  tunnelStopFails = false;
+  await manager.start();
+  await manager.stopOwnedResources(); // intent was consumed by the failed stop: dia stops normally
+  assert.deepEqual(stops.slice().sort(), ["dia", "mcp", "tunnel"]);
+});
+
 test("start -> ready -> stop stops owned deps once; restart works; external untouched", async () => {
   const ownedStops: string[] = [];
   const externalStops: string[] = [];

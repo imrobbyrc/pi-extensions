@@ -23,6 +23,7 @@ export interface InfrastructureDependency {
 export class HarnessInfrastructureManager {
   private stopping = false;
   private started = false;
+  private preserveDiaOnStop = false;
   private startInFlight: Promise<HarnessInfrastructureStatus> | undefined;
 
   constructor(
@@ -75,11 +76,26 @@ export class HarnessInfrastructureManager {
     }
   }
 
+  /**
+   * Authorize exactly one subsequent stopOwnedResources call to keep the live
+   * browser running (one-shot): the intent is consumed by the next stop call,
+   * so later normal shutdowns follow normal Dia stop semantics.
+   */
+  preserveBrowserForHandoff(): void {
+    this.preserveDiaOnStop = true;
+  }
+
   async stopOwnedResources(): Promise<HarnessInfrastructureStatus> {
+    // Consume the handoff authorization on this stop call — even if the stop
+    // path below exits early or a dependency stop throws — so preservation
+    // never leaks into a later normal shutdown.
+    const preserveDia = this.preserveDiaOnStop;
+    this.preserveDiaOnStop = false;
     if (this.started && !this.stopping) {
       this.stopping = true;
       try {
         for (const dependency of [this.dia, this.tunnel, this.mcp]) {
+          if (dependency === this.dia && preserveDia) continue;
           if (dependency.managedByPi) await dependency.stop();
         }
         this.started = false;

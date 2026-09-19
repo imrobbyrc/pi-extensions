@@ -235,13 +235,22 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
   }
 
   pi.registerCommand("openai-web", {
-    description: "Start, show, refresh, reset, diagnose, or configure the openai-web harness",
+    description: "Start, reload, hand off, show, reset, diagnose, or configure the openai-web harness",
     handler: async (args, ctx) => {
       try {
         await ensureServices();
         captureSession(ctx);
         const cfg = await config();
         const parts = args.trim().split(/\s+/).filter(Boolean);
+        if (parts[0] === "handoff") {
+          if (!runtime!.hasConversation || !infrastructure) throw new Error("No active openai-web conversation to hand off.");
+          if (subagents?.hasActiveRun() || mcpToolActivity.active) throw new Error("Cannot hand off while Herdr or MCP work is active.");
+          infrastructure.preserveBrowserForHandoff();
+          recordActivity("provider browser prepared for in-place Pi reload");
+          ctx.ui.notify("Reloading Pi extensions in place; browser conversation will be preserved.", "info");
+          await ctx.reload();
+          return;
+        }
         if (parts[0] === "start" || parts[0] === "reload") {
           const host = await ensureInfrastructure();
           const reload = parts[0] === "reload";
