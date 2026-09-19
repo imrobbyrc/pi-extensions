@@ -43,6 +43,10 @@ export class HarnessRuntime {
     return this.infrastructure.reloadMcpAndTunnel(onProgress);
   }
 
+  preserveBrowserForHandoff(): void {
+    this.infrastructure.preserveBrowserForHandoff();
+  }
+
   async stop(): Promise<HarnessInfrastructureStatus> {
     return this.infrastructure.stopOwnedResources();
   }
