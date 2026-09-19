@@ -147,7 +147,67 @@ export function assertExecutionSpec(spec: unknown): ExecutionSpec | undefined {
 /** Deterministic canonical form: sorted entry pairs, immune to object key-order drift. */
 export function canonicalExecutionSpec(spec: ExecutionSpec | undefined): string {
   if (!spec) return "";
-  return JSON.stringify(Object.keys(spec).sort().map((key) => [key, spec[key]]));
+  return JSON.stringify(Object.keys(spec).sort().map((key) => [key, spec[key] as string]));
+}
+
+/**
+ * Phase-3 decision graph: the Lead's planning decisions as an exact object —
+ * nine required axes, no more, no less. Accepting arbitrary keys here would
+ * collapse the graph into an alias for ExecutionSpec, so the shape is strict.
+ */
+export type DecisionGraphAxis = "problem" | "shapes" | "graph" | "cardinality" | "boundaries" | "behavior" | "scope" | "verification" | "critique";
+export const DECISION_GRAPH_AXES: readonly DecisionGraphAxis[] = ["problem", "shapes", "graph", "cardinality", "boundaries", "behavior", "scope", "verification", "critique"];
+
+export interface DecisionGraph {
+  problem: string;
+  shapes: string;
+  graph: string;
+  cardinality: string;
+  boundaries: string;
+  behavior: string;
+  scope: string;
+  verification: string;
+  critique: string;
+}
+
+/** Shared bound for every decision_graph axis; equal to the spec value bound so the compiled form is always a valid ExecutionSpec. */
+export const DECISION_GRAPH_VALUE_MAX = EXECUTION_SPEC_VALUE_MAX;
+
+/** decision_graph and direct execution_spec describe the same spec slot — supplying both is ambiguous and fails closed. */
+export function assertSpecSourceExclusive(executionSpec: unknown, decisionGraph: unknown): void {
+  if (executionSpec !== undefined && decisionGraph !== undefined) {
+    throw new Error("decision_graph_exclusive: provide either decision_graph or execution_spec, not both");
+  }
+}
+
+/** Validate a present decision_graph: exactly nine required, bounded, non-blank string axes; throws decision_graph_invalid on any shape drift. */
+export function assertDecisionGraph(graph: unknown): DecisionGraph {
+  if (typeof graph !== "object" || graph === null || Array.isArray(graph)) throw new Error("decision_graph_invalid: expected an object with exactly nine axes: problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique");
+  const record = graph as Record<string, unknown>;
+  const extra = Object.keys(record).filter((key) => !(DECISION_GRAPH_AXES as readonly string[]).includes(key));
+  if (extra.length > 0) throw new Error(`decision_graph_invalid: unknown axis ${JSON.stringify(extra[0])}; exactly nine axes are allowed: problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique`);
+  const normalized = {} as DecisionGraph;
+  for (const axis of DECISION_GRAPH_AXES) {
+    const value = record[axis];
+    if (typeof value !== "string" || !value.trim()) throw new Error(`decision_graph_invalid: ${axis} is required and must be a non-blank string`);
+    if (value.length > DECISION_GRAPH_VALUE_MAX) throw new Error(`decision_graph_invalid: ${axis} must be at most ${DECISION_GRAPH_VALUE_MAX} characters`);
+    normalized[axis] = value;
+  }
+  return normalized;
+}
+
+/**
+ * Phase-3 mechanical compile: the exact nine axes map verbatim onto the existing
+ * Phase-1 ExecutionSpec authority path — one `decision.<axis>` entry per axis,
+ * fixed axis order, values untouched. No re-reasoning and no invented
+ * requirements: the compiled spec is the single authority a graph-shaped plan
+ * binds (fingerprint, envelope, run validation), so a decision_graph is just an
+ * input spelling for one canonical spec, and axis key order never matters.
+ */
+export function compileDecisionGraph(graph: DecisionGraph): ExecutionSpec {
+  const spec: ExecutionSpec = {};
+  for (const axis of DECISION_GRAPH_AXES) spec[`decision.${axis}`] = graph[axis];
+  return spec;
 }
 
 /** Stable fingerprint binding a handoff envelope to one exact goal + worker decomposition (+ optional spec). */
@@ -156,9 +216,10 @@ export function planFingerprint(goal: string, workers: unknown[], executionSpec?
   return createHash("sha256").update(`${goal}\n${canonicalWorkers(workers)}${spec ? `\n${spec}` : ""}`).digest("hex").slice(0, 32);
 }
 
-/** Pi-side issuance: fresh taskId + goal/workers/spec-bound fingerprint → handoff envelope string. */
-export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>, gates: OrchestrationGates, executionSpec?: unknown): string {
-  const spec = assertExecutionSpec(executionSpec);
+/** Pi-side issuance: fresh taskId + goal/workers/spec-bound fingerprint → handoff envelope string. Phase 3: a decision_graph compiles deterministically into the spec slot. */
+export function issueHerdrHandoff(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>, gates: OrchestrationGates, executionSpec?: unknown, decisionGraph?: unknown): string {
+  assertSpecSourceExclusive(executionSpec, decisionGraph);
+  const spec = decisionGraph !== undefined ? compileDecisionGraph(assertDecisionGraph(decisionGraph)) : assertExecutionSpec(executionSpec);
   const slices = workers.map((worker) => assertWorkerSlice(worker));
   return buildHerdrHandoff({
     taskId: randomUUID(),
@@ -215,13 +276,13 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "Your responsibilities: high-level reasoning, architectural planning, task decomposition, and code review.",
     `Workspace inspection tools (the only workspace access you have): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app.`,
     "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|accept|stop.",
-    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the spec and workers cannot invent requirements beyond it.",
-    "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec (when the plan included one) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice.",
+    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan) OR the optional decision_graph (your planning decisions as exactly nine non-blank axes — problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique — mechanically compiled by Pi into the plan's execution spec; decision_graph and execution_spec are mutually exclusive), and planning gates {graph, handoff, critique}; Pi validates the gates and returns a Pi-issued handoff envelope. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec or decision_graph, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the compiled spec and workers cannot invent requirements beyond it.",
+    "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec or decision_graph (whichever the plan included, verbatim — a changed, added, or removed decision_graph is rejected) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, correction rounds). A completed worker stays live in its pane awaiting your review — nothing is auto-cleaned until you accept or stop.",
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
     "- action=accept: accept one completed worker's work — finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
     "- action=stop: stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
-    "Planning protocol (mandatory before delegation): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique. The graph is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Derive each worker's declarative slice lists (requirements, behaviors, seams, acceptance) from that graph — and, when an execution_spec is present, from that spec — so workers cannot invent requirements. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
+    "Planning protocol (mandatory before delegation): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique. The graph is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Derive each worker's declarative slice lists (requirements, behaviors, seams, acceptance) from that graph — and, when an execution_spec or decision_graph is present, from that compiled spec — so workers cannot invent requirements. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
     "Pi remains the sole executor: never mutate source, never run shell commands, never spawn Pi subagents, never create Herdr panes directly.",
     "After workers finish, inspect git_status/git_diff and review semantically against the same Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique dimensions. Send bounded corrections via action=correct and re-review the finished round; accept each worker via action=accept once its work is good, then report the result to the user. Always accept or stop to release worker panes."
   ].join("\n");
