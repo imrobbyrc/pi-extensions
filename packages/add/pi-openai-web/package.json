@@ -1,6 +1,6 @@
 {
   "name": "@imrobbyrc/pi-openai-web",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Pi-native harness: always-on ChatGPT Web Lead Architect with strict bounded lead tools and Herdr-managed Pi workers.",
   "type": "module",
