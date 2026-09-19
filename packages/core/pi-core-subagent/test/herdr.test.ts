@@ -4,6 +4,7 @@ import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createSubagentController } from "../src/api.ts";
 import {
 	checkHerdrEnvironment,
 	extractPaneId,
@@ -15,7 +16,7 @@ import {
 	sanitizeHerdrAgentName,
 } from "../src/herdr.ts";
 import { MAX_HERDR_MESSAGE_SIZE, parseChildMessage } from "../src/herdr-protocol.ts";
-import { SubagentManager } from "../src/manager.ts";
+import { getOrCreateSubagentManager, SubagentManager } from "../src/manager.ts";
 import type { RunSnapshot } from "../src/types.ts";
 
 class FakeHerdrRunner implements HerdrCommandRunner {
@@ -1446,5 +1447,104 @@ describe("herdr runtime", () => {
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	// ---- One-shot session handoff preservation ----
+
+	test("35. handoff: herdr-only active state arms; preserved shutdown keeps the live task/pane, the next cleans", async () => {
+		const fake = new FakeHerdrRunner();
+		fake.splitResult = JSON.stringify({ result: { pane_id: "pane_handoff35" } });
+		fake.customExec = async (args) => {
+			if (args[0] === "agent" && args[1] === "prompt") {
+				return new Promise((r) => setTimeout(() => r({ stdout: "{}", stderr: "", exitCode: 0 }), 1000));
+			}
+			return undefined;
+		};
+		const m = new SubagentManager(stubPi, fake);
+		const details = m.startInBackground({ agent: "handoffee", task: "t35", runtime: "herdr" }, stubCtx);
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "running")).toBe(true);
+
+		// Herdr-only active state: prepare arms and reports the live task.
+		const prepared = m.prepareHandoff();
+		expect(prepared.ok).toBe(true);
+		if (prepared.ok) expect(prepared.nonterminal).toBe(1);
+
+		const preserved = m.handleSessionShutdown();
+		expect(preserved.preserved).toBe(true);
+		expect(m.getRun(details.run.id)?.tasks[0]?.status).toBe("running"); // state survived the boundary
+		await new Promise((r) => setTimeout(r, 50));
+		// Nothing was torn down: no pane close, no ctrl+c.
+		expect(fake.calls.some((c) => c.args[0] === "pane" && c.args[1] === "close")).toBe(false);
+		expect(fake.calls.some((c) => c.args[0] === "agent" && c.args[1] === "send-keys")).toBe(false);
+
+		// One-shot: the next ordinary shutdown force-cleans (pane closed).
+		expect(m.handleSessionShutdown().preserved).toBe(false);
+		expect(m.getRun(details.run.id)).toBeUndefined();
+		expect(
+			await waitFor(() =>
+				fake.calls.some((c) => c.args[0] === "pane" && c.args[1] === "close" && c.args[2] === "pane_handoff35"),
+			),
+		).toBe(true);
+	});
+
+	test("36. handoff: preserved shutdown keeps pane/token bindings; a recreated controller on the same ExtensionAPI still corrects", async () => {
+		const { fake } = reviewLoopFake();
+		const pi = { events: { emit() {} }, sendUserMessage() {} } as unknown as ExtensionAPI;
+		const m = getOrCreateSubagentManager(pi);
+		m.setHerdrRunner(fake);
+		const details = m.startInBackground({ agent: "reviewee36", task: "t36", runtime: "herdr" }, stubCtx);
+		const taskId = details.run.tasks[0]!.id;
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "completed")).toBe(true);
+
+		// Completed herdr work with a retained pane: prepare arms (no nonterminal work left).
+		const prepared = m.prepareHandoff();
+		expect(prepared.ok).toBe(true);
+		if (prepared.ok) expect(prepared.nonterminal).toBe(0);
+
+		expect(m.handleSessionShutdown().preserved).toBe(true);
+		// The pane stayed live through the boundary: no close attempt.
+		expect(fake.calls.some((c) => c.args[0] === "pane" && c.args[1] === "close")).toBe(false);
+
+		// Recreated controller on the SAME ExtensionAPI sees the same manager and preserved run...
+		const ctrl = createSubagentController(pi);
+		expect(ctrl.manager).toBe(m);
+		expect(ctrl.status(details.run.id).id).toBe(details.run.id);
+		// ...and the live binding survived: a correction round still re-prompts the SAME pane (no re-split).
+		const corrected = ctrl.correct(details.run.id, taskId, "tighten after reload", stubCtx);
+		expect(corrected.id).toBe(details.run.id);
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "completed")).toBe(true);
+		const task = m.getRun(details.run.id)!.tasks[0]!;
+		expect(task.corrections).toBe(1);
+		expect(task.paneId).toBe("pane_rev");
+		expect(fake.calls.filter((c) => c.args[0] === "pane" && c.args[1] === "split")).toHaveLength(1);
+
+		// Ordinary shutdown after the boundary still force-cleans the owned pane.
+		expect(m.handleSessionShutdown().preserved).toBe(false);
+		expect(await waitFor(() => fake.calls.some((c) => c.args[0] === "pane" && c.args[1] === "close"))).toBe(true);
+	});
+
+	test("37. handoff: mixed active state (inprocess alongside herdr) rejects without arming", async () => {
+		const fake = new FakeHerdrRunner();
+		fake.customExec = async (args) => {
+			if (args[0] === "agent" && args[1] === "prompt") {
+				return new Promise((r) => setTimeout(() => r({ stdout: "{}", stderr: "", exitCode: 0 }), 1000));
+			}
+			return undefined;
+		};
+		const m = new SubagentManager(stubPi, fake);
+		const details = m.startInBackground({ agent: "herdr37", task: "t37a", runtime: "herdr" }, stubCtx);
+		expect(await waitFor(() => m.getRun(details.run.id)?.tasks[0]?.status === "running")).toBe(true);
+		m.createRun({ agent: "inproc37", task: "t37b", runtime: "inprocess" }, stubCtx); // queued = mixed unsafe
+
+		const prepared = m.prepareHandoff();
+		expect(prepared.ok).toBe(false);
+		if (!prepared.ok) {
+			expect(prepared.blockers).toHaveLength(1);
+			expect(prepared.blockers[0]).toMatch(/inproc37/);
+			expect(prepared.blockers[0]).toMatch(/inprocess/);
+		}
+		// Unarmed: shutdown is ordinary cleanup (herdr pane force-closed).
+		expect(m.handleSessionShutdown().preserved).toBe(false);
+		expect(m.getRun(details.run.id)).toBeUndefined();
 	});
 });

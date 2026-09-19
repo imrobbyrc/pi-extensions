@@ -266,6 +266,10 @@ export interface LiveChild {
 	reply?: (message: string) => void;
 }
 
+export type HandoffPrepareResult =
+	| { ok: true; armed: true; nonterminal: number }
+	| { ok: false; reason: string; blockers: string[] };
+
 const MANAGER_REGISTRY_SYMBOL = Symbol.for("@imrobbyrc/pi-core-subagent.managerRegistry");
 const MANAGER_SYMBOL = Symbol.for("@imrobbyrc/pi-core-subagent.manager");
 
@@ -319,6 +323,8 @@ export class SubagentManager {
 	private persistChain: Promise<unknown> = Promise.resolve();
 	private readonly instanceNonce = Math.random().toString(36).slice(2, 8);
 	private cleared = false;
+	/** One-shot handoff authorization: armed by prepareHandoff, consumed by exactly one handleSessionShutdown. */
+	private preserveNextSessionShutdown = false;
 	private ownedPanes = new Set<string>();
 	/** Herdr review loop: per-task child IPC tokens. Presence marks a live pane binding (lost on session reload). */
 	private herdrTokens = new Map<string, string>();
@@ -444,6 +450,63 @@ export class SubagentManager {
 		for (const paneId of this.ownedPanes) void this.herdrRunner.exec(["pane", "close", paneId]).catch(() => {});
 		this.ownedPanes.clear();
 		this.herdrTokens.clear();
+	}
+
+	/**
+	 * One-shot handoff preservation: validate that every nonterminal task runs on the herdr
+	 * runtime — only live panes/bindings survive an intentional in-place extension reload;
+	 * inprocess work never does. Idle or herdr-only state arms the preservation; an active
+	 * inprocess/mixed state is rejected and leaves it unarmed (revoking a prior arming).
+	 */
+	prepareHandoff(): HandoffPrepareResult {
+		const blockers: string[] = [];
+		let nonterminal = 0;
+		for (const run of this.runs.values()) {
+			for (const task of run.tasks) {
+				if (TERMINAL.includes(task.status)) continue;
+				nonterminal += 1;
+				const runtime = task.runtime ?? run.runtime;
+				if (runtime !== "herdr") {
+					blockers.push(`${run.id}/${task.id} (${task.agent}) is ${task.status} on ${runtime}`);
+				}
+			}
+		}
+		if (blockers.length > 0) {
+			this.preserveNextSessionShutdown = false;
+			return {
+				ok: false,
+				reason: `Handoff refused: ${blockers.length} active task${blockers.length > 1 ? "s are" : " is"} not on the herdr runtime (${blockers.join("; ")}). Inprocess work cannot survive a session reload — cancel it or let it finish first.`,
+				blockers,
+			};
+		}
+		this.preserveNextSessionShutdown = true;
+		this.emit("subagent:handoff-armed", { nonterminal });
+		return { ok: true, armed: true, nonterminal };
+	}
+
+	/**
+	 * session_shutdown boundary. Consumes the one-shot preservation first: when armed by a prior
+	 * prepareHandoff, skips the ordinary teardown so runs, ownedPanes, herdrTokens and liveChildren
+	 * survive exactly one intentional reload boundary — the same shared manager (same ExtensionAPI)
+	 * keeps its bindings for the recreated controller. Any later call, or an unarmed one, is the
+	 * ordinary force-clean (clearRuns).
+	 */
+	handleSessionShutdown(): { preserved: boolean } {
+		if (!this.preserveNextSessionShutdown) {
+			this.clearRuns();
+			return { preserved: false };
+		}
+		this.preserveNextSessionShutdown = false;
+		// Detach session-bound display surfaces only; panes, bindings, runs and children persist.
+		if (this.pulseTimer) {
+			clearTimeout(this.pulseTimer);
+			this.pulseTimer = null;
+		}
+		for (const t of this.widgetTimers.values()) clearTimeout(t);
+		this.widgetTimers.clear();
+		this.widgetTui = null;
+		this.emit("subagent:handoff-preserved", { runs: this.runs.size });
+		return { preserved: true };
 	}
 
 	async restoreFromSidecar(ctx: ExtensionContext): Promise<void> {

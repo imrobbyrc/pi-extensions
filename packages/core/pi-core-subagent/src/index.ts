@@ -178,7 +178,7 @@ export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 				ctx.ui.setWidget("subagents", [], { placement: "aboveEditor" });
 			} catch {}
 		}
-		manager.clearRuns();
+		manager.handleSessionShutdown();
 	});
 
 	pi.registerTool<typeof SubagentParams, RunDetails>({

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { cloneRun, getOrCreateSubagentManager, type SubagentManager } from "./manager.ts";
+import { cloneRun, getOrCreateSubagentManager, type HandoffPrepareResult, type SubagentManager } from "./manager.ts";
 import type { SubagentParamsShape } from "./schemas.ts";
 import type { RunDetails, RunSnapshot, SubagentRuntime, TaskSnapshot } from "./types.ts";
 
@@ -77,6 +77,17 @@ export class SubagentController {
 		return this.manager.setDefaultRuntime(runtime);
 	}
 
+	/** One-shot handoff preservation: arms the next session_shutdown to preserve runs, panes and bindings (idle or herdr-only active state); rejection leaves it unarmed. */
+	prepareHandoff(): HandoffPrepareResult {
+		return this.manager.prepareHandoff();
+	}
+
+	/** session_shutdown boundary: consumes an armed preservation exactly once; otherwise ordinary force-clean. */
+	handleSessionShutdown(): { preserved: boolean } {
+		return this.manager.handleSessionShutdown();
+	}
+
+	/** Ordinary force-clean — unchanged semantics for ordinary callers. */
 	shutdown(): void {
 		this.manager.clearRuns();
 	}

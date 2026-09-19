@@ -319,6 +319,10 @@ A completed herdr worker stays **live and reviewable** in its pane — the leade
 
 Failure/abort stay terminal (use `resume_subagent`, which still spawns a fresh pane); `subagent_cancel` and session shutdown force-clean all panes the run owns. A failed herdr task publishes its terminal state only after its pane/agent cleanup boundary: if that teardown fails, the task carries an explicit `cleanupPending` marker (ownership retained) and `retryTaskCleanup(runId, taskId)` re-runs it — the failed state is never presented as fully settled while the worker's pane may still be live. Late pane traffic after a terminal state is ignored. Inprocess tasks are unaffected: `resume_subagent` still refuses completed tasks (`spawn a new task instead`). Corrections require a live pane binding, so after a session reload they refuse with a pointer to `resume_subagent`. Manager API: `correctTask(...)` / `acceptTask(...)` / `retryTaskCleanup(...)`; controller: `correct(...)` / `accept(...)` / `retryCleanup(...)`.
 
+#### Session handoff preservation (one-shot)
+
+An intentional in-place extension reload no longer has to kill active Herdr panes. `prepareHandoff()` (manager; the controller exposes the same delegate) validates that **every nonterminal task runs on the `herdr` runtime** — live panes and their bindings survive a session reload; inprocess work never does. Idle or herdr-only state arms a one-shot preservation; an active inprocess/mixed state is rejected without arming (and revokes a prior arming). An armed `session_shutdown` (`handleSessionShutdown()`) then preserves runs, owned panes, IPC tokens and live children **exactly once** — a controller recreated for the same session (`createSubagentController` on the same `ExtensionAPI`, via the shared-manager registry) observes the same manager, runs and live pane bindings, so review/correction loops continue seamlessly. The next ordinary `session_shutdown` force-cleans as always, and `shutdown()` semantics never change for ordinary callers.
+
 ### Child talk tools (always on)
 
 | Tool | Meaning |
