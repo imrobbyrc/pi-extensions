@@ -85,7 +85,7 @@ const WIDGET_THROTTLE_MS = 150;
  * and only redundant exploration after that evidence is complete is forbidden.
  */
 export const WORKER_EXECUTION_INVARIANT =
-	"Execution invariant: treat the Lead/parent plan as frozen — never broaden or re-derive it, and inspect only what your owned slice requires. Stop once every acceptance criterion has direct evidence: run the checks the plan requires to produce that evidence first (stopping never skips required verification), then finish — no redundant exploration after the evidence is complete. If truly blocked, report the blocker instead of expanding scope.";
+	"Execution invariant: treat the Lead/parent plan as frozen — never broaden or re-derive it, and inspect only what your owned slice requires. Stop once every acceptance criterion has direct evidence: run the checks the plan requires to produce that evidence first (stopping never skips required verification), then finish — no redundant exploration after the evidence is complete. Scale verification to the change class: documentation-only edits never run test suites or recount packages outside the owned slice unless an acceptance criterion explicitly names that check — the cheapest sufficient evidence satisfies it. Prefer one decisive command over repeated approximate variants. If truly blocked, report the blocker instead of expanding scope.";
 
 function newId(prefix: string): string {
 	return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;

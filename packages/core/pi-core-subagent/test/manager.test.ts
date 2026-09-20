@@ -268,6 +268,13 @@ describe("worker execution invariant (V5 Phase 2)", () => {
 		expect(WORKER_EXECUTION_INVARIANT).toMatch(/stopping never skips required verification/);
 		expect(WORKER_EXECUTION_INVARIANT).toMatch(/no redundant exploration after the evidence is complete/);
 	});
+	test("invariant scales verification to the change class (doc edits never re-derive counts)", () => {
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/scale verification to the change class/i);
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/documentation-only edits never run test suites/i);
+		// Explicit acceptance keeps Lead authority: a named check still runs.
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/unless an acceptance criterion explicitly names that check/i);
+		expect(WORKER_EXECUTION_INVARIANT).toMatch(/cheapest sufficient evidence/i);
+	});
 	test("invariant still permits blocker handling instead of scope expansion", () => {
 		expect(WORKER_EXECUTION_INVARIANT).toMatch(/If truly blocked, report the blocker instead of expanding scope/);
 	});
