@@ -29,10 +29,11 @@ npm test
 - `config.test.ts` — config loading and planner-era field rejection.
 - `path-safety.test.ts` — workspace path containment and traversal rejection.
 
-Planner suite currently has 90 tests; core package suite has 159 tests.
+This package's suite currently runs 242 tests (verified via `npm test`). The `@imrobbyrc/pi-core-subagent` suite lives in its own package and is run separately (`bun test`); see that package for its current count.
 
 ## Manual/live checks (not in CI)
 
 - `scripts/live-discovery-probe.ts` — real model discovery against configured CDP.
 - `npm run doctor` — host prerequisites (Node, Git, Pi, CDP reachability).
 - Live herdr run: confirm TUI gate, parallel independent workers, `correct` turn evidence on a reused pane, `stop` reaping panes.
+- Adaptive worker effort (V5 semantics): for each risk level, confirm the Lead passes the matching per-run `worker_thinking` value to `action=run` — low-risk plans get `worker_thinking=low`, medium/high-risk plans get `worker_thinking=high` (applies to that run only). Then set an explicit worker thinking level via configuration or command and confirm the Lead honors it verbatim, never rewriting the persisted configuration to impose adaptive guidance.
