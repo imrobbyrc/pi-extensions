@@ -37,6 +37,23 @@ describe("Lead Architect GUI Component", () => {
     assert.ok(fullText.includes("Save Scope"), "Includes Scope setting");
   });
 
+  it("describes Thinking Level as the profile default with adaptive per-run override", () => {
+    const component = createOrchestratorSettingsComponent({
+      current: mockState,
+      availableModels: [],
+      onSave: async () => {},
+      onDone: () => {}
+    });
+
+    // Move to Thinking Level (item 1) so its description renders
+    component.handleInput("\u001b[B");
+    const text = component.render(80).join("\n").replace(/\s+/g, " ");
+    assert.ok(text.includes("Thinking Level (default)"), "Label marks the level as the default");
+    assert.ok(text.includes("Profile default reasoning effort"), "Description frames the value as a profile default");
+    assert.ok(text.includes("per-run effort"), "Description mentions the per-run adaptive effort");
+    assert.ok(text.includes("explicitly set level always wins"), "Explicit override semantics explained");
+  });
+
   it("opens submenu for Worker Model and selects a new model", () => {
     let savedConfig: OrchestratorConfig | undefined;
     let savedScope: OrchestratorScope | undefined;

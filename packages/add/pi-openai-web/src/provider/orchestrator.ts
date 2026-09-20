@@ -771,6 +771,24 @@ export async function saveOrchestratorConfig(
   return targetPath;
 }
 
+const ORCHESTRATOR_BOX_NOTE_WIDTH = 55;
+
+/** Wrap one plain-text note into fixed-width box rows (border alignment contract: every row is 58 columns). */
+function formatOrchestratorBoxNote(text: string): string[] {
+  const rows: string[] = [];
+  let current = "";
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    if (!current) current = word;
+    else if (current.length + 1 + word.length <= ORCHESTRATOR_BOX_NOTE_WIDTH) current = `${current} ${word}`;
+    else {
+      rows.push(current);
+      current = word;
+    }
+  }
+  if (current) rows.push(current);
+  return rows.map((row) => `│ ${row.padEnd(ORCHESTRATOR_BOX_NOTE_WIDTH)}│`);
+}
+
 export function formatOrchestratorBox(state: OrchestratorState): string {
   const { config, scope } = state;
   const scopeStr = scope === "project" ? "This project" : scope === "global" ? "Global" : "This session";
@@ -781,7 +799,7 @@ export function formatOrchestratorBox(state: OrchestratorState): string {
     "┌ OpenAI Web Lead Architect ─────────────────────────────┐",
     "│ Mode              LEAD (always on)                     │",
     `│ Worker model      ${config.workerModel.padEnd(37)}│`,
-    `│ Thinking          ${config.workerThinking.padEnd(37)}│`,
+    `│ Thinking profile  ${config.workerThinking.padEnd(37)}│`,
     `│ Parallel workers  ${String(config.maxParallelWorkers).padEnd(37)}│`,
     `│ Delegation        ${config.delegationStrategy.padEnd(37)}│`,
     `│ Workflows         ${tags.slice(0, 2).join(" ").padEnd(37)}│`,
@@ -789,6 +807,9 @@ export function formatOrchestratorBox(state: OrchestratorState): string {
     "│                                                        │",
     `│ Scope             ${scopeStr.padEnd(37)}│`,
     ...(state.sourcePath ? [`│ Path              ${state.sourcePath.slice(-35).padStart(37)}│`] : []),
+    ...formatOrchestratorBoxNote(
+      "Thinking profile is the default fallback, not the per-run effort: adaptive runs pick worker effort per run unless the user explicitly sets one."
+    ),
     "└────────────────────────────────────────────────────────┘"
   ];
   return lines.join("\n");

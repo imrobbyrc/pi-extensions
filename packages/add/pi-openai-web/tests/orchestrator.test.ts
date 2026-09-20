@@ -203,7 +203,7 @@ test("formatOrchestratorBox renders lead status lines", () => {
   assert.match(box, /OpenAI Web Lead Architect/);
   assert.match(box, /LEAD \(always on\)/);
   assert.match(box, /Worker model\s+zai\/glm-5\.3/);
-  assert.match(box, /Thinking\s+high/);
+  assert.match(box, /Thinking profile\s+high/);
   assert.match(box, /Parallel workers\s+4/);
   assert.match(box, /Delegation\s+adaptive/);
   assert.match(box, /Workflows\s+planning:on effort:on/);
@@ -223,6 +223,21 @@ test("workflow toggles: absent means enabled, only an explicit false disables", 
   // The status box reflects disabled workflows.
   const box = formatOrchestratorBox({ config: { ...DEFAULT_ORCHESTRATOR_CONFIG, adaptivePlanning: false }, scope: "project" });
   assert.match(box, /planning:off effort:on/);
+});
+
+test("formatOrchestratorBox presents workerThinking as the profile default, not the per-run effort", () => {
+  const state: OrchestratorState = {
+    config: { ...DEFAULT_ORCHESTRATOR_CONFIG, workerThinking: "max" },
+    scope: "global"
+  };
+  const box = formatOrchestratorBox(state);
+  assert.match(box, /Thinking profile\s+max/, "row labels the configured level as the profile value");
+  assert.ok(box.includes("default fallback"), "identifies the configured level as a fallback default");
+  assert.ok(box.includes("per-run"), "contrasts the profile default with the per-run effort");
+  assert.ok(box.includes("explicitly sets one"), "explicit user setting wins over the adaptive rule");
+  for (const line of box.split("\n")) {
+    assert.equal(line.length, 58, "note rows keep the box border alignment");
+  }
 });
 
 test("provider to Herdr handoff requires graph, handoff, and critique gates", () => {

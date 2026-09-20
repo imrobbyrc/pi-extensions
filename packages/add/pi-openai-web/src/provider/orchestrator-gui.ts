@@ -210,8 +210,9 @@ export function createOrchestratorSettingsComponent(options: OrchestratorGuiOpti
     },
     {
       id: "workerThinking",
-      label: "Thinking Level",
-      description: "Reasoning effort level for worker models.",
+      label: "Thinking Level (default)",
+      description:
+        "Profile default reasoning effort for worker models. Adaptive delegation may override it with a per-run effort (low for low risk, high for medium/high); an explicitly set level always wins.",
       currentValue: workerThinking,
       values: ["high", "max", "medium", "low", "none"]
     },
