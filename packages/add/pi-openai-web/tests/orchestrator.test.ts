@@ -106,14 +106,14 @@ test("loadOrchestratorState loads global config when global exists and project d
   }
 });
 
-test("legacy persisted enabled field is ignored instead of breaking loads", async () => {
+test("persisted config files load as-is with defaults merged", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-orches-test-"));
   try {
     const paths = resolveOrchestratorPaths(join(dir, "proj"), join(dir, "state"));
     await mkdir(dirname(paths.globalPath), { recursive: true });
-    await writeFile(paths.globalPath, JSON.stringify({ ...DEFAULT_ORCHESTRATOR_CONFIG, enabled: false }, null, 2), "utf-8");
+    await writeFile(paths.globalPath, JSON.stringify({ ...DEFAULT_ORCHESTRATOR_CONFIG, workerModel: "global/model" }, null, 2), "utf-8");
     const state = await loadOrchestratorState(join(dir, "proj"), join(dir, "state"));
-    assert.equal("enabled" in state.config, false);
+    assert.equal(state.config.workerModel, "global/model");
     assert.equal(state.scope, "global");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -210,7 +210,7 @@ test("formatOrchestratorBox renders lead status lines", () => {
 
 test("provider to Herdr handoff requires graph, handoff, and critique gates", () => {
   assert.throws(() => assertOrchestrationGates(undefined), /orchestration_gate_required/);
-  const envelope = buildHerdrHandoff({ taskId: "task-1", planFingerprint: "fp", gates: { graph: "graph", handoff: "brief", critique: "independent" }, workers: [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }] });
+  const envelope = buildHerdrHandoff({ taskId: "task-1", planFingerprint: "fp", gates: { graph: "graph", handoff: "brief", critique: "independent" }, workers: [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }], executionSpec: { suite: "focused" } });
   const parsed = parseHerdrHandoff(envelope);
   assert.equal(parsed.taskId, "task-1");
   assert.equal(parsed.gates.critique, "independent");
@@ -220,7 +220,7 @@ test("provider to Herdr handoff requires graph, handoff, and critique gates", ()
 // --- Optional execution_spec (Phase 1) ---
 
 test("assertExecutionSpec validates, bounds, and normalizes to sorted canonical form", () => {
-  assert.equal(assertExecutionSpec(undefined), undefined);
+  assert.throws(() => assertExecutionSpec(undefined), /execution_spec_invalid/, "a missing spec is rejected, not tolerated");
   const normalized = assertExecutionSpec({ b: "2", a: "1" });
   assert.deepEqual(normalized, { a: "1", b: "2" });
   assert.deepEqual(Object.keys(normalized ?? {}), ["a", "b"], "keys are sorted for deterministic serialization");
@@ -233,47 +233,45 @@ test("assertExecutionSpec validates, bounds, and normalizes to sorted canonical 
   assert.throws(() => assertExecutionSpec(tooMany), /execution_spec_invalid/);
 });
 
-test("handoff round-trips the optional execution_spec and legacy envelopes stay spec-free", () => {
+test("handoff round-trips the execution_spec and spec-less envelopes are rejected", () => {
   const workers = [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }];
   const gates = { graph: "graph", handoff: "brief", critique: "independent" };
   const withSpec = buildHerdrHandoff({ taskId: "task-2", planFingerprint: "fp2", gates, workers, executionSpec: { runtime: "node" } });
   const parsed = parseHerdrHandoff(withSpec);
   assert.deepEqual(parsed.executionSpec, { runtime: "node" });
-  // Legacy no-spec envelope: key absent, parse yields no spec (V3 preserved).
-  const legacy = buildHerdrHandoff({ taskId: "task-3", planFingerprint: "fp3", gates, workers });
-  assert.equal("executionSpec" in JSON.parse(legacy), false);
-  assert.equal(parseHerdrHandoff(legacy).executionSpec, undefined);
+  // A spec-less envelope is rejected at build AND parse time (no legacy support).
+  assert.throws(() => buildHerdrHandoff({ taskId: "task-3", planFingerprint: "fp3", gates, workers }), /execution_spec_invalid/);
   // Injecting a structurally invalid spec into an envelope fails parse.
-  assert.throws(() => parseHerdrHandoff(legacy.replace('"workers"', '"executionSpec":42,"workers"')), /execution_spec_invalid/);
+  assert.throws(() => parseHerdrHandoff(withSpec.replace('"workers"', '"executionSpec":42,"workers"')), /execution_spec_invalid/);
   // buildHerdrHandoff itself rejects invalid specs.
   assert.throws(() => buildHerdrHandoff({ taskId: "task-4", planFingerprint: "fp4", gates, workers, executionSpec: { bad: "" } }), /execution_spec_invalid/);
 });
 
 // --- Declarative WorkerSlice (Phase 2) ---
 
-const legacyWorker = { id: "w1", objective: "fix", owns: ["src/**"], depends_on: [] };
+const bareWorker = { id: "w1", objective: "fix", owns: ["src/**"], depends_on: [] };
 
 test("canonicalWorkers keeps legacy workers byte-identical and appends slice metadata deterministically", () => {
   // Metadata-free workers serialize exactly like the frozen legacy form.
-  assert.equal(canonicalWorkers([legacyWorker]), JSON.stringify([{ id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] }]));
-  assert.equal(canonicalWorkers([{ ...legacyWorker, dependsOn: [] }]), canonicalWorkers([legacyWorker]), "dependsOn/depends_on spellings canonicalize identically");
-  const sliced = canonicalWorkers([{ ...legacyWorker, requirements: ["bounded lists"], seams: ["MCP boundary"] }]);
+  assert.equal(canonicalWorkers([bareWorker]), JSON.stringify([{ id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] }]));
+  assert.equal(canonicalWorkers([{ ...bareWorker, dependsOn: [] }]), canonicalWorkers([bareWorker]), "dependsOn/depends_on spellings canonicalize identically");
+  const sliced = canonicalWorkers([{ ...bareWorker, requirements: ["bounded lists"], seams: ["MCP boundary"] }]);
   assert.match(sliced, /"dependsOn":\[\],"requirements":\["bounded lists"\],"seams":\["MCP boundary"\]/);
   assert.equal(sliced.includes("behaviors"), false, "absent fields stay out of the canonical form");
 });
 
 test("planFingerprint binds worker slice metadata immutably and preserves legacy hashes", () => {
   const goal = "ship phase 2";
-  const legacyHash = planFingerprint(goal, [legacyWorker]);
-  assert.equal(planFingerprint(goal, [{ ...legacyWorker, dependsOn: [] }]), legacyHash);
-  assert.equal(planFingerprint(goal, [{ ...legacyWorker, requirements: undefined }]), legacyHash, "explicitly absent metadata never changes the hash");
-  const sliced = [{ ...legacyWorker, requirements: ["r1"], acceptance: ["a1"] }];
+  const legacyHash = planFingerprint(goal, [bareWorker]);
+  assert.equal(planFingerprint(goal, [{ ...bareWorker, dependsOn: [] }]), legacyHash);
+  assert.equal(planFingerprint(goal, [{ ...bareWorker, requirements: undefined }]), legacyHash, "explicitly absent metadata never changes the hash");
+  const sliced = [{ ...bareWorker, requirements: ["r1"], acceptance: ["a1"] }];
   assert.notEqual(planFingerprint(goal, sliced), legacyHash, "adding metadata changes the hash");
-  assert.notEqual(planFingerprint(goal, [{ ...legacyWorker, requirements: ["r2"], acceptance: ["a1"] }]), planFingerprint(goal, sliced), "changing one item changes the hash");
+  assert.notEqual(planFingerprint(goal, [{ ...bareWorker, requirements: ["r2"], acceptance: ["a1"] }]), planFingerprint(goal, sliced), "changing one item changes the hash");
 });
 
 test("assertWorkerSlice validates and normalizes both dependsOn spellings", () => {
-  assert.deepEqual(assertWorkerSlice(legacyWorker), { id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] });
+  assert.deepEqual(assertWorkerSlice(bareWorker), { id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] });
   const full = assertWorkerSlice({ id: "w1", objective: "fix", owns: ["src/**"], dependsOn: ["w0"], requirements: ["r"], behaviors: ["b"], seams: ["s"], acceptance: ["a"] });
   assert.deepEqual(full, { id: "w1", objective: "fix", owns: ["src/**"], dependsOn: ["w0"], requirements: ["r"], behaviors: ["b"], seams: ["s"], acceptance: ["a"] });
   for (const bad of [
@@ -295,20 +293,20 @@ test("assertWorkerSlice validates and normalizes both dependsOn spellings", () =
   }
 });
 
-test("handoff envelopes round-trip complete worker slices and stay legacy-shaped without metadata", () => {
+test("handoff envelopes round-trip complete worker slices and metadata-free workers stay metadata-free", () => {
   const gates = { graph: "graph", handoff: "brief", critique: "independent" };
   const sliceWorker = { id: "w", objective: "ship", owns: ["src/**"], dependsOn: [], requirements: ["r1", "r2"], behaviors: ["b1"], seams: ["s1"], acceptance: ["a1"] };
-  const envelope = issueHerdrHandoff("goal", [sliceWorker], gates);
+  const envelope = issueHerdrHandoff("goal", [sliceWorker], gates, { suite: "focused" });
   const parsed = parseHerdrHandoff(envelope);
   assert.deepEqual(parsed.workers, [sliceWorker], "complete slices round-trip through the envelope");
-  // Legacy envelope keeps the exact pre-slice worker serialization.
-  const legacy = issueHerdrHandoff("goal", [{ id: "w", objective: "ship", owns: ["src/**"], depends_on: [] }], gates);
-  assert.equal(JSON.parse(legacy).workers[0].requirements, undefined);
-  assert.deepEqual(parseHerdrHandoff(legacy).workers, [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]);
+  // Metadata-free worker: identical envelope shape minus the slice lists.
+  const bare = issueHerdrHandoff("goal", [{ id: "w", objective: "ship", owns: ["src/**"], depends_on: [] }], gates, { suite: "focused" });
+  assert.equal(JSON.parse(bare).workers[0].requirements, undefined);
+  assert.deepEqual(parseHerdrHandoff(bare).workers, [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]);
   // Tampering embedded slice metadata fails parse closed.
   assert.throws(() => parseHerdrHandoff(envelope.replace('"requirements":["r1","r2"]', '"requirements":"r1"')), /worker_slice_invalid/);
   // buildHerdrHandoff itself rejects invalid slice metadata.
-  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates, workers: [{ ...sliceWorker, requirements: [] }] }), /worker_slice_invalid/);
+  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates, executionSpec: { suite: "focused" }, workers: [{ ...sliceWorker, requirements: [] }] }), /worker_slice_invalid/);
 });
 
 test("Lead contract documents declarative worker slices and execution_spec derivation", () => {
@@ -362,24 +360,24 @@ test("compileDecisionGraph maps the nine axes verbatim into one canonical Execut
   assert.deepEqual(compileDecisionGraph(assertDecisionGraph(reshuffled)), spec);
   assert.equal(canonicalExecutionSpec(compileDecisionGraph(assertDecisionGraph(reshuffled))), canonicalExecutionSpec(spec));
   // The fingerprint binds the compiled form, so equivalent graphs produce identical fingerprints.
-  assert.equal(planFingerprint("ship phase 3", [legacyWorker], compileDecisionGraph(assertDecisionGraph(reshuffled))), planFingerprint("ship phase 3", [legacyWorker], spec));
+  assert.equal(planFingerprint("ship phase 3", [bareWorker], compileDecisionGraph(assertDecisionGraph(reshuffled))), planFingerprint("ship phase 3", [bareWorker], spec));
 });
 
 test("issueHerdrHandoff compiles a decision_graph into the envelope's spec slot", () => {
   const gates = { graph: "graph", handoff: "brief", critique: "independent" };
   const compiled = compileDecisionGraph(assertDecisionGraph(decisionGraph));
-  const envelope = issueHerdrHandoff("goal", [legacyWorker], gates, undefined, decisionGraph);
+  const envelope = issueHerdrHandoff("goal", [bareWorker], gates, undefined, decisionGraph);
   const parsed = parseHerdrHandoff(envelope);
   assert.deepEqual(parsed.executionSpec, compiled, "envelope embeds the compiled spec");
-  assert.equal(parsed.planFingerprint, planFingerprint("goal", [legacyWorker], compiled));
+  assert.equal(parsed.planFingerprint, planFingerprint("goal", [bareWorker], compiled));
   // Graph-shaped issuance still validates the graph itself.
-  assert.throws(() => issueHerdrHandoff("goal", [legacyWorker], gates, undefined, { ...decisionGraph, scope: "" }), /decision_graph_invalid/);
-  assert.throws(() => issueHerdrHandoff("goal", [legacyWorker], gates, undefined, "not a graph"), /decision_graph_invalid/);
+  assert.throws(() => issueHerdrHandoff("goal", [bareWorker], gates, undefined, { ...decisionGraph, scope: "" }), /decision_graph_invalid/);
+  assert.throws(() => issueHerdrHandoff("goal", [bareWorker], gates, undefined, "not a graph"), /decision_graph_invalid/);
 });
 
 test("decision_graph and execution_spec are mutually exclusive at issuance", () => {
   const gates = { graph: "graph", handoff: "brief", critique: "independent" };
-  assert.throws(() => issueHerdrHandoff("goal", [legacyWorker], gates, { runtime: "node" }, decisionGraph), /decision_graph_exclusive/);
+  assert.throws(() => issueHerdrHandoff("goal", [bareWorker], gates, { runtime: "node" }, decisionGraph), /decision_graph_exclusive/);
   assert.throws(() => assertSpecSourceExclusive({ runtime: "node" }, decisionGraph), /decision_graph_exclusive/);
   assert.doesNotThrow(() => assertSpecSourceExclusive(undefined, decisionGraph));
   assert.doesNotThrow(() => assertSpecSourceExclusive({ runtime: "node" }, undefined));
@@ -534,32 +532,32 @@ test("invalid work graphs fail closed at issuance before any usable handoff is m
     { id: "a", objective: "do a", owns: ["src/a/"], depends_on: ["b"] },
     { id: "b", objective: "do b", owns: ["src/b/"], depends_on: ["a"] }
   ];
-  assert.throws(() => issueHerdrHandoff("goal", cyclic, graphGates), /work_graph_invalid.*cycle/);
-  assert.throws(() => issueHerdrHandoff("goal", [cyclic[0] as typeof cyclic[number]], graphGates), /unknown worker "b"/);
-  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates: graphGates, workers: cyclic }), /work_graph_invalid.*cycle/);
-  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates: graphGates, workers: [
+  assert.throws(() => issueHerdrHandoff("goal", cyclic, graphGates, { suite: "focused" }), /work_graph_invalid.*cycle/);
+  assert.throws(() => issueHerdrHandoff("goal", [cyclic[0] as typeof cyclic[number]], graphGates, { suite: "focused" }), /unknown worker "b"/);
+  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates: graphGates, executionSpec: { suite: "focused" }, workers: cyclic }), /work_graph_invalid.*cycle/);
+  assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates: graphGates, executionSpec: { suite: "focused" }, workers: [
     { id: "a", objective: "do a", owns: ["src/x.ts"], dependsOn: [] },
     { id: "b", objective: "do b", owns: ["src/x.ts"], dependsOn: [] }
   ] }), /both own "src\/x.ts"/);
 });
 
-test("valid multi-worker graphs round-trip their deterministic order and legacy one-worker plans stay intact", () => {
+test("valid multi-worker graphs round-trip their deterministic order and one-worker plans stay intact", () => {
   const chain = [
     { id: "a", objective: "do a", owns: ["src/"], dependsOn: [] },
     { id: "b", objective: "do b", owns: ["src/b/"], dependsOn: ["a"] }
   ];
-  const envelope = issueHerdrHandoff("goal", chain, graphGates);
+  const envelope = issueHerdrHandoff("goal", chain, graphGates, { suite: "focused" });
   const parsed = parseHerdrHandoff(envelope);
   assert.deepEqual(parsed.order, ["a", "b"], "the envelope's slices yield their deterministic dependency order");
   assert.deepEqual(parsed.workers.map((worker) => worker.id), ["a", "b"]);
   assert.equal("order" in JSON.parse(envelope), false, "the wire format stays frozen; order is derived, never embedded");
 
-  // Legacy one-worker plan: identical envelope shape plus the derived single-node order.
-  const legacy = issueHerdrHandoff("goal", [{ id: "w", objective: "ship", owns: ["src/**"], depends_on: [] }], graphGates);
-  const legacyParsed = parseHerdrHandoff(legacy);
-  assert.deepEqual(legacyParsed.order, ["w"]);
-  assert.deepEqual(legacyParsed.workers, [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]);
-  assert.equal(legacyParsed.planFingerprint, planFingerprint("goal", [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]), "legacy fingerprints are unchanged by graph validation");
+  // One-worker plan: identical envelope shape plus the derived single-node order.
+  const single = issueHerdrHandoff("goal", [{ id: "w", objective: "ship", owns: ["src/**"], depends_on: [] }], graphGates, { suite: "focused" });
+  const singleParsed = parseHerdrHandoff(single);
+  assert.deepEqual(singleParsed.order, ["w"]);
+  assert.deepEqual(singleParsed.workers, [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }]);
+  assert.equal(singleParsed.planFingerprint, planFingerprint("goal", [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }], { suite: "focused" }), "fingerprints are unchanged by graph validation");
 });
 
 test("parseHerdrHandoff fails closed on tampered graph structure", () => {
@@ -571,6 +569,7 @@ test("parseHerdrHandoff fails closed on tampered graph structure", () => {
     taskId: "task-forged",
     planFingerprint: "fp",
     gates: graphGates,
+    executionSpec: { suite: "focused" },
     workers: [
       { id: "x", objective: "do x", owns: ["src/x/"], dependsOn: ["y"] },
       { id: "y", objective: "do y", owns: ["src/y/"], dependsOn: ["x"] }
@@ -583,6 +582,7 @@ test("parseHerdrHandoff fails closed on tampered graph structure", () => {
     taskId: "task-forged",
     planFingerprint: "fp",
     gates: graphGates,
+    executionSpec: { suite: "focused" },
     workers: [
       { id: "x", objective: "do x", owns: ["src/shared.ts"], dependsOn: [] },
       { id: "y", objective: "do y", owns: ["src/shared.ts"], dependsOn: [] }
@@ -618,7 +618,7 @@ test("Lead contract defines the three-level adaptive planning policy with compac
   // Low risk permits compact planning: the four compact elements, not all nine Design Graph axes.
   assert.match(prompt, /Low risk[\s\S]*?compact planning is sufficient/);
   assert.match(prompt, /the problem, scope\/boundaries \(what may change and what must not\), intended behavior, and verification/);
-  assert.match(prompt, /a decision_graph or execution_spec and multi-worker decomposition are optional at this level/);
+  assert.match(prompt, /multi-worker decomposition is optional at this level, but an execution_spec or decision_graph is always required/);
   // The V4 planning gates and work-graph rules are not relaxed by adaptation.
   assert.match(prompt, /the planning gates \{graph, handoff, critique\} and the work-graph rules apply identically at every level; only planning depth adapts/);
 });
@@ -660,12 +660,12 @@ test("LEAD_PROTOCOL_REMINDER states the adaptive policy instead of unconditional
 
 // --- Adaptive worker effort (V5 Phase 2: per-run thinking follows assessed risk) ---
 
-test("Lead contract maps assessed risk to per-run worker effort: low→medium, medium/high→high", () => {
+test("Lead contract maps assessed risk to per-run worker effort: low→low, medium/high→high", () => {
   const prompt = buildLeadContract(undefined);
   // The action=run bullet names the exact per-run argument mapping.
-  assert.match(prompt, /action=run: submit the exact same goal[\s\S]*?worker_thinking=medium for low-risk plans, worker_thinking=high for medium\/high-risk plans/);
+  assert.match(prompt, /action=run: submit the exact same goal[\s\S]*?worker_thinking=low for low-risk plans, worker_thinking=high for medium\/high-risk plans/);
   // The planning protocol restates the mapping at the same assessed risk as planning depth.
-  assert.match(prompt, /Worker effort matches the same risk assessment: run low-risk plans with worker_thinking=medium and medium\/high-risk plans with worker_thinking=high/);
+  assert.match(prompt, /Worker effort matches the same risk assessment: run low-risk plans with worker_thinking=low and medium\/high-risk plans with worker_thinking=high/);
   // Adaptive effort is per-run guidance only, never a persisted decision.
   assert.match(prompt, /it applies to that run only/);
 });
@@ -689,7 +689,7 @@ test("DEFAULT_ORCHESTRATOR_CONFIG keeps the configurable workerThinking setting"
 });
 
 test("LEAD_PROTOCOL_REMINDER carries the adaptive worker-effort mapping", () => {
-  assert.match(LEAD_PROTOCOL_REMINDER, /worker_thinking=medium for low risk, worker_thinking=high for medium\/high/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /worker_thinking=low for low risk, worker_thinking=high for medium\/high/);
   assert.match(LEAD_PROTOCOL_REMINDER, /an explicit user setting wins, never rewrite persisted config/);
   // The Phase-1 planning-depth policy wording survives alongside the new effort rule.
   assert.match(LEAD_PROTOCOL_REMINDER, /plan at the assessed risk/);
@@ -705,7 +705,7 @@ function verifyRunFixture(id: string, tasks: Array<Record<string, unknown>>, sta
 }
 
 test("buildVerificationReport exposes exactly the four frozen dimensions and never a score or verdict", () => {
-  const envelope = issueHerdrHandoff("ship phase 5", [legacyWorker], verifyGates, undefined, decisionGraph);
+  const envelope = issueHerdrHandoff("ship phase 5", [bareWorker], verifyGates, undefined, decisionGraph);
   const report = buildVerificationReport({
     handoff: parseHerdrHandoff(envelope),
     run: verifyRunFixture("run-1", [{ id: "w1", status: "completed", task: `${envelope}\n\nfix` }]),
@@ -725,13 +725,12 @@ test("buildVerificationReport exposes exactly the four frozen dimensions and nev
 
 test("spec and design derive mechanically from the parsed handoff with nothing invented", () => {
   const compiled = compileDecisionGraph(assertDecisionGraph(decisionGraph));
-  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates, undefined, decisionGraph);
+  const envelope = issueHerdrHandoff("goal", [bareWorker], verifyGates, undefined, decisionGraph);
   const handoff = parseHerdrHandoff(envelope);
   const report = buildVerificationReport({ handoff, run: verifyRunFixture("run-1", [{ id: "w1", status: "running", task: envelope }]), workspace: {} });
   assert.equal(report.spec.taskId, handoff.taskId);
   assert.equal(report.spec.planFingerprint, handoff.planFingerprint);
   assert.deepEqual(report.spec.gates, verifyGates);
-  assert.equal(report.spec.specStatus, "present");
   assert.deepEqual(report.spec.executionSpec, compiled, "the compiled spec is reported verbatim");
   assert.deepEqual(Object.keys(report.spec.executionSpec ?? {}).sort(), DECISION_GRAPH_AXES.map((axis) => `decision.${axis}`).sort(), "no spec entries beyond the compiled graph are invented");
   assert.deepEqual(report.design.workers, handoff.workers, "design reports the authorized slices verbatim");
@@ -743,7 +742,7 @@ test("multi-worker reports cover the authorized slices in deterministic work-gra
     { id: "b", objective: "do b", owns: ["src/b/"], dependsOn: ["a"] },
     { id: "a", objective: "do a", owns: ["src/a/"], dependsOn: [] }
   ];
-  const envelope = issueHerdrHandoff("goal", chain, verifyGates);
+  const envelope = issueHerdrHandoff("goal", chain, verifyGates, { suite: "focused" });
   const handoff = parseHerdrHandoff(envelope);
   assert.deepEqual(handoff.order, ["a", "b"]);
   const tasks = [
@@ -756,17 +755,14 @@ test("multi-worker reports cover the authorized slices in deterministic work-gra
   assert.deepEqual(report.evidence.workers.map((worker) => worker.id), ["a", "b"]);
 });
 
-test("legacy handoffs without an execution spec report an explicit legacy-absent observation", () => {
-  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
-  const report = buildVerificationReport({ handoff: parseHerdrHandoff(envelope), run: verifyRunFixture("run-1", [{ id: "w1", status: "completed", task: envelope }]), workspace: {} });
-  assert.equal(report.spec.specStatus, "legacy-absent");
-  assert.equal("executionSpec" in report.spec, false, "no spec is invented for a legacy envelope");
-  assert.deepEqual(report.design.workers.map((worker) => worker.id), ["w1"], "every other dimension stays fully populated");
-  assert.equal(report.quality.workers.length, 1);
+test("spec-less legacy handoffs are rejected instead of reported", () => {
+  assert.throws(() => issueHerdrHandoff("goal", [bareWorker], verifyGates), /execution_spec_invalid/);
+  const forged = JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", authority: "Pi", taskId: "task-x", planFingerprint: "fp", gates: verifyGates, workers: [bareWorker] });
+  assert.throws(() => parseHerdrHandoff(forged), /execution_spec_invalid/);
 });
 
 test("quality reports observed lifecycle facts only and omits volatile timestamps", () => {
-  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const envelope = issueHerdrHandoff("goal", [bareWorker], verifyGates, { suite: "focused" });
   const handoff = parseHerdrHandoff(envelope);
   const build = (task: Record<string, unknown>): VerificationReport => buildVerificationReport({ handoff, run: verifyRunFixture("run-1", [task]), workspace: {} });
   // Volatile lifecycle timestamps never enter the report: two snapshots that
@@ -793,7 +789,7 @@ test("quality reports observed lifecycle facts only and omits volatile timestamp
 });
 
 test("evidence bounds workspace observations and worker evidence deterministically", () => {
-  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const envelope = issueHerdrHandoff("goal", [bareWorker], verifyGates, { suite: "focused" });
   const handoff = parseHerdrHandoff(envelope);
   const oversized = "x".repeat(VERIFICATION_OBSERVATION_MAX + 500);
   const report = buildVerificationReport({
@@ -815,7 +811,7 @@ test("evidence bounds workspace observations and worker evidence deterministical
 });
 
 test("the report is deterministic: repeated builds of the same observations serialize identically", () => {
-  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const envelope = issueHerdrHandoff("goal", [bareWorker], verifyGates, { suite: "focused" });
   const handoff = parseHerdrHandoff(envelope);
   const input = (): VerificationReportInput => ({
     handoff,
@@ -829,7 +825,7 @@ test("the report is deterministic: repeated builds of the same observations seri
 // --- verificationFingerprint (Phase 5 accept gate: freshness of the reviewed evidence) ---
 
 /** One shared envelope: fingerprints compare facts, so the plan identity must be identical across builds. */
-const fingerprintEnvelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+const fingerprintEnvelope = issueHerdrHandoff("goal", [bareWorker], verifyGates, { suite: "focused" });
 
 /** Deterministic base report for fingerprint coverage: one completed worker with fixed observations. */
 function fingerprintedReport(options: { task?: Record<string, unknown>; runStatus?: string; workspace?: { gitStatus?: string; gitDiff?: string } } = {}): VerificationReport {
@@ -887,7 +883,7 @@ test("verificationFingerprint: corrections, statuses, workspace git_diff, and wo
 });
 
 test("the pure builder refuses to invent facts for a missing authorized worker", () => {
-  const envelope = issueHerdrHandoff("goal", [legacyWorker], verifyGates);
+  const envelope = issueHerdrHandoff("goal", [bareWorker], verifyGates, { suite: "focused" });
   const handoff = parseHerdrHandoff(envelope);
   assert.throws(
     () => buildVerificationReport({ handoff, run: verifyRunFixture("run-1", [{ id: "someone-else", status: "completed", task: envelope }]), workspace: {} }),

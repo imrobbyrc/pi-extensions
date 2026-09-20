@@ -7,10 +7,11 @@ import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkerSlice } from "../provider/orchestrator.js";
+import { buildWorkerTask } from "./subagent-adapter.js";
 type HerdrWorker = WorkerSlice;
 
 type HerdrMcpAdapter = {
-  run(request: { goal: string; workers: HerdrWorker[]; workerModel?: string; workerThinking?: string; handoff?: string }): Promise<{ id: string; status: string; workers: Array<{ id: string; state: string }> }>;
+  run(request: { goal: string; workers: HerdrWorker[]; workerModel?: string; workerThinking?: string; handoff: string }): Promise<{ id: string; status: string; workers: Array<{ id: string; state: string }> }>;
   status(runId?: string): any;
   correct(runId: string, workerId: string, instructions: string): any;
   accept(runId: string, workerId: string): any;
@@ -91,9 +92,9 @@ const herdrGates = z.object({
   critique: herdrText(HERDR_ITEM_MAX)
 });
 
-/** Optional Phase-1 execution spec: a bounded string map, or omitted entirely (V3). */
+/** Phase-1 execution spec: a bounded non-empty string map (every plan carries one — directly or compiled from a decision graph). */
 export const herdrExecutionSpec = z.record(z.string().min(1).max(EXECUTION_SPEC_KEY_MAX), herdrText(EXECUTION_SPEC_VALUE_MAX))
-  .refine((spec) => Object.keys(spec).length >= 1 && Object.keys(spec).length <= EXECUTION_SPEC_MAX_ENTRIES, { message: `execution_spec must contain 1-${EXECUTION_SPEC_MAX_ENTRIES} entries or be omitted` });
+  .refine((spec) => Object.keys(spec).length >= 1 && Object.keys(spec).length <= EXECUTION_SPEC_MAX_ENTRIES, { message: `execution_spec must contain 1-${EXECUTION_SPEC_MAX_ENTRIES} entries` });
 
 /** Optional Phase-3 decision graph: exactly the nine bounded non-blank axes, extra keys rejected. */
 export const herdrDecisionGraph = z.strictObject(
@@ -102,12 +103,12 @@ export const herdrDecisionGraph = z.strictObject(
 
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
-  "plan — validate planning gates {graph, handoff, critique} and the decomposition as one legal work graph (unique worker ids, dependencies referencing existing workers, no cycles, and no overlapping ownership between workers that no dependency path serializes — invalid graphs fail closed with work_graph_invalid), then return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), execution_spec or decision_graph (whichever was provided), and envelope string verbatim. A decision_graph carries your planning decisions as exactly nine non-blank axes (problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique), is mutually exclusive with execution_spec, and is compiled deterministically into the plan's execution spec — worker slice lists derive from that compiled spec, so workers cannot invent requirements.",
+  "plan — validate planning gates {graph, handoff, critique} and the decomposition as one legal work graph (unique worker ids, dependencies referencing existing workers, no cycles, and no overlapping ownership between workers that no dependency path serializes — invalid graphs fail closed with work_graph_invalid), then return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), execution_spec or decision_graph (exactly one of which is required — a spec-less plan is rejected), and envelope string verbatim. A decision_graph carries your planning decisions as exactly nine non-blank axes (problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique), is mutually exclusive with execution_spec, and is compiled deterministically into the plan's execution spec — worker slice lists derive from that compiled spec, so workers cannot invent requirements.",
   "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's execution_spec or decision_graph verbatim (whichever the plan included — a changed, added, or removed decision_graph is rejected), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
   "accept — accept one completed worker's work: requires run_id, worker_id, the exact Pi-issued handoff envelope, and the verification_fingerprint returned by a prior verify; the report is recomputed from fresh evidence immediately before the mutation and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated. On match: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
-  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled execution spec and planning gates; explicit legacy-absent observation for spec-less envelopes), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or prompt/envelope mismatch fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
+  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled execution spec and planning gates), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or a worker prompt that does not byte-match the deterministic minimal contract recomputed from the envelope (projection or authorization binding drift) fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
   "stop — stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
   "Workers always run as Pi agents (kind=pi); openai-web worker models are rejected."
 ].join(" ");
@@ -155,9 +156,11 @@ function herdrErrorMessage(error: unknown): string {
  * Fail-closed binding of one exact Pi-issued handoff envelope to one actual
  * run snapshot: parse/validate the envelope through the existing parser, then
  * prove the authorized worker set matches the run's workers exactly and every
- * worker task prompt carries the exact envelope prefix (the prompt embeds the
- * envelope verbatim at run time, which itself carries the plan fingerprint).
- * Malformed/tampered envelopes, unknown or unobservable runs, worker-set
+ * observed worker prompt is byte-identical to the deterministic minimal
+ * contract (V5.1 projection + compact binding) recomputed from THIS envelope
+ * and THIS worker's authorized slice — the same shared renderer run used, so
+ * projection drift, a forged binding, or cross-worker prompt reuse all fail
+ * closed. Malformed/tampered envelopes, unknown or unobservable runs, worker-set
  * mismatch, or prompt mismatch all fail closed with verification-specific
  * errors. Pure: performs no adapter calls and mutates nothing.
  */
@@ -191,8 +194,12 @@ export function bindHerdrRunToHandoff(handoffText: string, runId: string, run: u
   }
   for (const task of tasks) {
     const prompt = task.task;
-    if (typeof prompt !== "string" || !prompt.startsWith(handoffText)) {
-      throw new Error(`herdr_verify_prompt_mismatch: worker ${JSON.stringify(task.id)} was not started from this exact handoff envelope (its task prompt does not carry the envelope prefix).`);
+    const worker = parsed.workers.find((authorized) => authorized.id === task.id);
+    // Recompute, never trust: the expected minimal contract is derived here
+    // from the validated envelope + authorized slice; a binding or projection
+    // observed in the run itself proves nothing.
+    if (!worker || typeof prompt !== "string" || prompt !== buildWorkerTask(worker, handoffText)) {
+      throw new Error(`herdr_verify_prompt_mismatch: worker ${JSON.stringify(task.id)} was not started from the deterministic minimal contract of this exact handoff (projection or authorization binding mismatch).`);
     }
   }
   return parsed;
@@ -359,7 +366,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           // what each worker is told — already fingerprint-bound to this exact
           // goal/workers/spec, so run-time args can never drift from the plan.
           const authorized = validateHerdrRunInput({ goal, workers, execution_spec, decision_graph, handoff });
-          const run = await deps.subagent.run({ goal, workers: authorized.workers, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}), ...(handoff ? { handoff } : {}) });
+          const run = await deps.subagent.run({ goal, workers: authorized.workers, handoff, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}) });
           return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
         }
         if (action === "status") {

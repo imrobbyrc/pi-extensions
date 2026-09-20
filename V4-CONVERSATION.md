@@ -3220,3 +3220,147 @@ All earlier checkpoints in this file remain intact as history. Where any earlier
 ### Next
 - Nothing pending for V4 Phases 1–5. Any future work starts from baseline `8d366b0ad03749e2c77ab29e09e4fe772b69de77` with a fresh plan.
 
+---
+
+## V5 Resume Checkpoint — 2026-09-20 (LATEST and AUTHORITATIVE)
+
+This section supersedes earlier baseline and next-step statements where they conflict. V4 Phases 1–5 remain landed and closed; V5 builds on those safety gates rather than replacing them.
+
+### Shipped V5 baseline
+- V5 adaptive planning and release documentation are landed and pushed through `c85cfb27c8dce7f577428fd4d8e770a3982a303f` (`origin/main` at time of this checkpoint).
+- Package `@imrobbyrc/pi-openai-web` version is `1.0.1`.
+- Planning depth is risk-adaptive while Design Thinking remains universal:
+  - low risk: compact `Problem → Scope/Boundaries → Behavior → Verification`;
+  - medium/high risk: full Design Graph (`Problem → Shapes → Graph → Cardinality → Boundaries → Behavior → Scope → Test Layers → Critique`);
+  - discovered complexity escalates the plan; an in-flight task must never be silently downgraded to bypass stronger gates.
+- V4 work-graph validation, observational verification, deterministic `verification_fingerprint`, fresh-evidence accept gate, correction lifecycle, and authoritative landing verification remain unchanged.
+
+### Adaptive worker effort — landed locally
+- Reviewed worker tip `97e42a575f14b1886f297bb3e02277d43ba3142f` is merged into local authoritative `main` by merge commit `b64216858a4364fa266cb0f017fc10498c336b79`.
+- Immediately before this documentation edit, local `main` was clean and `ahead 2` of `origin/main`; this adaptive-worker-effort merge has not yet been pushed at checkpoint time.
+- Worker effort now follows assessed risk per run:
+  - low risk → `worker_thinking=medium`;
+  - medium/high risk → `worker_thinking=high`;
+  - an explicit user-configured/requested thinking level wins verbatim;
+  - adaptive guidance never rewrites persisted configuration.
+- `WORKER_EXECUTION_INVARIANT` is injected into both Herdr and in-process worker instructions: Lead/parent plan is frozen; do not broaden or re-derive it; inspect only the owned slice; stop once every acceptance criterion has direct evidence; required verification may not be skipped; blockers are reported instead of expanding scope.
+- Serialization, handoff, WorkGraph, VerificationReport, fingerprint, accept freshness, and correction mechanics were not changed.
+
+### Verification evidence for adaptive worker effort
+- `packages/add/pi-openai-web/tests/orchestrator.test.ts`: 58/58 pass.
+- Full `pi-openai-web` suite: 238/238 pass.
+- `packages/core/pi-core-subagent/test/manager.test.ts`: 27/27 pass.
+- `tsc --noEmit`: clean in both packages.
+- Biome: clean.
+- `pi-core-subagent` test `worktree > removeByBranch` remains an environment-dependent pre-existing failure; worker verified identical failure with its changes stashed.
+- Merge scope is exactly four files: `orchestrator.ts`, `orchestrator.test.ts`, `manager.ts`, and `manager.test.ts`.
+
+### Remaining work
+1. Commit this checkpoint update, then push local `main` so `origin/main` includes `b6421685` and this documentation.
+2. Run one or two comparable low-risk tasks using `worker_thinking=medium` and record turns/tool calls against prior low-risk high-thinking runs. This is measurement only; do not claim reduced overthinking until evidence shows it.
+3. Escalate or revise worker policy only from measured results; do not add dual reviewers, scoring, or new orchestration machinery by default.
+
+### Authoritative baseline at checkpoint time
+- Local authoritative `main`: `b64216858a4364fa266cb0f017fc10498c336b79` plus this uncommitted documentation update.
+- Remote baseline before the pending push: `origin/main = c85cfb27c8dce7f577428fd4d8e770a3982a303f`.
+
+---
+
+## V5.1 Resume Checkpoint — 2026-09-20 (LATEST and AUTHORITATIVE)
+
+This checkpoint supersedes stale adaptive-effort wording above. V5 adaptive worker effort is now landed locally as `low → low`, `medium → high`, `high → high`; no adaptive path uses `worker_thinking=medium`.
+
+### Agreed V5.1 direction — minimal worker contract
+- Full Lead reasoning remains canonical Pi plan state: Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, Critique, fingerprint, and verification context.
+- Worker still receives a complete task-specific specification. It receives a compiled projection, not zero context:
+  - objective;
+  - owned paths/slice;
+  - requirements and invariants;
+  - relevant behavior/seams;
+  - forbidden scope;
+  - acceptance criteria;
+  - compact authorization/binding.
+- Worker must not receive duplicated full handoff JSON, full Design Graph, unrelated worker slices, or repeated prose already represented by the canonical contract.
+- Lead keeps the full plan for authority, tamper/fingerprint checks, verification, and semantic review. Worker executes only the frozen compiled slice.
+
+### Frozen worker contract invariants
+- Authority: Pi canonical plan and downstream runtime validation.
+- Adaptive decision when no explicit per-run thinking override exists:
+  - assessed low risk → `low`;
+  - assessed medium risk → `high`;
+  - assessed high risk → `high`.
+- Explicit `worker_thinking` is passed verbatim; adaptive policy never silently remaps it. Model capability validation remains downstream and fail-closed.
+- Worker owns only its assigned slice and stops after direct evidence for every acceptance criterion. It reports blockers instead of broadening scope or re-deriving architecture.
+- Scope for V5.1: worker-prompt projection and its binding/verification seam only. Do not modify manager, model adapter, serialization authority, persisted config semantics, or `validateThinking` unless a new plan explicitly authorizes it.
+
+### Decision matrix for implementation/tests
+| Input | Source | Expected result |
+|---|---|---|
+| no explicit override + low risk | adaptive policy | `low` |
+| no explicit override + medium risk | adaptive policy | `high` |
+| no explicit override + high risk | adaptive policy | `high` |
+| explicit `low` | user/run override | preserve `low`, then validate |
+| explicit `medium` | user/run override | preserve `medium`, validator decides support |
+| explicit `max` | user/run override | preserve `max`, then validate |
+| unsupported explicit value | downstream validator | reject; never remap |
+
+### Execution state
+- V5.1 worker execution was previously blocked by Herdr timeout; retry after Herdr reload/restart.
+- No V5.1 source implementation has been authorized or landed yet. Do not claim completion from this checkpoint alone.
+- First execution should use one bounded worker. Worker prompt must be compiled from the canonical plan and must omit full Lead-only reasoning while retaining enough local spec to implement without guessing.
+- Verify with focused tests, prompt-content assertions, binding/tamper fail-closed checks, and changed-path review. Record any overthinking evidence (turns, tool calls, corrections) rather than assuming improvement.
+
+### Explicitness decision still open
+- Do not infer explicitness from the value `high` alone. Current merged config does not preserve field provenance.
+- V5.1 must treat the agreed explicit per-run override semantics as authoritative. Persistent config provenance is a separate V5.2 decision and must not be smuggled into this scope.
+
+
+---
+
+## V5.1 Spec Revision — review feedback incorporated — 2026-09-20 (LATEST and AUTHORITATIVE)
+
+External review rated the V5.1 Lead spec ~8.8/10. Points below are now frozen into the spec. This section refines, and where conflicting supersedes, the wording above; the decision matrix and scope boundaries above remain unchanged.
+
+### Review points already resolved by the landed V5.1 implementation
+- **Redundancy (envelope JSON + slice lists + repeated prose in worker prompts):** resolved structurally. The worker prompt is now a compiled minimal contract only — objective, owned paths, authorized slice sections, scope boundary, compact authorization binding (`subagent-adapter.ts`: `buildWorkerTask`/`deriveWorkerBinding`). The envelope JSON, gates, execution spec, plan fingerprint, and other workers' material never enter a worker prompt; there is no second representation to drift.
+- **Lead plan vs worker contract separation:** landed as `Lead internal plan → compile → minimal immutable worker contract → execute → verify against original Lead plan`. Full Design Graph/critique/reasoning stays in Pi plan state for review; workers get the frozen compiled slice only.
+
+### Formalized precedence invariant (disambiguating "requests/configures")
+Frozen reading for V5.1, in strict order:
+
+1. **Explicit per-run override** — a `worker_thinking` argument supplied to `herdr action=run` (or an explicit user request in the current turn): passed verbatim; adaptive policy MUST NOT rewrite it; downstream model capability validation stays authoritative and fail-closed (never remap).
+2. **Adaptive risk mapping** (only when no explicit per-run override exists): assessed low → `low`; medium → `high`; high → `high`.
+3. **Configured/default fallback** — the persisted `workerThinking` profile value is context shown to the Lead (`the profile default, not a per-run decision`); it is NOT by itself an explicit override. Whether persisted-config provenance can ever count as explicit is the separate V5.2 decision; V5.1 must not smuggle it in, and explicitness must never be inferred from the value `high` alone.
+
+Adaptive literals are the chosen values for currently supported target models — portability is guaranteed by the downstream validator, not by the literals themselves.
+
+### Behavioral acceptance (decision matrix now mechanically covered)
+- Adaptive rows are Lead-guidance by design and stay covered by contract-text assertions in `orchestrator.test.ts` (low→low, medium/high→high; there is no mechanical thinking injector to test).
+- Explicit rows are now covered mechanically in `subagent-adapter.test.ts`: an explicit `worker_thinking` reaches the controller task verbatim (even values like `medium` that no current model advertises — the adapter never remaps or drops), and an omitted `worker_thinking` injects no thinking field at all.
+
+### Naming discipline for future Lead gates
+Gate prose must not reuse the words `low`/`medium`/`high` risk for a different concept than the assessed task risk input. Where a gate describes the risk of the change itself (e.g. cross-surface behavior complexity), name it distinctly — `changeRisk` — so gate wording cannot be confused with the adaptive policy input.
+
+### Status
+- V5.1 implementation landed this session: minimal worker contract + binding, shared run/verify renderer, exact-equality fail-closed prompt verification, tests A–G green (focused suites 64/64, package 241/241, `tsc --noEmit` clean).
+- Still open, unchanged: V5.2 config provenance; measured overthinking evidence (turns/tool calls) from comparable low-risk runs before any claim of improvement.
+
+---
+
+## Legacy Support Removal — 2026-09-20 (LATEST and AUTHORITATIVE)
+
+User decision: no backward compatibility needed; legacy paths are removed.
+
+### Removed
+- **Spec-less handoff envelopes (V3 "legacy-absent")**: `assertExecutionSpec` now rejects `undefined` — every plan MUST carry an `execution_spec` or `decision_graph` (compiled into a spec) at issue, parse, and run time. `VerificationReport.spec` drops `specStatus`; `executionSpec` is always present. `ParsedHerdrHandoff.executionSpec` is required.
+- **Handoff-less `adapter.run`**: `handoff` is now a required argument (type + runtime fail-closed `herdr_run_handoff_required`). Every worker prompt always carries the deterministic authorization binding; `buildWorkerTask(worker, handoffText)` takes a required handoff.
+- **Persisted-config `enabled` field tolerance**: the `enabled: _legacy` stripping in `loadOrchestratorState` is gone; config files load as-is with defaults merged.
+
+### Unchanged (current features, not legacy)
+- Metadata-free workers (no requirements/behaviors/seams/acceptance) remain fully legal — renamed fixtures `legacyWorker` → `bareWorker` to kill the misleading name.
+- Decision-graph compilation, fingerprints, V5.1 minimal worker contract + binding, verify/accept freshness, adaptive worker effort (`low→low`, `medium/high→high`; explicit per-run override verbatim) — all intact.
+
+### Verification
+- Focused suites (orchestrator, herdr-gate, subagent-adapter, herdr-review-flow): 123/123 pass.
+- Full `pi-openai-web` suite: 242/242 pass. `tsc --noEmit` clean in all workspaces.
+- New fail-closed tests: spec-less issuance and parsing rejected; spec-less run rejected; handoff-less run rejected.

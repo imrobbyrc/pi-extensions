@@ -8,29 +8,28 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const gates = { graph: "graph", handoff: "handoff", critique: "critique" };
 const base = { goal: "fix bug", workers: [{ id: "w1", objective: "fix", owns: ["src"], depends_on: [] }] };
-const validHandoff = issueHerdrHandoff(base.goal, base.workers, gates);
+const spec = { runtime: "node>=20", suite: "focused" };
+const validHandoff = issueHerdrHandoff(base.goal, base.workers, gates, spec);
 
 test("herdr run requires complete planning handoff", () => {
   assert.throws(() => validateHerdrRunInput(base), /handoff/);
-  assert.throws(() => validateHerdrRunInput({ ...base, handoff: "{}" }), /handoff/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: "{}" }), /handoff/);
 });
 
 test("herdr run handoff is task-bound to the exact goal and workers", () => {
-  assert.doesNotThrow(() => validateHerdrRunInput({ ...base, handoff: validHandoff }));
+  assert.doesNotThrow(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: validHandoff }));
   // Different worker decomposition → fingerprint mismatch.
-  assert.throws(() => validateHerdrRunInput({ ...base, workers: [{ ...base.workers[0], id: "w2" }], handoff: validHandoff }), /fingerprint/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, workers: [{ ...base.workers[0], id: "w2" }], handoff: validHandoff }), /fingerprint/);
   // Different goal → fingerprint mismatch.
-  assert.throws(() => validateHerdrRunInput({ ...base, goal: "other goal", handoff: validHandoff }), /fingerprint/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, goal: "other goal", handoff: validHandoff }), /fingerprint/);
   // Envelope minted for another plan is rejected.
-  const otherHandoff = issueHerdrHandoff("other goal", base.workers, gates);
-  assert.throws(() => validateHerdrRunInput({ ...base, handoff: otherHandoff }), /fingerprint/);
+  const otherHandoff = issueHerdrHandoff("other goal", base.workers, gates, spec);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: otherHandoff }), /fingerprint/);
   // Tampered taskId still fails structural parsing.
-  assert.throws(() => validateHerdrRunInput({ ...base, handoff: validHandoff.replace(/"taskId":"[^"]+"/, '"taskId":""') }), /handoff/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: validHandoff.replace(/"taskId":"[^"]+"/, '"taskId":""') }), /handoff/);
 });
 
-// --- Optional execution_spec binding (Phase 1) ---
-
-const spec = { runtime: "node>=20", suite: "focused" };
+// --- Required execution_spec binding (Phase 1; spec-less legacy envelopes are rejected) ---
 
 test("herdr run binds execution_spec into the plan immutably", () => {
   const handoff = issueHerdrHandoff(base.goal, base.workers, gates, spec);
@@ -38,15 +37,20 @@ test("herdr run binds execution_spec into the plan immutably", () => {
   assert.doesNotThrow(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff }));
   // Key order at run time is irrelevant (deterministic canonicalization).
   assert.doesNotThrow(() => validateHerdrRunInput({ ...base, execution_spec: { suite: spec.suite, runtime: spec.runtime }, handoff }));
-  // Removing the spec after plan fails closed.
-  assert.throws(() => validateHerdrRunInput({ ...base, handoff }), /execution_spec differs/);
+  // Removing the spec after plan fails closed (the spec requirement fires first).
+  assert.throws(() => validateHerdrRunInput({ ...base, handoff }), /execution_spec/);
   // Changing one value after plan fails closed.
   assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: { ...spec, suite: "full" }, handoff }), /execution_spec differs/);
-  // Adding a spec that was never planned fails closed against a no-spec envelope.
-  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: validHandoff }), /execution_spec differs/);
+  // A spec minted for a different plan still fails closed on the fingerprint.
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: issueHerdrHandoff("other goal", base.workers, gates, spec) }), /fingerprint/);
 });
 
-test("execution_spec fingerprints are order-independent and spec-less V3 hashes stay intact", () => {
+test("spec-less plan issuance and parsing are rejected outright", () => {
+  assert.throws(() => issueHerdrHandoff(base.goal, base.workers, gates), /execution_spec_invalid/);
+  assert.throws(() => parseHerdrHandoff(JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", authority: "Pi", taskId: "t", planFingerprint: "fp", gates, workers: base.workers })), /execution_spec_invalid/);
+});
+
+test("execution_spec fingerprints are order-independent", () => {
   assert.equal(planFingerprint(base.goal, base.workers, { a: "1", b: "2" }), planFingerprint(base.goal, base.workers, { b: "2", a: "1" }));
   assert.notEqual(planFingerprint(base.goal, base.workers, spec), planFingerprint(base.goal, base.workers));
   assert.equal(planFingerprint(base.goal, base.workers, undefined), planFingerprint(base.goal, base.workers));
@@ -87,15 +91,15 @@ test("execution_spec schema bounds at the MCP boundary", () => {
 const sliceWorker = { id: "w1", objective: "fix", owns: ["src"], depends_on: [], requirements: ["no new dependencies"], behaviors: ["fail closed on metadata drift"], seams: ["MCP herdr tool boundary"], acceptance: ["focused tests pass"] };
 
 test("herdr run binds worker slice metadata into the plan immutably", () => {
-  const handoff = issueHerdrHandoff(base.goal, [sliceWorker], gates);
+  const handoff = issueHerdrHandoff(base.goal, [sliceWorker], gates, spec);
   // Exact same goal/workers/slice → accepted.
-  assert.doesNotThrow(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], handoff }));
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], execution_spec: spec, handoff }));
   // Dropping metadata after plan fails closed.
-  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [base.workers[0]], handoff }), /fingerprint/);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [base.workers[0]], execution_spec: spec, handoff }), /fingerprint/);
   // Changing one metadata item after plan fails closed.
-  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [{ ...sliceWorker, requirements: ["new dependencies allowed"] }], handoff }), /fingerprint/);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [{ ...sliceWorker, requirements: ["new dependencies allowed"] }], execution_spec: spec, handoff }), /fingerprint/);
   // Adding metadata that was never planned fails closed against a metadata-free envelope.
-  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], handoff: validHandoff }), /fingerprint/);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], execution_spec: spec, handoff: validHandoff }), /fingerprint/);
 });
 
 test("worker slice metadata coexists with execution_spec in one immutable plan", () => {
@@ -109,11 +113,11 @@ test("worker slice metadata coexists with execution_spec in one immutable plan",
 });
 
 test("herdr run returns the envelope's authorized slices as the single source of truth", () => {
-  const handoff = issueHerdrHandoff(base.goal, [sliceWorker], gates);
-  const { workers } = validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], handoff });
+  const handoff = issueHerdrHandoff(base.goal, [sliceWorker], gates, spec);
+  const { workers } = validateHerdrRunInput({ goal: base.goal, workers: [sliceWorker], execution_spec: spec, handoff });
   assert.deepEqual(workers, [{ id: "w1", objective: "fix", owns: ["src"], dependsOn: [], requirements: ["no new dependencies"], behaviors: ["fail closed on metadata drift"], seams: ["MCP herdr tool boundary"], acceptance: ["focused tests pass"] }]);
   // Run args spelled with dependsOn canonicalize to the same authorized slice.
-  const respelled = validateHerdrRunInput({ goal: base.goal, workers: [{ ...sliceWorker, dependsOn: sliceWorker.depends_on, depends_on: undefined }], handoff });
+  const respelled = validateHerdrRunInput({ goal: base.goal, execution_spec: spec, workers: [{ ...sliceWorker, dependsOn: sliceWorker.depends_on, depends_on: undefined }], handoff });
   assert.deepEqual(respelled.workers, workers);
 });
 
@@ -162,9 +166,9 @@ test("herdr plan/run bind decision_graph immutably through the compiled spec", (
   assert.doesNotThrow(() => validateHerdrRunInput({ ...base, decision_graph: reshuffled, handoff }));
   // Changed axis after plan fails closed.
   assert.throws(() => validateHerdrRunInput({ ...base, decision_graph: { ...decisionGraph, scope: "everything" }, handoff }), /decision_graph differs/);
-  // Removed graph after plan fails closed.
-  assert.throws(() => validateHerdrRunInput({ ...base, handoff }), /execution_spec differs/);
-  // Added graph to a graph-less plan fails closed.
+  // Removed graph after plan fails closed (the spec requirement fires first).
+  assert.throws(() => validateHerdrRunInput({ ...base, handoff }), /execution_spec/);
+  // Added graph against a direct-spec plan fails closed.
   assert.throws(() => validateHerdrRunInput({ ...base, decision_graph: decisionGraph, handoff: validHandoff }), /decision_graph differs/);
   // Added graph to a direct-spec plan fails closed.
   const specHandoff = issueHerdrHandoff(base.goal, base.workers, gates, spec);
@@ -194,12 +198,12 @@ const chain = [
 ];
 
 function forgedEnvelope(workers: unknown[]): string {
-  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", authority: "Pi", taskId: "task-forged", planFingerprint: "fp", gates, workers });
+  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", authority: "Pi", taskId: "task-forged", planFingerprint: "fp", gates, executionSpec: spec, workers });
 }
 
 test("herdr run accepts a dependency-serialized chain and returns its deterministic order", () => {
-  const handoff = issueHerdrHandoff(base.goal, chain, gates);
-  const authorized = validateHerdrRunInput({ goal: base.goal, workers: chain, handoff });
+  const handoff = issueHerdrHandoff(base.goal, chain, gates, spec);
+  const authorized = validateHerdrRunInput({ goal: base.goal, workers: chain, execution_spec: spec, handoff });
   assert.deepEqual(authorized.order, ["a", "b"], "graph-derived ordering metadata rides along with the authorized slices");
   assert.deepEqual(authorized.workers.map((worker) => worker.id), ["a", "b"]);
   // Independent disjoint workers are equally legal at the run boundary.
@@ -207,8 +211,8 @@ test("herdr run accepts a dependency-serialized chain and returns its determinis
     { id: "x", objective: "do x", owns: ["src/x.ts"], depends_on: [] },
     { id: "y", objective: "do y", owns: ["docs/"], depends_on: [] }
   ];
-  const independentHandoff = issueHerdrHandoff(base.goal, independent, gates);
-  assert.deepEqual(validateHerdrRunInput({ goal: base.goal, workers: independent, handoff: independentHandoff }).order, ["x", "y"]);
+  const independentHandoff = issueHerdrHandoff(base.goal, independent, gates, spec);
+  assert.deepEqual(validateHerdrRunInput({ goal: base.goal, workers: independent, execution_spec: spec, handoff: independentHandoff }).order, ["x", "y"]);
 });
 
 test("herdr run fails closed on graph-invalid decompositions before fingerprint comparison", () => {
@@ -248,13 +252,13 @@ test("herdr run fails closed on tampered envelopes whose workers no longer form 
     { id: "x", objective: "do x", owns: ["src/x/"], dependsOn: ["y"] },
     { id: "y", objective: "do y", owns: ["src/y/"], dependsOn: ["x"] }
   ]);
-  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: chain, handoff: cyclicEnvelope }), /work_graph_invalid: dependency cycle/);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: chain, execution_spec: spec, handoff: cyclicEnvelope }), /work_graph_invalid: dependency cycle/);
   // Forged unordered ownership overlap inside the envelope.
   const overlapEnvelope = forgedEnvelope([
     { id: "x", objective: "do x", owns: ["src/shared.ts"], dependsOn: [] },
     { id: "y", objective: "do y", owns: ["src/shared.ts"], dependsOn: [] }
   ]);
-  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: chain, handoff: overlapEnvelope }), /both own "src\/shared.ts"/);
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: chain, execution_spec: spec, handoff: overlapEnvelope }), /both own "src\/shared.ts"/);
 });
 
 test("herdr workers schema bounds the decomposition to the shared 1-4 work-graph cardinality", () => {
@@ -286,7 +290,7 @@ function fakeController(throwOnRun = false) {
   return { controller: controller as unknown as SubagentController, calls };
 }
 
-const herdrRequest = { goal: "fix the bug", workers: [{ id: "w1", objective: "fix", owns: ["src"], dependsOn: [] }] };
+const herdrRequest = { goal: "fix the bug", workers: [{ id: "w1", objective: "fix", owns: ["src"], dependsOn: [] }], handoff: issueHerdrHandoff("fix the bug", [{ id: "w1", objective: "fix", owns: ["src"], dependsOn: [] }], gates, spec) };
 
 function gate(
   ui: { hasUI: boolean; confirm: (title: string, message: string) => Promise<boolean> } | undefined,
@@ -344,7 +348,7 @@ test("herdr run fails closed when no gate is wired at all", async () => {
 
 test("failed controller startup does not consume handoff", async () => {
   const { controller, calls } = fakeController(true);
-  const handoff = issueHerdrHandoff(herdrRequest.goal, herdrRequest.workers, gates);
+  const handoff = issueHerdrHandoff(herdrRequest.goal, herdrRequest.workers, gates, spec);
   const request = { ...herdrRequest, handoff };
   const adapter = new SubagentMcpAdapter(controller, () => session, gate(undefined, true));
   await assert.rejects(adapter.run(request), /controller_start_failed/);

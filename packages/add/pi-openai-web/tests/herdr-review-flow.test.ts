@@ -5,8 +5,9 @@ import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { SubagentMcpAdapter } from "../src/mcp/subagent-adapter.js";
+import { SubagentMcpAdapter, buildWorkerTask } from "../src/mcp/subagent-adapter.js";
 import { createHarnessMcpFactory, HERDR_TOOL_DESCRIPTION } from "../src/mcp/server.js";
+import type { WorkerSlice } from "../src/provider/orchestrator.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -450,6 +451,7 @@ test("herdr accept: one verify fingerprint accepts worker A then worker B while 
   const planned = parseToolText(await herdr.handler({
     action: "plan",
     goal: "ship",
+    execution_spec: { suite: "focused" },
     workers: [
       { id: "wa", objective: "core", owns: ["src/core/**"], depends_on: [] },
       { id: "wb", objective: "tests", owns: ["tests/**"], depends_on: [] }
@@ -458,14 +460,15 @@ test("herdr accept: one verify fingerprint accepts worker A then worker B while 
   }));
   assert.equal(planned.ok, true);
   const envelope = planned.handoff as string;
-  const workerPrompt = (objective: string, owns: string) => `${envelope}\n\n${objective}\n\nOwned paths (must not modify outside these paths): ${owns}`;
+  // V5.1: each observed prompt is the deterministic minimal contract for its worker.
+  const workerTask = (id: string, objective: string, owns: string) => buildWorkerTask({ id, objective, owns: [owns], dependsOn: [] }, envelope);
   harness.setRun({
     id: "run-1",
     runtime: "herdr",
     status: "completed",
     tasks: [
-      { id: "wa", status: "completed", runtime: "herdr", task: workerPrompt("core", "src/core/**"), corrections: 0, changedFiles: ["src/core/thing.ts"], diffStat: "1 file changed" },
-      { id: "wb", status: "completed", runtime: "herdr", task: workerPrompt("tests", "tests/**"), corrections: 0, changedFiles: ["tests/thing.test.ts"], diffStat: "1 file changed" }
+      { id: "wa", status: "completed", runtime: "herdr", task: workerTask("wa", "core", "src/core/**"), corrections: 0, changedFiles: ["src/core/thing.ts"], diffStat: "1 file changed" },
+      { id: "wb", status: "completed", runtime: "herdr", task: workerTask("wb", "tests", "tests/**"), corrections: 0, changedFiles: ["tests/thing.test.ts"], diffStat: "1 file changed" }
     ]
   });
   const reviewed = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
@@ -508,7 +511,7 @@ test("herdr correct handler surfaces the task-scoped correction round count", as
 
 const planGates = { graph: "graph", handoff: "brief", critique: "independent" };
 
-/** Adapter-shaped run fixture: each worker task prompt carries the exact envelope prefix (as SubagentMcpAdapter serializes it at run time). */
+/** Adapter-shaped run fixture: each worker task prompt is the deterministic minimal contract (as SubagentMcpAdapter serializes it at run time). */
 function verifyRunFor(envelope: string, workerId: string, objective: string, owns: string, taskExtra: Record<string, unknown> = {}) {
   return {
     id: "run-1",
@@ -518,7 +521,7 @@ function verifyRunFor(envelope: string, workerId: string, objective: string, own
       id: workerId,
       status: "completed",
       runtime: "herdr",
-      task: `${envelope}\n\n${objective}\n\nOwned paths (must not modify outside these paths): ${owns}`,
+      task: buildWorkerTask({ id: workerId, objective, owns: [owns], dependsOn: [] }, envelope),
       corrections: 1,
       changedFiles: ["src/thing.ts"],
       diffStat: "1 file changed",
@@ -528,7 +531,7 @@ function verifyRunFor(envelope: string, workerId: string, objective: string, own
 }
 
 async function planEnvelope(herdr: RegisteredTool["handler"], workerId = "w1"): Promise<string> {
-  const planned = parseToolText(await herdr({ action: "plan", goal: "ship", workers: [{ id: workerId, objective: "ship", owns: ["src/**"], depends_on: [] }], gates: planGates }));
+  const planned = parseToolText(await herdr({ action: "plan", goal: "ship", execution_spec: { suite: "focused" }, workers: [{ id: workerId, objective: "ship", owns: ["src/**"], depends_on: [] }], gates: planGates }));
   assert.equal(planned.ok, true);
   return planned.handoff as string;
 }
@@ -592,9 +595,29 @@ test("herdr verify fails closed on malformed handoffs, worker-set mismatch, prom
   // A different plan's envelope authorizes a different worker set.
   const other = await planEnvelope(herdr.handler, "w2");
   await assert.rejects(herdr.handler({ action: "verify", run_id: "run-1", handoff: other }), /herdr_verify_worker_mismatch/);
-  // Valid envelope, but the run was not started from it (no envelope prompt prefix).
-  harness.setRun({ id: "run-1", runtime: "herdr", status: "completed", tasks: [{ id: "w1", status: "completed", task: "just the objective, no envelope" }] });
-  await assert.rejects(herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }), /herdr_verify_prompt_mismatch/);
+  // Valid envelope + minimal-contract prompts verify (fixture sanity for this shape).
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope });
+  // Fail-closed prompt tampering: verify recomputes the expected minimal
+  // contract from THIS envelope + slice, so every drift below is rejected.
+  const slice: WorkerSlice = { id: "w1", objective: "ship", owns: ["src/**"], dependsOn: [] };
+  const flipBinding = (task: string) => task.replace(/Authorization binding: ([0-9a-f])/, (_match, first: string) => `Authorization binding: ${(Number.parseInt(first, 16) ^ 1).toString(16)}`);
+  const tampers: Array<[string, string]> = [
+    ["no contract at all", "just the objective, no contract"],
+    ["forged binding", flipBinding(buildWorkerTask(slice, envelope))],
+    ["changed objective", buildWorkerTask({ ...slice, objective: "smuggled objective" }, envelope)],
+    ["changed owned path", buildWorkerTask({ ...slice, owns: ["other/**"] }, envelope)],
+    ["changed acceptance", buildWorkerTask({ ...slice, acceptance: ["invented acceptance"] }, envelope)],
+    ["unrelated worker's projection", buildWorkerTask({ ...slice, id: "w9", objective: "another worker", owns: ["elsewhere/**"] }, envelope)]
+  ];
+  for (const [label, task] of tampers) {
+    harness.setRun({ id: "run-1", runtime: "herdr", status: "completed", tasks: [{ id: "w1", status: "completed", task }] });
+    await assert.rejects(
+      herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }),
+      { message: /herdr_verify_prompt_mismatch/, name: "Error" },
+      `${label} must fail closed with herdr_verify_prompt_mismatch`
+    );
+  }
   // Unknown run id.
   await assert.rejects(herdr.handler({ action: "verify", run_id: "run-404", handoff: envelope }), /herdr_verify_run_unavailable/);
   // Missing required arguments.

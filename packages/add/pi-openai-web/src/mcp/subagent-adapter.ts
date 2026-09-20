@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
-import { WORKER_METADATA_FIELDS, type WorkerMetadataField, type WorkerSlice } from "../provider/orchestrator.js";
+import { WORKER_METADATA_FIELDS, canonicalWorkers, type WorkerMetadataField, type WorkerSlice } from "../provider/orchestrator.js";
 
 // Structural snapshots (controller is typed loosely by the local .d.ts; the
 // shapes come from @imrobbyrc/pi-core-subagent TaskSnapshot/RunSnapshot).
@@ -68,6 +69,42 @@ export function renderWorkerSliceSections(slice: Pick<WorkerSlice, "requirements
 }
 
 /**
+ * V5.1 compact deterministic authorization binding: SHA-256 over the exact
+ * validated canonical handoff text and the exact authorized worker slice.
+ * Recomputed at verify time from the supplied envelope — never accepted from
+ * a worker or a caller. Changes when the handoff, the slice, or the worker
+ * identity changes; complements (never replaces) the plan fingerprint.
+ */
+export function deriveWorkerBinding(handoffText: string, worker: WorkerSlice): string {
+  // NUL separator: JSON text can never contain a raw NUL, so the envelope and
+  // the slice cannot be re-cut against each other.
+  return createHash("sha256").update(`${handoffText}\u0000${canonicalWorkers([worker])}`).digest("hex");
+}
+
+/** Fixed forbidden-scope instruction every minimal worker contract carries. */
+const WORKER_SCOPE_BOUNDARY = "Scope boundary:\nModify only your authorized owned paths. Do not expand scope and do not inspect unrelated implementation unless the authorized task requires it.";
+
+/**
+ * V5.1 minimal worker contract: a deterministic projection of ONLY this
+ * worker's authorized slice — objective, owned paths, declarative slice
+ * sections, scope boundary — plus the compact authorization binding derived
+ * from the exact Pi-issued handoff. Never the full envelope, gates, spec,
+ * plan fingerprint, or any other worker's material. Run and verify share this
+ * single renderer, so any projection or binding drift fails closed.
+ */
+export function buildWorkerTask(worker: WorkerSlice, handoffText: string): string {
+  return [
+    worker.objective,
+    `Owned paths:\n${worker.owns.map((path) => `- ${path}`).join("\n")}`,
+    renderWorkerSliceSections(worker),
+    WORKER_SCOPE_BOUNDARY,
+    `Authorization binding: ${deriveWorkerBinding(handoffText, worker)}`
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/**
  * Explicit confirmation boundary for `herdr run`: `ui` yields the captured
  * session UI when one exists; `autoApprove` is true only when the operator
  * explicitly enabled headless auto-approval (`harnessAutoApproveHerdrRun`).
@@ -88,7 +125,7 @@ export class SubagentMcpAdapter {
     private readonly gate?: HerdrRunGateSource
   ) {}
 
-  async run(request: { goal: string; workers: WorkerSlice[]; workerModel?: string; workerThinking?: string; handoff?: string }) {
+  async run(request: { goal: string; workers: WorkerSlice[]; workerModel?: string; workerThinking?: string; handoff: string }) {
     const ctx = this.context();
     if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before delegating work.");
     // Confirmation boundary: the only paths past this point are an explicit
@@ -106,27 +143,26 @@ export class SubagentMcpAdapter {
     // Replay guard: check before the synchronous controller call. Mark only
     // after success so startup failures remain retryable; no await occurs
     // between check and run, so concurrent duplicates cannot both pass.
-    const handoff = request.handoff?.trim();
-    if (handoff && this.consumedHandoffs.has(handoff)) {
+    const handoff = request.handoff.trim();
+    if (!handoff) throw new Error("herdr_run_handoff_required: every worker contract is bound to the Pi-issued handoff envelope.");
+    if (this.consumedHandoffs.has(handoff)) {
       throw new Error("orchestration_handoff_replay: handoff already consumed.");
     }
-    const tasks = request.workers.map((worker) => {
-      // Prompt propagation serializes the already-authorized slice — the exact
-      // metadata bound into the plan fingerprint and handoff envelope.
-      const sliceSections = renderWorkerSliceSections(worker);
-      return {
-        id: worker.id,
-        agent: worker.id,
-        task: `${request.handoff ? `${request.handoff}\n\n` : ""}${worker.objective}\n\nOwned paths (must not modify outside these paths): ${worker.owns.join(", ")}${sliceSections ? `\n\n${sliceSections}` : ""}`,
-        write: true,
-        ...(request.workerModel ? { model: request.workerModel } : {}),
-        ...(request.workerThinking ? { thinking: request.workerThinking } : {}),
-        ...(worker.dependsOn.length ? { needs: worker.dependsOn } : {})
-      };
-    });
-    // Tasks mode rejects top-level prompt; planning context travels with each task.
+    const tasks = request.workers.map((worker) => ({
+      id: worker.id,
+      agent: worker.id,
+      // V5.1: the worker receives ONLY its deterministic minimal contract —
+      // authorized slice projection + compact binding — never the full
+      // handoff envelope or any Lead-only planning state.
+      task: buildWorkerTask(worker, request.handoff),
+      write: true,
+      ...(request.workerModel ? { model: request.workerModel } : {}),
+      ...(request.workerThinking ? { thinking: request.workerThinking } : {}),
+      ...(worker.dependsOn.length ? { needs: worker.dependsOn } : {})
+    }));
+    // Tasks mode rejects top-level prompt; the worker contract travels with each task.
     const run = this.controller.run({ tasks, runtime: "herdr" }, ctx);
-    if (handoff) this.consumedHandoffs.add(handoff);
+    this.consumedHandoffs.add(handoff);
     return { id: run.id, status: run.status, workers: run.tasks.map((task: { id: string; status: string }) => ({ id: task.id, state: task.status })) };
   }
 

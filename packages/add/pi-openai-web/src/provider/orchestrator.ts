@@ -252,7 +252,7 @@ export function assertWorkGraph(slices: WorkerSlice[]): WorkGraph {
   return { workers: slices, order };
 }
 
-/** Canonical worker JSON: stable equality across dependsOn/depends_on spellings; present slice metadata is appended in fixed field order, so metadata-free workers hash byte-identically to the legacy form. */
+/** Canonical worker JSON: stable equality across dependsOn/depends_on spellings; present slice metadata is appended in fixed field order, so metadata-free workers serialize deterministically. */
 export function canonicalWorkers(workers: unknown[]): string {
   return JSON.stringify((workers as Array<Record<string, unknown>>).map((worker) => {
     const canonical: Record<string, unknown> = {
@@ -279,14 +279,15 @@ export const EXECUTION_SPEC_KEY_MAX = 100;
 export const EXECUTION_SPEC_VALUE_MAX = 2_000;
 
 /**
- * Validate a present execution spec and return it in canonical (sorted-key)
- * form; `undefined` passes through unchanged so spec-less V3 plans keep working.
+ * Validate the required execution spec and return it in canonical (sorted-key)
+ * form. Every plan must carry one — directly or compiled from a decision
+ * graph; spec-less legacy envelopes are no longer issued or accepted.
  */
-export function assertExecutionSpec(spec: unknown): ExecutionSpec | undefined {
-  if (spec === undefined) return undefined;
+export function assertExecutionSpec(spec: unknown): ExecutionSpec {
+  if (spec === undefined) throw new Error("execution_spec_invalid: an execution_spec or decision_graph is required (spec-less legacy envelopes are no longer supported)");
   if (typeof spec !== "object" || spec === null || Array.isArray(spec)) throw new Error("execution_spec_invalid: expected an object mapping string keys to string values");
   const entries = Object.entries(spec as Record<string, unknown>);
-  if (entries.length < 1) throw new Error("execution_spec_invalid: provide at least one entry or omit execution_spec entirely");
+  if (entries.length < 1) throw new Error("execution_spec_invalid: provide at least one entry");
   if (entries.length > EXECUTION_SPEC_MAX_ENTRIES) throw new Error(`execution_spec_invalid: at most ${EXECUTION_SPEC_MAX_ENTRIES} entries`);
   const normalized: ExecutionSpec = {};
   for (const [key, value] of entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
@@ -404,7 +405,7 @@ export interface ParsedHerdrHandoff {
   gates: OrchestrationGates;
   workers: WorkerSlice[];
   order: string[];
-  executionSpec?: ExecutionSpec;
+  executionSpec: ExecutionSpec;
 }
 
 export function parseHerdrHandoff(text: string): ParsedHerdrHandoff {
@@ -421,7 +422,7 @@ export function parseHerdrHandoff(text: string): ParsedHerdrHandoff {
     // Fail closed at parse time: a tampered envelope whose workers no longer
     // form one legal work graph is rejected before any caller can run it.
     const order = assertWorkGraph(workers).order;
-    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers, order, ...(executionSpec ? { executionSpec } : {}) };
+    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers, order, executionSpec };
   } catch (error) {
     if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid") || error.message.startsWith("work_graph_invalid"))) throw error;
     throw new Error("orchestration_handoff_invalid: expected Pi-issued handoff envelope");
@@ -443,9 +444,7 @@ export interface VerificationSpecDimension {
   taskId: string;
   planFingerprint: string;
   gates: OrchestrationGates;
-  /** Explicit mechanical observation: a spec-bearing handoff or a legacy spec-less one (never invented). */
-  specStatus: "present" | "legacy-absent";
-  executionSpec?: ExecutionSpec;
+  executionSpec: ExecutionSpec;
 }
 
 /** design dimension: the authorized worker slices in their deterministic work-graph order. */
@@ -569,8 +568,7 @@ export function buildVerificationReport(input: VerificationReportInput): Verific
       taskId: handoff.taskId,
       planFingerprint: handoff.planFingerprint,
       gates: handoff.gates,
-      specStatus: handoff.executionSpec ? "present" : "legacy-absent",
-      ...(handoff.executionSpec ? { executionSpec: handoff.executionSpec } : {})
+      executionSpec: handoff.executionSpec
     },
     design: { workers: orderedWorkers, order: [...handoff.order] },
     quality: {
@@ -632,7 +630,7 @@ export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
 };
 
 /** Concise protocol reminder carried into continuation turns (planning depth and worker effort adapt to assessed risk). */
-export const LEAD_PROTOCOL_REMINDER = "[LEAD-PROTOCOL: plan at the assessed risk — low: compact problem/scope/boundaries/behavior/verification; medium/high: full Design Graph Problem → Shapes → Graph → Cardinality → Boundaries → Behavior → Scope → Test Layers → Critique; run workers at matching effort — worker_thinking=medium for low risk, worker_thinking=high for medium/high (an explicit user setting wins, never rewrite persisted config); escalate on discovered complexity, never downgrade in-flight; review against the dimensions you planned with]";
+export const LEAD_PROTOCOL_REMINDER = "[LEAD-PROTOCOL: plan at the assessed risk — low: compact problem/scope/boundaries/behavior/verification; medium/high: full Design Graph Problem → Shapes → Graph → Cardinality → Boundaries → Behavior → Scope → Test Layers → Critique; run workers at matching effort — worker_thinking=low for low risk, worker_thinking=high for medium/high (an explicit user setting wins, never rewrite persisted config); escalate on discovered complexity, never downgrade in-flight; review against the dimensions you planned with]";
 
 /** The Lead Architect contract. Always on: the provider is the harness lead. */
 export function buildLeadContract(config: OrchestratorConfig | undefined, appName = "Pi Workspace"): string {
@@ -643,18 +641,18 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "Your responsibilities: high-level reasoning, architectural planning, task decomposition, and code review.",
     `Workspace inspection tools (the only workspace access you have): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app.`,
     "Worker delegation uses exactly one tool: the `herdr` MCP tool with action=plan|run|status|correct|accept|stop|verify.",
-    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the optional execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan) OR the optional decision_graph (your planning decisions as exactly nine non-blank axes — problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique — mechanically compiled by Pi into the plan's execution spec; decision_graph and execution_spec are mutually exclusive), and planning gates {graph, handoff, critique}; Pi validates the gates and the decomposition as one legal work graph — unique ids, dependencies referencing existing workers only, no cycles, and no overlapping ownership between workers that no dependency path serializes (invalid graphs fail closed with work_graph_invalid) — then returns a Pi-issued handoff envelope whose workers carry one deterministic dependency order. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec or decision_graph, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the compiled spec and workers cannot invent requirements beyond it.",
-    "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec or decision_graph (whichever the plan included, verbatim — a changed, added, or removed decision_graph is rejected) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice. Select per-run worker effort with the worker_thinking argument: worker_thinking=medium for low-risk plans, worker_thinking=high for medium/high-risk plans.",
+    "- action=plan: submit the goal, the bounded 1-4 worker decomposition (workers: id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — each a bounded list of strings immutably bound into the plan fingerprint and handoff envelope), the required execution_spec (a bounded string map of execution parameters, immutably bound to this exact plan) OR the required decision_graph (exactly one of the two — spec-less plans are rejected; the graph is your planning decisions as exactly nine non-blank axes — problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique — mechanically compiled by Pi into the plan's execution spec; decision_graph and execution_spec are mutually exclusive), and planning gates {graph, handoff, critique}; Pi validates the gates and the decomposition as one legal work graph — unique ids, dependencies referencing existing workers only, no cycles, and no overlapping ownership between workers that no dependency path serializes (invalid graphs fail closed with work_graph_invalid) — then returns a Pi-issued handoff envelope whose workers carry one deterministic dependency order. Never write this envelope yourself — always use the returned string verbatim. When the plan carries an execution_spec or decision_graph, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the compiled spec and workers cannot invent requirements beyond it.",
+    "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec or decision_graph (whichever the plan included, verbatim — a changed, added, or removed decision_graph is rejected) together with the handoff envelope from action=plan (required, verbatim). Workers run as Pi agents (kind=pi) after explicit user confirmation in Pi's TUI; each worker's prompt receives its assigned immutable slice. Select per-run worker effort with the worker_thinking argument: worker_thinking=low for low-risk plans, worker_thinking=high for medium/high-risk plans.",
     "- action=status: read the persisted run lifecycle (workers, panes, failures, correction rounds). A completed worker stays live in its pane awaiting your review — nothing is auto-cleaned until you accept or stop.",
     "- action=correct: send bounded review feedback to one exact worker. A completed worker reopens in its SAME pane and session and completes again for re-review (repeatable; the round count appears in status). A still-running worker is steered mid-flight.",
     "- action=accept: accept one completed worker's work — requires run_id, worker_id, the exact handoff envelope, and the verification_fingerprint returned by a prior action=verify; the report is recomputed from fresh evidence immediately before acceptance and any drift (stale report, changed workspace, corrected worker) fails closed before mutation. On match: finalizes the review loop and closes its pane (idempotent). Required to release each approved worker's pane.",
     "- action=verify: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope) and derive a deterministic bounded VerificationReport — exactly four evidence dimensions (spec, design, quality, evidence): the compiled spec and planning gates, the authorized worker slices in work-graph order, observed run/worker lifecycle facts, and current git status/diff plus bounded run evidence. Purely observational: never a score or pass/fail, never gates acceptance, never mutates worker/run state; worker-set or prompt/envelope mismatches fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
     "- action=stop: stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
     "Planning protocol (mandatory before delegation, adaptive to risk): assess the risk first, then plan at the lightest level the evidence justifies — the planning gates {graph, handoff, critique} and the work-graph rules apply identically at every level; only planning depth adapts.",
-    "- Low risk — small localized work with no cross-surface behavior (docs, comments, config, single-file or test-only edits): compact planning is sufficient. State four things: the problem, scope/boundaries (what may change and what must not), intended behavior, and verification (how correctness will be checked); a decision_graph or execution_spec and multi-worker decomposition are optional at this level.",
+    "- Low risk — small localized work with no cross-surface behavior (docs, comments, config, single-file or test-only edits): compact planning is sufficient. State four things: the problem, scope/boundaries (what may change and what must not), intended behavior, and verification (how correctness will be checked); multi-worker decomposition is optional at this level, but an execution_spec or decision_graph is always required.",
     "- Medium risk — normal multi-surface behavioral changes (features or behavior spanning multiple files, modules, or surfaces): render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique.",
     "- High risk — architecture, concurrency, auth/security, migrations/data integrity, lifecycle-sensitive changes, or complex multi-worker dependency work: the full Design Graph (the same nine sections) plus broader verification expectations — wider test surface and explicit failure/boundary analysis.",
-    "Worker effort matches the same risk assessment: run low-risk plans with worker_thinking=medium and medium/high-risk plans with worker_thinking=high (pass the value to action=run; it applies to that run only). The configured worker thinking shown above (${active.workerThinking}) is the profile default, not a per-run decision: when the user has explicitly set or requested a specific worker thinking level (via configuration or command), honor that level verbatim and never rewrite the persisted configuration to impose adaptive guidance.",
+    "Worker effort matches the same risk assessment: run low-risk plans with worker_thinking=low and medium/high-risk plans with worker_thinking=high (pass the value to action=run; it applies to that run only). The configured worker thinking shown above (${active.workerThinking}) is the profile default, not a per-run decision: when the user has explicitly set or requested a specific worker thinking level (via configuration or command), honor that level verbatim and never rewrite the persisted configuration to impose adaptive guidance.",
     "The plan is the contract: inspect the workspace, annotate data/cardinality/failure/requirements and trust/resource boundaries, then obtain critique evidence from a prior herdr run's status output or the user, or perform and record an adversarial self-critique on a fresh first run. Derive each worker's declarative slice lists (requirements, behaviors, seams, acceptance) from that plan — and, when an execution_spec or decision_graph is present, from that compiled spec — so workers cannot invent requirements. Escalate, never downgrade: when inspection or new evidence reveals architecture, concurrency, auth/security, data-integrity, lifecycle, or cross-worker complexity beyond the assessed level, raise the assessment and re-plan at the higher rigor before delegating — a low-risk task that grows must produce the full Design Graph — and never silently downgrade an in-flight task to lighter review to bypass stronger gates. Only then obtain the handoff envelope via herdr action=plan and start execution via herdr action=run.",
     "Pi remains the sole executor: never mutate source, never run shell commands, never spawn Pi subagents, never create Herdr panes directly.",
     "After workers finish, inspect git_status/git_diff and review semantically against the dimensions you planned with — the compact problem, scope/boundaries, intended behavior, and verification for low risk; the same Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique dimensions for medium and high risk. Send bounded corrections via action=correct and re-review the finished round; accept each worker via action=accept once its work is good, then report the result to the user. Always accept or stop to release worker panes."
@@ -692,9 +690,8 @@ export async function loadOrchestratorState(
 
   const projectData = await readJsonSafe<Partial<OrchestratorConfig>>(projectPath);
   if (projectData) {
-    const { enabled: _legacy, ...config } = projectData as Partial<OrchestratorConfig> & { enabled?: boolean };
     return {
-      config: { ...DEFAULT_ORCHESTRATOR_CONFIG, ...config },
+      config: { ...DEFAULT_ORCHESTRATOR_CONFIG, ...projectData },
       scope: "project",
       sourcePath: projectPath
     };
@@ -702,9 +699,8 @@ export async function loadOrchestratorState(
 
   const globalData = await readJsonSafe<Partial<OrchestratorConfig>>(globalPath);
   if (globalData) {
-    const { enabled: _legacy, ...config } = globalData as Partial<OrchestratorConfig> & { enabled?: boolean };
     return {
-      config: { ...DEFAULT_ORCHESTRATOR_CONFIG, ...config },
+      config: { ...DEFAULT_ORCHESTRATOR_CONFIG, ...globalData },
       scope: "global",
       sourcePath: globalPath
     };
