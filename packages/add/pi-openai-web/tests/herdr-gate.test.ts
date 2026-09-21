@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph } from "../src/mcp/server.js";
-import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, assertDecisionGraph, compileDecisionGraph, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX } from "../src/provider/orchestrator.js";
-import { SubagentMcpAdapter } from "../src/mcp/subagent-adapter.js";
+import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph, createHarnessMcpFactory } from "../src/mcp/server.js";
+import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, assertDecisionGraph, compileDecisionGraph, resolveWorkflowToggles, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, DEFAULT_ORCHESTRATOR_CONFIG } from "../src/provider/orchestrator.js";
+import { SubagentMcpAdapter, type AdapterRunSnapshot } from "../src/mcp/subagent-adapter.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { McpServer } from "@modelcontextprotocol/server";
 
 const gates = { graph: "graph", handoff: "handoff", critique: "critique" };
 const base = { goal: "fix bug", workers: [{ id: "w1", objective: "fix", owns: ["src"], depends_on: [] }] };
@@ -355,3 +356,117 @@ test("failed controller startup does not consume handoff", async () => {
   await assert.doesNotReject(adapter.run(request));
   assert.equal(calls.length, 2);
 });
+
+// ── Workflow toggle enforcement (server-level) ────────────────────────────────
+// A single factory + mutable workflowsRef cell avoids McpServer.prototype
+// race conditions between concurrently executing tests.
+//
+// Herdr delegation is an always-on invariant (not a toggle): only three
+// toggles are enforced at the server level — adaptiveWorkerEffort,
+// verificationGate, and reviewLoop (reviewLoop is adapter-level, tested in
+// herdr-review-flow.test.ts). Tests here cover the two server-side guards.
+
+const toggleGates = { graph: "graph", handoff: "handoff", critique: "critique" };
+const toggleWorkers = [{ id: "w1", objective: "fix", owns: ["src"], depends_on: [] }];
+const toggleSpec = { suite: "focused" };
+
+/** Mutable cell: tests swap toggles in place; the factory reads it live. */
+let workflowsRef = resolveWorkflowToggles(DEFAULT_ORCHESTRATOR_CONFIG);
+
+const toggleController = {
+  run: async () => ({ id: "run-toggle", status: "running", tasks: [] as AdapterRunSnapshot["tasks"] }),
+  status: () => [] as AdapterRunSnapshot[],
+  stop: async () => {},
+  steer: async () => ({ id: "run-toggle", status: "running", tasks: [] as AdapterRunSnapshot["tasks"] }),
+  resumeTask: async () => {},
+  initialize: async () => {},
+  cleanup: async () => {},
+} as unknown as SubagentController;
+
+const toggleAdapterInstance = new SubagentMcpAdapter(
+  toggleController,
+  () => undefined,
+  { ui: () => undefined, autoApprove: () => true }
+);
+
+/** The single shared herdr handler — workflows() reads workflowsRef live. */
+let sharedHerdrHandler: ((args: unknown) => Promise<unknown>) | undefined;
+
+{
+  // Register once at module load time by patching prototype temporarily (serial, not concurrent).
+  const original = McpServer.prototype.registerTool;
+  McpServer.prototype.registerTool = function patched(this: unknown, name: string, _config: unknown, h: (args: unknown) => Promise<unknown>) {
+    if (name === "herdr") sharedHerdrHandler = h;
+    return original.call(this, name, _config, h);
+  } as typeof McpServer.prototype.registerTool;
+  createHarnessMcpFactory({
+    config: { maxReadLines: 400, maxFileBytes: 262_144 } as Parameters<typeof createHarnessMcpFactory>[0]["config"],
+    workspaceRoot: process.cwd(),
+    subagent: toggleAdapterInstance as Parameters<typeof createHarnessMcpFactory>[0]["subagent"],
+    workflows: () => workflowsRef,
+  })();
+  McpServer.prototype.registerTool = original;
+}
+
+function parseText(result: unknown): unknown {
+  const r = result as { content?: Array<{ text?: string }> };
+  const raw = r?.content?.[0]?.text;
+  return typeof raw === "string" ? JSON.parse(raw) : raw;
+}
+
+/** Obtain a fresh herdr handoff using the default (all-on) toggle state. */
+async function freshToggleHandoff(goal: string): Promise<string> {
+  workflowsRef = resolveWorkflowToggles(DEFAULT_ORCHESTRATOR_CONFIG);
+  const planned = parseText(await sharedHerdrHandler!({ action: "plan", goal, workers: toggleWorkers, gates: toggleGates, execution_spec: toggleSpec })) as { handoff: string };
+  return planned.handoff;
+}
+
+test("toggle enforcement: adaptiveWorkerEffort=false rejects worker_thinking on action=run", async () => {
+  const handoff = await freshToggleHandoff("toggle-effort-off");
+  workflowsRef = resolveWorkflowToggles({ ...DEFAULT_ORCHESTRATOR_CONFIG, adaptiveWorkerEffort: false });
+  // worker_thinking passed → guard must fire before reaching the adapter.
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "run", goal: "toggle-effort-off", workers: toggleWorkers, execution_spec: toggleSpec, handoff, worker_thinking: "low" }),
+    /herdr_worker_effort_locked/,
+    "effort toggle off must reject worker_thinking"
+  );
+  // Without worker_thinking the effort guard doesn't fire; adapter runs and
+  // throws subagent_context_unavailable (no real session in unit tests).
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "run", goal: "toggle-effort-off", workers: toggleWorkers, execution_spec: toggleSpec, handoff }),
+    /subagent_context_unavailable/,
+    "run without worker_thinking must reach the adapter (effort guard bypassed)"
+  );
+});
+
+test("toggle enforcement: adaptiveWorkerEffort=true allows worker_thinking (guard does not fire)", async () => {
+  const handoff = await freshToggleHandoff("toggle-effort-on");
+  workflowsRef = resolveWorkflowToggles(DEFAULT_ORCHESTRATOR_CONFIG);
+  // worker_thinking=low + toggle on → effort guard does NOT fire; adapter runs,
+  // throws subagent_context_unavailable (no session in unit tests — proves guard was bypassed).
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "run", goal: "toggle-effort-on", workers: toggleWorkers, execution_spec: toggleSpec, handoff, worker_thinking: "low" }),
+    /subagent_context_unavailable/,
+    "effort guard must not fire when toggle is on; error must be from adapter, not server guard"
+  );
+});
+
+test("toggle enforcement: verificationGate=true rejects accept missing fingerprint", async () => {
+  workflowsRef = resolveWorkflowToggles(DEFAULT_ORCHESTRATOR_CONFIG);
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "accept", run_id: "run-toggle", worker_id: "w1" }),
+    /herdr accept requires the exact Pi-issued handoff/,
+    "gate on: server must reject missing fingerprint before reaching adapter"
+  );
+});
+
+test("toggle enforcement: verificationGate=false skips fingerprint check and reaches adapter", async () => {
+  workflowsRef = resolveWorkflowToggles({ ...DEFAULT_ORCHESTRATOR_CONFIG, verificationGate: false });
+  // Gate off: fingerprint check skipped; adapter runs and throws context error.
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "accept", run_id: "run-toggle", worker_id: "w1" }),
+    /subagent_context_unavailable/,
+    "gate off: error must come from adapter (context), not from the fingerprint check"
+  );
+});
+
