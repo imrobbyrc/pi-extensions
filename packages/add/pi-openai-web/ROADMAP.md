@@ -7,7 +7,7 @@ One product: an always-on **OpenAI Web Lead Architect** running as a native Pi p
 Shipped:
 
 - [x] Always-on Lead Architect contract injected into every `openai-web` provider turn; lead profile (worker model, thinking, max parallel workers) persisted per project/global/session scope.
-- [x] Strict frozen MCP allowlist: six bounded read-only workspace tools plus one `herdr` tool. No shell/write/subagent/bridge/worker-tab tools at any endpoint.
+- [x] Strict frozen MCP allowlist: seven bounded read-only workspace tools (including root `CONTEXT.md` guidance via `read_context`) plus one `herdr` tool. No shell/write/subagent/bridge/worker-tab tools at any endpoint.
 - [x] `herdr` tool actions: `run` (validated 1–4 worker contract, explicit TUI confirmation, immediate handle), `status` (persisted lifecycle; completed workers stay live for review — never auto-cleaned while reviewable), `correct` (completed worker reopens in its exact pane/session via the core review loop and completes again for re-review; running workers are steered), `accept` (finalize a completed worker — closes its pane, idempotent), `stop` (run or all owned panes).
 - [x] Herdr Pi workers only (`--kind pi`); `openai-web` worker models rejected fail-closed; Luna Max default profile.
 - [x] Run store with no-replay restart recovery; scope baselines and ownership evidence fail closed on unowned/ambiguous mutations.

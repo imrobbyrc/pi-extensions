@@ -53,6 +53,21 @@ export async function readTextFile(
     .join("\n");
 }
 
+/** Read conventional project context without making the Lead guess its path. */
+export async function readContextFile(
+  root: string,
+  config: Pick<HarnessConfig, "maxReadLines" | "maxFileBytes">
+): Promise<string> {
+  try {
+    return await readTextFile(root, "CONTEXT.md", config);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return "No CONTEXT.md found at workspace root.";
+    }
+    throw error;
+  }
+}
+
 export async function repoMap(root: string, maxDepth = 3): Promise<string> {
   const rootReal = await resolveInsideWorkspace(root, ".");
   const output: string[] = [];

@@ -24,6 +24,7 @@ Create one custom ChatGPT app named `Pi Workspace` (configurable via `PLANNER_CH
 
 | Tool | Kind |
 | --- | --- |
+| `read_context` | read-only — bounded root `CONTEXT.md`, or absent-file result |
 | `read_file` | read-only |
 | `list_directory` | read-only |
 | `search_workspace` | read-only |

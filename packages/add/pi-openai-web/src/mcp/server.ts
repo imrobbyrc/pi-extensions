@@ -4,7 +4,7 @@ import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
-import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
+import { listDirectory, readContextFile, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice } from "../provider/orchestrator.js";
 import { buildWorkerTask, type AdapterRunSnapshot } from "./subagent-adapter.js";
@@ -288,6 +288,17 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
       track(async ({ path }) => text((await listDirectory(workspaceRoot, path)).join("\n")))
+    );
+
+    server.registerTool(
+      "read_context",
+      {
+        title: "Read project context",
+        description: "Read the bounded root CONTEXT.md project guidance, or report that it is absent.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      track(async () => text(await readContextFile(workspaceRoot, limits)))
     );
 
     server.registerTool(

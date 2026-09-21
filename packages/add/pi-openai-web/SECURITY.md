@@ -4,7 +4,7 @@
 
 ## Non-negotiable rules
 
-1. Lead MCP tools are a strict frozen allowlist: `read_file`, `list_directory`, `search_workspace`, `repo_map`, `git_status`, `git_diff` (all read-only) plus `herdr`.
+1. Lead MCP tools are a strict frozen allowlist: `read_context`, `read_file`, `list_directory`, `search_workspace`, `repo_map`, `git_status`, `git_diff` (all read-only) plus `herdr`. `read_context` exposes only bounded root `CONTEXT.md` guidance.
 2. ChatGPT must never receive `bash`, arbitrary process execution, file-write/edit, package install, migration, git commit/push/reset/deploy, or subagent-spawning tools. No such tools exist at any endpoint.
 3. `herdr` is the only mutating lead tool. It must keep honest annotations (`readOnlyHint: false`, `destructiveHint: true`). Never mark a mutating tool as read-only to bypass host restrictions.
 4. `herdr run` requires explicit human confirmation in Pi's TUI. Headless runs fail closed unless `harnessAutoApproveHerdrRun` is explicitly configured; an explicit human rejection is final even then.

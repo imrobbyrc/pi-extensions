@@ -397,7 +397,7 @@ let sharedHerdrHandler: ((args: unknown) => Promise<unknown>) | undefined;
   const original = McpServer.prototype.registerTool;
   McpServer.prototype.registerTool = function patched(this: unknown, name: string, _config: unknown, h: (args: unknown) => Promise<unknown>) {
     if (name === "herdr") sharedHerdrHandler = h;
-    return original.call(this, name, _config, h);
+    return Reflect.apply(original, this, [name, _config, h]);
   } as typeof McpServer.prototype.registerTool;
   createHarnessMcpFactory({
     config: { maxReadLines: 400, maxFileBytes: 262_144 } as Parameters<typeof createHarnessMcpFactory>[0]["config"],

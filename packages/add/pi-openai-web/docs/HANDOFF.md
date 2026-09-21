@@ -6,7 +6,7 @@ One product, no planner:
 
 ```text
 Pi user → /model openai-web/<id>  (always-on Lead Architect)
-Lead turn → strict MCP allowlist (6 read-only tools + `herdr`)
+Lead turn → strict MCP allowlist (7 read-only tools, including optional root `CONTEXT.md`, + `herdr`)
 Lead → MCP herdr → `@imrobbyrc/pi-core-subagent` API → Herdr run (1–4 Pi workers, DAG + owns scopes)
 Pi TUI → explicit confirmation → Herdr panes start (kind=pi)
 Lead → herdr status / correct / stop

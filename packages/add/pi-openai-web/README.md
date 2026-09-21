@@ -9,7 +9,7 @@ Pi-native harness with an **always-on ChatGPT Web Lead Architect**: ChatGPT Web 
 One product, one flow:
 
 - **OpenAI Web Lead (always on)** — ChatGPT Web behaves like a native Pi model through `/model openai-web/<id>`, with dynamic model/effort discovery, exact browser selection, bounded context, and structured checkpoint compaction.
-- **Strict lead tools** — the Lead sees exactly seven MCP tools: six bounded read-only workspace inspections plus one Pi-native `herdr` execution tool. No shell, no writes, no subagent spawning, no browser worker tabs.
+- **Strict lead tools** — the Lead sees exactly eight MCP tools: seven bounded read-only workspace inspections (including optional root `CONTEXT.md` guidance via `read_context`) plus one Pi-native `herdr` execution tool. No shell, no writes, no subagent spawning, no browser worker tabs.
 - **Decision-graph planning & work-graph validation** — every plan passes the planning gates (`graph`, `handoff`, `critique`); an optional nine-axis `decision_graph` is mechanically compiled by Pi into the plan's execution spec, and every 1–4 worker decomposition is validated as one legal work graph (unique ids, acyclic dependencies, non-overlapping ownership) before a Pi-issued handoff envelope binds it to a deterministic plan fingerprint.
 - **Asynchronous native Herdr** — one `herdr` MCP tool with `plan | run | status | correct | accept | stop | verify` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
 - **Observational verification & fingerprint-bound acceptance** — `herdr verify` binds the exact Pi-issued handoff envelope to one actual run and derives a deterministic bounded `VerificationReport` (exactly four dimensions: spec, design, quality, evidence) from the parsed handoff, the raw run snapshot, and current git status/diff, plus a `verification_fingerprint` (deterministic SHA-256). The report is read-only evidence for review — never a score, never a pass/fail. `herdr accept` additionally requires that fingerprint: the report is recomputed from fresh evidence immediately before the mutation, and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated.
@@ -91,7 +91,7 @@ Lead turn → herdr plan (planning gates, fingerprinted handoff envelope)
 
    Infrastructure (browser/CDP, local MCP, tunnel) starts automatically on first use. Verify with `/openai-web doctor`.
 
-4. Create the custom ChatGPT app named `Pi Workspace`, point it at the tunnel's remote endpoint, and scan tools. You should see `read_file`, `list_directory`, `search_workspace`, `repo_map`, `git_status`, `git_diff`, and `herdr`. See [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md).
+4. Create the custom ChatGPT app named `Pi Workspace`, point it at the tunnel's remote endpoint, and scan tools. You should see `read_context`, `read_file`, `list_directory`, `search_workspace`, `repo_map`, `git_status`, `git_diff`, and `herdr`. See [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md).
 
 5. Verify Herdr: `herdr status server` must succeed, and `pi auth check --provider openai-codex` must pass for the default Luna Max worker profile.
 
@@ -121,7 +121,7 @@ The Lead inspects the workspace through MCP, runs its planning protocol at the a
                    CONTROL PLANE
                         │
                         ▼
-   strict MCP data plane (7 tools, via tunnel)
+   strict MCP data plane (8 tools, via tunnel)
                         │
                         ▼
                  Pi Host / Harness
@@ -150,6 +150,7 @@ Strict frozen allowlist — the only tools the Lead can see:
 
 | Tool | Kind | Purpose |
 | --- | --- | --- |
+| `read_context` | read-only | Bounded root `CONTEXT.md` project guidance, or an absent-file result |
 | `read_file` | read-only | Bounded line range from a workspace text file |
 | `list_directory` | read-only | One directory listing |
 | `search_workspace` | read-only | Bounded text search (ripgrep or safe JS fallback) |
