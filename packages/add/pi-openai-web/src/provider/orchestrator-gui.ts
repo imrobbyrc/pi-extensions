@@ -298,7 +298,6 @@ export function createOrchestratorSettingsComponent(options: OrchestratorGuiOpti
           workerThinking,
           maxParallelWorkers,
           delegationStrategy,
-          herdrDelegation: toggles.herdrDelegation,
           adaptivePlanning: toggles.adaptivePlanning,
           adaptiveWorkerEffort: toggles.adaptiveWorkerEffort,
           verificationGate: toggles.verificationGate,

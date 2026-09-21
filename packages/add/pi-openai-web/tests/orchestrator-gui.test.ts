@@ -102,10 +102,11 @@ describe("Lead Architect GUI Component", () => {
     });
 
     let rendered = component.render(80).join("\n");
-    for (const label of ["Workflow: Herdr Delegation", "Workflow: Adaptive Planning", "Workflow: Adaptive Worker Effort", "Workflow: Verification Gate", "Workflow: Review Loop"]) {
+    for (const label of ["Workflow: Adaptive Planning", "Workflow: Adaptive Worker Effort", "Workflow: Verification Gate", "Workflow: Review Loop"]) {
       assert.ok(rendered.includes(label), `Includes ${label}`);
       assert.ok(rendered.includes("on"), "Toggles default to on");
     }
+    assert.ok(!rendered.includes("Workflow: Herdr Delegation"), "Delegation is an invariant — no toggle for it");
 
     // Move to the first workflow toggle (item 4) and cycle it off with Space.
     for (let i = 0; i < 4; i++) component.handleInput("\u001b[B");
@@ -131,8 +132,8 @@ describe("Lead Architect GUI Component", () => {
       }
     });
 
-    // Navigate down to 'Save & Apply' (item 10: after 4 base settings + 5 workflow toggles)
-    for (let i = 0; i < 10; i++) {
+    // Navigate down to 'Save & Apply' (item 9: after 4 base settings + 4 workflow toggles)
+    for (let i = 0; i < 9; i++) {
       component.handleInput("\u001b[B");
     }
 
@@ -148,8 +149,7 @@ describe("Lead Architect GUI Component", () => {
     assert.equal(doneStatus, true, "onDone called with true");
     // Workflow toggles ride along explicitly — disabled ones stay disabled, the rest default on.
     assert.equal(savedConfig?.reviewLoop, false, "Disabled workflow persists as false");
-    assert.equal(savedConfig?.herdrDelegation, true, "Default-on workflow saves as true");
-    assert.equal(savedConfig?.verificationGate, true);
+    assert.equal(savedConfig?.verificationGate, true, "Default-on workflow saves as true");
     assert.equal(savedConfig?.adaptivePlanning, true);
     assert.equal(savedConfig?.adaptiveWorkerEffort, true);
   });

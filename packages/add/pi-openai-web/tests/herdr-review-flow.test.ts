@@ -677,7 +677,7 @@ test("herdr verify fails closed when the workspace cannot be observed", async ()
 
 // --- Workflow toggle enforcement (TUI enable/disable is real, not advisory) ---
 
-const allOff = { herdrDelegation: false, adaptivePlanning: false, adaptiveWorkerEffort: false, verificationGate: false, reviewLoop: false };
+const allOff = { adaptivePlanning: false, adaptiveWorkerEffort: false, verificationGate: false, reviewLoop: false };
 
 const planArgs = {
   action: "plan" as const,
@@ -687,20 +687,13 @@ const planArgs = {
   gates: planGates
 };
 
-test("workflow toggles are enforced: delegation off rejects run; effort lock rejects worker_thinking", async () => {
+test("workflow toggles are enforced: effort lock rejects worker_thinking", async () => {
   const harness = loopHarness(completedHerdrRun());
   const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent, process.cwd(), { workflows: () => allOff }))[0]!;
   const planned = parseToolText(await herdr.handler(planArgs));
-  assert.equal(planned.ok, true, "plan stays available for inspection even with delegation off");
+  assert.equal(planned.ok, true);
   await assert.rejects(
-    herdr.handler({ ...planArgs, action: "run", handoff: planned.handoff }),
-    /herdr_run_delegation_disabled/
-  );
-  // Adaptive effort locked: an explicit worker_thinking is refused even with delegation re-enabled.
-  const delegationOn = { ...allOff, herdrDelegation: true };
-  const herdrEffortLocked = (await registeredHerdrToolsFor(harness.mcpSubagent, process.cwd(), { workflows: () => delegationOn }))[0]!;
-  await assert.rejects(
-    herdrEffortLocked.handler({ ...planArgs, action: "run", handoff: planned.handoff, worker_thinking: "low" }),
+    herdr.handler({ ...planArgs, action: "run", handoff: planned.handoff, worker_thinking: "low" }),
     /herdr_worker_effort_locked/
   );
 });

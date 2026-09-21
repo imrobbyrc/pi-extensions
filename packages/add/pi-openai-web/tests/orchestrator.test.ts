@@ -206,24 +206,23 @@ test("formatOrchestratorBox renders lead status lines", () => {
   assert.match(box, /Thinking\s+high/);
   assert.match(box, /Parallel workers\s+4/);
   assert.match(box, /Delegation\s+adaptive/);
-  assert.match(box, /Workflows\s+delegation:on planning:on effort:on/);
+  assert.match(box, /Workflows\s+planning:on effort:on/);
   assert.match(box, /verification:on review:on/);
   assert.match(box, /Scope\s+This project/);
 });
 
 test("workflow toggles: absent means enabled, only an explicit false disables", () => {
   const allOn = resolveWorkflowToggles(undefined);
-  assert.deepEqual(allOn, { herdrDelegation: true, adaptivePlanning: true, adaptiveWorkerEffort: true, verificationGate: true, reviewLoop: true });
+  assert.deepEqual(allOn, { adaptivePlanning: true, adaptiveWorkerEffort: true, verificationGate: true, reviewLoop: true });
   // A saved config from before the toggles existed keeps every workflow on.
   assert.deepEqual(resolveWorkflowToggles({ ...DEFAULT_ORCHESTRATOR_CONFIG }), allOn);
   // Only explicit false disables; the rest stay on.
-  const mixed = resolveWorkflowToggles({ ...DEFAULT_ORCHESTRATOR_CONFIG, herdrDelegation: false, verificationGate: false });
-  assert.equal(mixed.herdrDelegation, false);
+  const mixed = resolveWorkflowToggles({ ...DEFAULT_ORCHESTRATOR_CONFIG, verificationGate: false });
   assert.equal(mixed.verificationGate, false);
   assert.equal(mixed.reviewLoop, true);
   // The status box reflects disabled workflows.
-  const box = formatOrchestratorBox({ config: { ...DEFAULT_ORCHESTRATOR_CONFIG, herdrDelegation: false }, scope: "project" });
-  assert.match(box, /delegation:off planning:on effort:on/);
+  const box = formatOrchestratorBox({ config: { ...DEFAULT_ORCHESTRATOR_CONFIG, adaptivePlanning: false }, scope: "project" });
+  assert.match(box, /planning:off effort:on/);
 });
 
 test("provider to Herdr handoff requires graph, handoff, and critique gates", () => {

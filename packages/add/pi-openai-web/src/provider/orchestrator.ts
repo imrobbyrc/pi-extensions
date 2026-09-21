@@ -15,18 +15,16 @@ export interface OrchestratorConfig {
   maxParallelWorkers: number;
   delegationStrategy: DelegationStrategy;
   /** Workflow toggles (TUI enable/disable). Absent = enabled; `false` disables. Advisory until enforcement lands. */
-  herdrDelegation?: boolean;
   adaptivePlanning?: boolean;
   adaptiveWorkerEffort?: boolean;
   verificationGate?: boolean;
   reviewLoop?: boolean;
 }
 
-/** The five harness workflows that can be enabled/disabled from the TUI settings. */
-export type WorkflowToggleId = "herdrDelegation" | "adaptivePlanning" | "adaptiveWorkerEffort" | "verificationGate" | "reviewLoop";
-export const WORKFLOW_TOGGLE_IDS: readonly WorkflowToggleId[] = ["herdrDelegation", "adaptivePlanning", "adaptiveWorkerEffort", "verificationGate", "reviewLoop"];
+/** The four toggleable harness workflows. Herdr delegation itself is an invariant — always on, never toggleable. */
+export type WorkflowToggleId = "adaptivePlanning" | "adaptiveWorkerEffort" | "verificationGate" | "reviewLoop";
+export const WORKFLOW_TOGGLE_IDS: readonly WorkflowToggleId[] = ["adaptivePlanning", "adaptiveWorkerEffort", "verificationGate", "reviewLoop"];
 export const WORKFLOW_TOGGLE_META: Record<WorkflowToggleId, { label: string; short: string; description: string }> = {
-  herdrDelegation: { label: "Workflow: Herdr Delegation", short: "delegation", description: "Delegate implementation to Herdr Pi workers via herdr plan/run." },
   adaptivePlanning: { label: "Workflow: Adaptive Planning", short: "planning", description: "Risk-based planning depth: compact for low risk, full Design Graph otherwise." },
   adaptiveWorkerEffort: { label: "Workflow: Adaptive Worker Effort", short: "effort", description: "Per-run worker_thinking follows assessed risk (low→low, medium/high→high)." },
   verificationGate: { label: "Workflow: Verification Gate", short: "verification", description: "Accept requires a fresh verify fingerprint bound to the exact handoff." },
@@ -36,7 +34,6 @@ export const WORKFLOW_TOGGLE_META: Record<WorkflowToggleId, { label: string; sho
 /** Resolve the effective workflow toggles: absent/undefined means enabled (default), only an explicit `false` disables. */
 export function resolveWorkflowToggles(config: OrchestratorConfig | undefined): Record<WorkflowToggleId, boolean> {
   return {
-    herdrDelegation: config?.herdrDelegation !== false,
     adaptivePlanning: config?.adaptivePlanning !== false,
     adaptiveWorkerEffort: config?.adaptiveWorkerEffort !== false,
     verificationGate: config?.verificationGate !== false,
@@ -666,7 +663,7 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
   const wf = resolveWorkflowToggles(active);
   return [
     "LEAD ARCHITECT MODE (always on):",
-    `You are the Lead Architect and Orchestrator: high-level reasoning, architectural planning, task decomposition, and code review. Implementation is delegated to Herdr-managed Pi worker agents (worker model: ${active.workerModel}, thinking: ${active.workerThinking} (profile default; per-run effort follows the rule below), max parallel workers: ${active.maxParallelWorkers}, strategy: ${active.delegationStrategy}).${wf.herdrDelegation ? "" : " Operator has DISABLED the Herdr delegation workflow: never call action=run (it fails closed); inspect only via status/verify."}`,
+    `You are the Lead Architect and Orchestrator: high-level reasoning, architectural planning, task decomposition, and code review. Implementation is delegated to Herdr-managed Pi worker agents (worker model: ${active.workerModel}, thinking: ${active.workerThinking} (profile default; per-run effort follows the rule below), max parallel workers: ${active.maxParallelWorkers}, strategy: ${active.delegationStrategy}).`,
     `Workspace inspection tools (your only workspace access): read_file, list_directory, search_workspace, repo_map, git_status, git_diff on the "${appName}" MCP app. Worker delegation uses exactly one tool: the \`herdr\` MCP tool with action=plan|run|status|correct|accept|stop|verify.`,
     "- action=plan: submit the goal, the bounded 1-4 worker decomposition (id, objective, owns, depends_on, plus optional declarative slice lists — requirements, behaviors, seams, acceptance — immutably bound into the plan fingerprint and handoff envelope), plus exactly one of execution_spec (a bounded string map) or decision_graph (nine non-blank axes — problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique — mechanically compiled by Pi into the plan's execution spec; the two are mutually exclusive; spec-less plans are rejected), and planning gates {graph, handoff, critique}. Pi validates the decomposition as one legal work graph — unique ids, known dependencies, no cycles, no overlapping ownership between workers that no dependency path serializes (work_graph_invalid) — and returns a Pi-issued handoff envelope with one deterministic dependency order. Use that envelope verbatim; never write it yourself. When the plan carries an execution_spec or decision_graph, worker slices derive from it: requirements/behaviors/seams/acceptance must trace to the compiled spec and workers cannot invent requirements.",
     "- action=run: submit the exact same goal, workers (including every declarative slice list), and execution_spec or decision_graph verbatim (a changed, added, or removed decision_graph is rejected) plus the handoff envelope from action=plan. Workers run as Pi agents after explicit TUI user confirmation; each worker's prompt receives its assigned immutable slice. Select per-run worker effort with worker_thinking: worker_thinking=low for low-risk plans, worker_thinking=high for medium/high-risk plans.",
@@ -787,8 +784,8 @@ export function formatOrchestratorBox(state: OrchestratorState): string {
     `│ Thinking          ${config.workerThinking.padEnd(37)}│`,
     `│ Parallel workers  ${String(config.maxParallelWorkers).padEnd(37)}│`,
     `│ Delegation        ${config.delegationStrategy.padEnd(37)}│`,
-    `│ Workflows         ${tags.slice(0, 3).join(" ").padEnd(37)}│`,
-    `│                   ${tags.slice(3).join(" ").padEnd(37)}│`,
+    `│ Workflows         ${tags.slice(0, 2).join(" ").padEnd(37)}│`,
+    `│                   ${tags.slice(2).join(" ").padEnd(37)}│`,
     "│                                                        │",
     `│ Scope             ${scopeStr.padEnd(37)}│`,
     ...(state.sourcePath ? [`│ Path              ${state.sourcePath.slice(-35).padStart(37)}│`] : []),

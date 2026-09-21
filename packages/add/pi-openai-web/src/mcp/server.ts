@@ -371,10 +371,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and execution_spec or decision_graph (whichever was provided)." });
         }
         if (action === "run") {
-          // Workflow enforcement (fail-closed): the operator's TUI toggles gate the mutating paths.
-          if (!workflows().herdrDelegation) {
-            throw new Error("herdr_run_delegation_disabled: the operator disabled the Herdr delegation workflow; re-enable it in the Lead settings to run workers.");
-          }
+          // Workflow enforcement (fail-closed): adaptive effort lock gates the per-run thinking argument.
           if (worker_thinking && !workflows().adaptiveWorkerEffort) {
             throw new Error("herdr_worker_effort_locked: adaptive worker effort is disabled by the operator; omit worker_thinking and the configured profile default applies.");
           }
