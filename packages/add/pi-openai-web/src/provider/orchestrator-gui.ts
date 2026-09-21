@@ -12,11 +12,13 @@ import {
   getKeybindings,
   Input
 } from "@earendil-works/pi-tui";
+import { WORKFLOW_TOGGLE_IDS, WORKFLOW_TOGGLE_META, resolveWorkflowToggles } from "./orchestrator.js";
 import type {
   DelegationStrategy,
   OrchestratorConfig,
   OrchestratorScope,
-  OrchestratorState
+  OrchestratorState,
+  WorkflowToggleId
 } from "./orchestrator.js";
 
 export interface GuiThemeLike {
@@ -172,6 +174,8 @@ export function createOrchestratorSettingsComponent(options: OrchestratorGuiOpti
   let maxParallelWorkers = options.current.config.maxParallelWorkers;
   let delegationStrategy: DelegationStrategy = options.current.config.delegationStrategy;
   let scope: OrchestratorScope = options.current.scope;
+  // Workflow toggles: undefined in config means enabled; the GUI always writes an explicit on/off.
+  const toggles: Record<WorkflowToggleId, boolean> = resolveWorkflowToggles(options.current.config);
 
   const popularModels: SelectItem[] = [
     { value: "zai/glm-5.3", label: "zai/glm-5.3", description: "Default fast orchestrator worker" },
@@ -225,6 +229,13 @@ export function createOrchestratorSettingsComponent(options: OrchestratorGuiOpti
       currentValue: delegationStrategy,
       values: ["adaptive", "aggressive"]
     },
+    ...WORKFLOW_TOGGLE_IDS.map((id): SettingItem => ({
+      id,
+      label: WORKFLOW_TOGGLE_META[id].label,
+      description: WORKFLOW_TOGGLE_META[id].description,
+      currentValue: toggles[id] ? "on" : "off",
+      values: ["on", "off"]
+    })),
     {
       id: "scope",
       label: "Save Scope",
@@ -277,6 +288,8 @@ export function createOrchestratorSettingsComponent(options: OrchestratorGuiOpti
         maxParallelWorkers = parseInt(newValue, 10) || 3;
       } else if (id === "delegationStrategy") {
         delegationStrategy = newValue as DelegationStrategy;
+      } else if ((WORKFLOW_TOGGLE_IDS as readonly string[]).includes(id)) {
+        toggles[id as WorkflowToggleId] = newValue === "on";
       } else if (id === "scope") {
         scope = newValue as OrchestratorScope;
       } else if (id === "save") {
@@ -284,7 +297,12 @@ export function createOrchestratorSettingsComponent(options: OrchestratorGuiOpti
           workerModel,
           workerThinking,
           maxParallelWorkers,
-          delegationStrategy
+          delegationStrategy,
+          herdrDelegation: toggles.herdrDelegation,
+          adaptivePlanning: toggles.adaptivePlanning,
+          adaptiveWorkerEffort: toggles.adaptiveWorkerEffort,
+          verificationGate: toggles.verificationGate,
+          reviewLoop: toggles.reviewLoop
         };
         void options.onSave(finalConfig, scope).then(() => {
           options.onDone(true);

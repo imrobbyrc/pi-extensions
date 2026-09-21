@@ -3,7 +3,7 @@ import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { createOrchestratorSettingsComponent } from "./orchestrator-gui.js";
+import { createOrchestratorSettingsComponent, type GuiThemeLike } from "./orchestrator-gui.js";
 
 export type OrchestratorScope = "project" | "global" | "session";
 export type DelegationStrategy = "adaptive" | "aggressive";
@@ -14,6 +14,34 @@ export interface OrchestratorConfig {
   workerThinking: string;
   maxParallelWorkers: number;
   delegationStrategy: DelegationStrategy;
+  /** Workflow toggles (TUI enable/disable). Absent = enabled; `false` disables. Advisory until enforcement lands. */
+  herdrDelegation?: boolean;
+  adaptivePlanning?: boolean;
+  adaptiveWorkerEffort?: boolean;
+  verificationGate?: boolean;
+  reviewLoop?: boolean;
+}
+
+/** The five harness workflows that can be enabled/disabled from the TUI settings. */
+export type WorkflowToggleId = "herdrDelegation" | "adaptivePlanning" | "adaptiveWorkerEffort" | "verificationGate" | "reviewLoop";
+export const WORKFLOW_TOGGLE_IDS: readonly WorkflowToggleId[] = ["herdrDelegation", "adaptivePlanning", "adaptiveWorkerEffort", "verificationGate", "reviewLoop"];
+export const WORKFLOW_TOGGLE_META: Record<WorkflowToggleId, { label: string; short: string; description: string }> = {
+  herdrDelegation: { label: "Workflow: Herdr Delegation", short: "delegation", description: "Delegate implementation to Herdr Pi workers via herdr plan/run." },
+  adaptivePlanning: { label: "Workflow: Adaptive Planning", short: "planning", description: "Risk-based planning depth: compact for low risk, full Design Graph otherwise." },
+  adaptiveWorkerEffort: { label: "Workflow: Adaptive Worker Effort", short: "effort", description: "Per-run worker_thinking follows assessed risk (low→low, medium/high→high)." },
+  verificationGate: { label: "Workflow: Verification Gate", short: "verification", description: "Accept requires a fresh verify fingerprint bound to the exact handoff." },
+  reviewLoop: { label: "Workflow: Review Loop", short: "review", description: "Completed workers stay live in their panes for correct/accept review." }
+};
+
+/** Resolve the effective workflow toggles: absent/undefined means enabled (default), only an explicit `false` disables. */
+export function resolveWorkflowToggles(config: OrchestratorConfig | undefined): Record<WorkflowToggleId, boolean> {
+  return {
+    herdrDelegation: config?.herdrDelegation !== false,
+    adaptivePlanning: config?.adaptivePlanning !== false,
+    adaptiveWorkerEffort: config?.adaptiveWorkerEffort !== false,
+    verificationGate: config?.verificationGate !== false,
+    reviewLoop: config?.reviewLoop !== false
+  };
 }
 
 export interface OrchestratorState {
@@ -738,6 +766,8 @@ export async function saveOrchestratorConfig(
 export function formatOrchestratorBox(state: OrchestratorState): string {
   const { config, scope } = state;
   const scopeStr = scope === "project" ? "This project" : scope === "global" ? "Global" : "This session";
+  const workflows = resolveWorkflowToggles(config);
+  const tags = WORKFLOW_TOGGLE_IDS.map((id) => `${WORKFLOW_TOGGLE_META[id].short}:${workflows[id] ? "on" : "off"}`);
 
   const lines = [
     "┌ OpenAI Web Lead Architect ─────────────────────────────┐",
@@ -746,6 +776,8 @@ export function formatOrchestratorBox(state: OrchestratorState): string {
     `│ Thinking          ${config.workerThinking.padEnd(37)}│`,
     `│ Parallel workers  ${String(config.maxParallelWorkers).padEnd(37)}│`,
     `│ Delegation        ${config.delegationStrategy.padEnd(37)}│`,
+    `│ Workflows         ${tags.slice(0, 3).join(" ").padEnd(37)}│`,
+    `│                   ${tags.slice(3).join(" ").padEnd(37)}│`,
     "│                                                        │",
     `│ Scope             ${scopeStr.padEnd(37)}│`,
     ...(state.sourcePath ? [`│ Path              ${state.sourcePath.slice(-35).padStart(37)}│`] : []),
@@ -754,6 +786,11 @@ export function formatOrchestratorBox(state: OrchestratorState): string {
   return lines.join("\n");
 }
 
+/** Structural capability slice for TUIs that support custom components (the real UI API is richer; this is everything configureOrchestratorUI touches). */
+type CustomCapableUi = {
+  custom?: (mount: (tui: { requestRender?: () => void } | undefined, theme: GuiThemeLike, keyboard: unknown, done: (saved?: boolean) => void) => { render: (width: number) => string[]; invalidate: () => void; handleInput: (data: string) => void }) => Promise<boolean>;
+};
+
 export async function configureOrchestratorUI(
   ctx: ExtensionCommandContext,
   current: OrchestratorState,
@@ -761,9 +798,10 @@ export async function configureOrchestratorUI(
   onSave: (config: OrchestratorConfig, scope: OrchestratorScope) => Promise<void>
 ): Promise<void> {
   // If running in interactive TUI mode with custom component support, show rich SettingsList GUI
-  if (ctx.mode === "tui" && typeof (ctx.ui as any).custom === "function") {
+  const custom = (ctx.ui as CustomCapableUi | undefined)?.custom;
+  if (ctx.mode === "tui" && typeof custom === "function") {
     let savedState: OrchestratorState | undefined;
-    const wasSaved = await (ctx.ui as any).custom((tui: any, theme: any, _kb: any, done: (val?: boolean) => void) => {
+    const wasSaved = await custom((tui, theme, _keyboard, done) => {
       const comp = createOrchestratorSettingsComponent({
         current,
         availableModels,

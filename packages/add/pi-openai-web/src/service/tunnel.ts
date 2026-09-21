@@ -224,10 +224,10 @@ export class SecureTunnel {
     this.processState = "stopped";
     this.connectionState = "disconnected";
     const pid = child?.pid;
-    if (!pid) return;
+    if (!child || !pid) return;
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } resolve(); }, 3_000);
-      child!.once("exit", () => { clearTimeout(timer); resolve(); });
+      child.once("exit", () => { clearTimeout(timer); resolve(); });
       try { process.kill(pid, "SIGTERM"); } catch { clearTimeout(timer); resolve(); }
     });
   }

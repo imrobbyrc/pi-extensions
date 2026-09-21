@@ -5,15 +5,17 @@ import { WORKER_METADATA_FIELDS, canonicalWorkers, type WorkerMetadataField, typ
 
 // Structural snapshots (controller is typed loosely by the local .d.ts; the
 // shapes come from @imrobbyrc/pi-core-subagent TaskSnapshot/RunSnapshot).
-type AdapterTaskSnapshot = {
+export type AdapterTaskSnapshot = {
   id: string;
   status: string;
   runtime?: string;
   acceptedAt?: number;
+  corrections?: number;
+  error?: string;
   paneId?: string;
   cleanupPending?: { error: string; attempts: number; lastAttemptAt: number };
 };
-type AdapterRunSnapshot = { id: string; runtime: string; status: string; tasks: AdapterTaskSnapshot[] };
+export type AdapterRunSnapshot = { id: string; runtime: string; status: string; tasks: AdapterTaskSnapshot[] };
 
 const TERMINAL_RUN_STATUS = ["completed", "failed", "aborted"];
 
@@ -166,7 +168,7 @@ export class SubagentMcpAdapter {
     return { id: run.id, status: run.status, workers: run.tasks.map((task: { id: string; status: string }) => ({ id: task.id, state: task.status })) };
   }
 
-  status(runId?: string) {
+  status(runId?: string): AdapterRunSnapshot | AdapterRunSnapshot[] {
     const result = this.controller.status(runId);
     // Completed herdr workers stay live in their panes for lead review. Shut
     // down (and thereby close owned panes) only once nothing is active AND
@@ -193,7 +195,7 @@ export class SubagentMcpAdapter {
   }
 
   /** Lead review: a completed herdr worker reopens in its SAME pane/session via the core review loop; a still-running worker is steered. */
-  correct(runId: string, workerId: string, instructions: string) {
+  correct(runId: string, workerId: string, instructions: string): AdapterRunSnapshot {
     const ctx = this.context();
     const run = this.controller.status(runId) as AdapterRunSnapshot;
     const task = run.tasks.find((candidate: AdapterTaskSnapshot) => candidate.id === workerId);
@@ -201,33 +203,38 @@ export class SubagentMcpAdapter {
     // core review API — the latter yields its precise "already accepted" refusal.
     if (task && (isReviewableWorker(run, task) || task.acceptedAt)) {
       if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before reviewing herdr workers.");
-      return (this.controller as unknown as ReviewCapableController).correct(runId, workerId, instructions, ctx);
+      return this.reviewApi().correct(runId, workerId, instructions, ctx) as AdapterRunSnapshot;
     }
     return this.controller.steer(runId, workerId, instructions);
   }
 
   /** Explicit acceptance: finalizes a completed herdr worker — marks it accepted and closes its pane. Idempotent. */
-  async accept(runId: string, workerId: string) {
+  async accept(runId: string, workerId: string): Promise<AdapterRunSnapshot> {
     const ctx = this.context();
     if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before accepting herdr workers.");
     // The core accept API rejects when pane close fails. Do not catch or turn that
     // rejection into a successful-looking run snapshot: acceptance is transactional.
-    const result = await (this.controller as unknown as ReviewCapableController).accept(runId, workerId, ctx);
+    const result = await this.reviewApi().accept(runId, workerId, ctx);
     // Keep the provider boundary defensive for structural/older controllers that
     // return the manager's `{ ok: false, reason }` result instead of throwing.
     if (result && typeof result === "object" && "ok" in result && (result as { ok?: unknown }).ok === false) {
       throw new Error(String((result as { reason?: unknown }).reason ?? "herdr accept failed"));
     }
-    return result;
+    return result as AdapterRunSnapshot;
   }
 
   /** Retry terminal Herdr pane/agent cleanup that previously failed. */
   async retryCleanup(runId: string, workerId: string) {
     const ctx = this.context();
     if (!ctx) throw new Error("subagent_context_unavailable: start a Pi session before retrying Herdr cleanup.");
-    const retry = (this.controller as unknown as ReviewCapableController).retryCleanup;
+    const retry = this.reviewApi().retryCleanup;
     if (!retry) throw new Error("herdr_cleanup_retry_unavailable: core controller does not support retryCleanup.");
-    return retry.call(this.controller, runId, workerId, ctx);
+    return retry.call(this.reviewApi(), runId, workerId, ctx);
+  }
+
+  /** The core review API, hidden behind the loosely-typed controller shim (upstream declares it `any`); asserted once, here. */
+  private reviewApi(): ReviewCapableController {
+    return this.controller as unknown as ReviewCapableController;
   }
 
   stop(runId?: string) {

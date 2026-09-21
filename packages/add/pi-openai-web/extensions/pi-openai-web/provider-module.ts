@@ -339,7 +339,7 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       const infra = infrastructure ? await infrastructure.infraSnapshot() : { ready: false, mcp: "stopped", tunnel: "stopped", dia: "stopped" };
       const auth = await resolveCredential(cfg) ? "configured" : "missing (run /openai-web setup)";
       const orch = await getOrchestrator();
-      const runs = subagents ? (subagents.status() as any[]).slice(0, 5) : [];
+      const runs = subagents ? (subagents.status() as Array<{ id: string; status: string }>).slice(0, 5) : [];
       return [
         `openai-web provider: ${models.length} models registered (source: ${catalog.source}) · Lead Architect always on`,
         `Infrastructure: ${infra.ready ? "ready" : "idle/not ready"}`,

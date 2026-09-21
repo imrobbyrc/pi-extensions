@@ -93,13 +93,34 @@ describe("Lead Architect GUI Component", () => {
     assert.ok(rendered.includes("medium"), "Cycled to medium");
   });
 
+  it("shows every workflow toggle and cycles one off", () => {
+    const component = createOrchestratorSettingsComponent({
+      current: mockState,
+      availableModels: [],
+      onSave: async () => {},
+      onDone: () => {}
+    });
+
+    let rendered = component.render(80).join("\n");
+    for (const label of ["Workflow: Herdr Delegation", "Workflow: Adaptive Planning", "Workflow: Adaptive Worker Effort", "Workflow: Verification Gate", "Workflow: Review Loop"]) {
+      assert.ok(rendered.includes(label), `Includes ${label}`);
+      assert.ok(rendered.includes("on"), "Toggles default to on");
+    }
+
+    // Move to the first workflow toggle (item 4) and cycle it off with Space.
+    for (let i = 0; i < 4; i++) component.handleInput("\u001b[B");
+    component.handleInput(" ");
+    rendered = component.render(80).join("\n");
+    assert.ok(rendered.includes("off"), "Cycled to off");
+  });
+
   it("triggers onSave and onDone when Save & Apply is activated", async () => {
     let savedConfig: OrchestratorConfig | undefined;
     let savedScope: OrchestratorScope | undefined;
     let doneStatus: boolean | undefined;
 
     const component = createOrchestratorSettingsComponent({
-      current: mockState,
+      current: { config: { ...mockState.config, reviewLoop: false }, scope: "project" },
       availableModels: [],
       onSave: async (cfg, scp) => {
         savedConfig = cfg;
@@ -110,8 +131,8 @@ describe("Lead Architect GUI Component", () => {
       }
     });
 
-    // Navigate down to 'Save & Apply' (item 5)
-    for (let i = 0; i < 5; i++) {
+    // Navigate down to 'Save & Apply' (item 10: after 4 base settings + 5 workflow toggles)
+    for (let i = 0; i < 10; i++) {
       component.handleInput("\u001b[B");
     }
 
@@ -125,5 +146,11 @@ describe("Lead Architect GUI Component", () => {
     assert.equal(savedConfig?.workerModel, mockState.config.workerModel, "Worker model preserved");
     assert.equal(savedScope, "project", "Scope matches");
     assert.equal(doneStatus, true, "onDone called with true");
+    // Workflow toggles ride along explicitly — disabled ones stay disabled, the rest default on.
+    assert.equal(savedConfig?.reviewLoop, false, "Disabled workflow persists as false");
+    assert.equal(savedConfig?.herdrDelegation, true, "Default-on workflow saves as true");
+    assert.equal(savedConfig?.verificationGate, true);
+    assert.equal(savedConfig?.adaptivePlanning, true);
+    assert.equal(savedConfig?.adaptiveWorkerEffort, true);
   });
 });

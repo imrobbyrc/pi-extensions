@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { SubagentMcpAdapter, buildWorkerTask } from "../src/mcp/subagent-adapter.js";
+import { SubagentMcpAdapter, buildWorkerTask, type AdapterRunSnapshot } from "../src/mcp/subagent-adapter.js";
 import { createHarnessMcpFactory, HERDR_TOOL_DESCRIPTION } from "../src/mcp/server.js";
 import type { WorkerSlice } from "../src/provider/orchestrator.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
@@ -128,7 +128,7 @@ function completedHerdrRun() {
 
 test("review loop: run -> finish -> status keeps the completed worker alive for review", async () => {
   const { adapter } = loopHarness(completedHerdrRun());
-  const result = adapter.status("run-1");
+  const result = adapter.status("run-1") as AdapterRunSnapshot;
   assert.equal(result.tasks[0]?.status, "completed");
   // Reviewable completed herdr worker must NOT trigger auto-shutdown.
   const all = adapter.status() as any[];

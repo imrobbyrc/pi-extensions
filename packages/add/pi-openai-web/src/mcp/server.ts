@@ -7,15 +7,20 @@ import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkerSlice } from "../provider/orchestrator.js";
-import { buildWorkerTask } from "./subagent-adapter.js";
+import { buildWorkerTask, type AdapterRunSnapshot } from "./subagent-adapter.js";
 type HerdrWorker = WorkerSlice;
 
+/**
+ * Minimal structural view of a run snapshot the MCP handlers consume. The real
+ * shape is the core RunSnapshot (a superset); this narrow contract replaces
+ * `any` at the adapter seam while staying assignable from the real adapter.
+ */
 type HerdrMcpAdapter = {
   run(request: { goal: string; workers: HerdrWorker[]; workerModel?: string; workerThinking?: string; handoff: string }): Promise<{ id: string; status: string; workers: Array<{ id: string; state: string }> }>;
-  status(runId?: string): any;
-  correct(runId: string, workerId: string, instructions: string): any;
-  accept(runId: string, workerId: string): any;
-  stop(runId?: string): any;
+  status(runId?: string): AdapterRunSnapshot | AdapterRunSnapshot[];
+  correct(runId: string, workerId: string, instructions: string): AdapterRunSnapshot;
+  accept(runId: string, workerId: string): Promise<AdapterRunSnapshot>;
+  stop(runId?: string): unknown;
   /**
    * Read-only raw run-snapshot channel (core status semantics with no
    * lifecycle side effects). `herdr verify` inspects runs through this seam
@@ -47,7 +52,9 @@ export class McpToolActivity {
 /**
  * Bracket a harness tool handler so its execution counts as provider-turn
  * progress. `activity` is optional so non-runtime callers (tests, tooling)
- * can reuse handlers untracked.
+ * can reuse handlers untracked. `args` stays `any` deliberately: this is the
+ * dynamic boundary where the MCP SDK hands over schema-validated input and
+ * each inline handler destructures its own shape.
  */
 export function trackedTool<R>(
   activity: McpToolActivity | undefined,
