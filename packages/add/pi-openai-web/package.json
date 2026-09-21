@@ -20,7 +20,7 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.tests.json",
     "test": "node --import tsx --test tests/*.test.ts",
     "doctor": "tsx scripts/doctor.ts",
     "browser": "tsx scripts/start-browser.ts",
