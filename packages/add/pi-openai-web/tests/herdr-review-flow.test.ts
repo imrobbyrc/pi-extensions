@@ -288,7 +288,7 @@ test("review refuses without a live Pi session context", async () => {
 type RegisteredTool = { name: string; config: any; handler: (args: any) => Promise<any> };
 
 /** Capture tool registrations from a factory-built real McpServer without a live transport. */
-async function registeredHerdrToolsFor(adapter: unknown, workspaceRoot: string = process.cwd()): Promise<RegisteredTool[]> {
+async function registeredHerdrToolsFor(adapter: unknown, workspaceRoot: string = process.cwd(), factoryExtra: { workflows?: () => Record<string, boolean> } = {}): Promise<RegisteredTool[]> {
   const { McpServer } = await import("@modelcontextprotocol/server");
   const registrations: RegisteredTool[] = [];
   const original = McpServer.prototype.registerTool as (...args: any[]) => any;
@@ -300,7 +300,8 @@ async function registeredHerdrToolsFor(adapter: unknown, workspaceRoot: string =
     const factory = createHarnessMcpFactory({
       config: { maxReadLines: 400, maxFileBytes: 262_144 } as any,
       workspaceRoot,
-      subagent: adapter as any
+      subagent: adapter as any,
+      ...factoryExtra
     });
     factory();
     await Promise.resolve();
@@ -672,4 +673,65 @@ test("herdr verify fails closed when the workspace cannot be observed", async ()
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- Workflow toggle enforcement (TUI enable/disable is real, not advisory) ---
+
+const allOff = { herdrDelegation: false, adaptivePlanning: false, adaptiveWorkerEffort: false, verificationGate: false, reviewLoop: false };
+
+const planArgs = {
+  action: "plan" as const,
+  goal: "ship",
+  execution_spec: { suite: "focused" },
+  workers: [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }],
+  gates: planGates
+};
+
+test("workflow toggles are enforced: delegation off rejects run; effort lock rejects worker_thinking", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent, process.cwd(), { workflows: () => allOff }))[0]!;
+  const planned = parseToolText(await herdr.handler(planArgs));
+  assert.equal(planned.ok, true, "plan stays available for inspection even with delegation off");
+  await assert.rejects(
+    herdr.handler({ ...planArgs, action: "run", handoff: planned.handoff }),
+    /herdr_run_delegation_disabled/
+  );
+  // Adaptive effort locked: an explicit worker_thinking is refused even with delegation re-enabled.
+  const delegationOn = { ...allOff, herdrDelegation: true };
+  const herdrEffortLocked = (await registeredHerdrToolsFor(harness.mcpSubagent, process.cwd(), { workflows: () => delegationOn }))[0]!;
+  await assert.rejects(
+    herdrEffortLocked.handler({ ...planArgs, action: "run", handoff: planned.handoff, worker_thinking: "low" }),
+    /herdr_worker_effort_locked/
+  );
+});
+
+test("workflow toggles are enforced: verification gate off lifts the evidence requirement", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent, process.cwd(), { workflows: () => allOff }))[0]!;
+  const envelope = await planEnvelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  // No handoff, no fingerprint — with the gate disabled, accept delegates directly.
+  const result = parseToolText(await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1" }));
+  assert.equal(result.ok, true);
+  assert.ok(result.worker.accepted_at > 0);
+  // Contrast: gate ON (default) still fails closed without evidence — covered by the evidence-gate tests above.
+});
+
+test("workflow toggles are enforced: review loop off stops retaining completed workers", () => {
+  const calls: string[] = [];
+  const run = completedHerdrRun();
+  const controller = {
+    status: () => {
+      calls.push("status");
+      return structuredClone([run]);
+    },
+    hasActiveRun: () => false,
+    shutdown: () => calls.push("shutdown")
+  };
+  const adapterOn = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session, undefined, () => true);
+  adapterOn.status();
+  assert.equal(calls.filter((call) => call === "shutdown").length, 0, "review loop on keeps the reviewable worker's pane");
+  const adapterOff = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session, undefined, () => false);
+  adapterOff.status();
+  assert.equal(calls.filter((call) => call === "shutdown").length, 1, "review loop off releases the pane when idle");
 });

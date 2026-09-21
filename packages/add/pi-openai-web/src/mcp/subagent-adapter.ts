@@ -124,7 +124,9 @@ export class SubagentMcpAdapter {
   constructor(
     private readonly controller: SubagentController,
     private readonly context: () => ExtensionContext | undefined,
-    private readonly gate?: HerdrRunGateSource
+    private readonly gate?: HerdrRunGateSource,
+    /** Workflow enforcement: when provided and false, completed workers stop being retained for review (panes release when idle). */
+    private readonly reviewLoop?: () => boolean
   ) {}
 
   async run(request: { goal: string; workers: WorkerSlice[]; workerModel?: string; workerThinking?: string; handoff: string }) {
@@ -183,6 +185,8 @@ export class SubagentMcpAdapter {
   }
 
   private hasReviewableWorker(): boolean {
+    // Review-loop workflow disabled: no worker is retained for review.
+    if (this.reviewLoop && !this.reviewLoop()) return false;
     return (this.controller.status() as AdapterRunSnapshot[]).some((run) =>
       run.tasks.some((task) => isReviewableWorker(run, task))
     );

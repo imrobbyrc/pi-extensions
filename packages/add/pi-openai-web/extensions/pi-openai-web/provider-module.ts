@@ -13,6 +13,7 @@ import { SessionStore } from "../../src/provider/session-store.js";
 import { FileProviderResumeStore } from "../../src/provider/resume.js";
 import {
   loadOrchestratorState,
+  resolveWorkflowToggles,
   saveOrchestratorConfig,
   configureOrchestratorUI,
   handleOrchestratorCli,
@@ -137,19 +138,22 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
     if (!infrastructure) {
       const cfg = await config();
       if (!subagents) throw new Error("subagent_controller_unavailable");
+      await getOrchestrator();
       const subagentAdapter = new SubagentMcpAdapter(
         subagents,
         () => subagentContext,
         {
           ui: () => uiContext,
           autoApprove: () => cfg.harnessAutoApproveHerdrRun === true
-        }
+        },
+        () => resolveWorkflowToggles(orchestratorState?.config).reviewLoop
       );
       infrastructure = new HarnessRuntime(cfg, () => createHarnessMcpFactory({
         config: cfg,
         workspaceRoot: process.cwd(),
         subagent: subagentAdapter,
-        activity: mcpToolActivity
+        activity: mcpToolActivity,
+        workflows: () => resolveWorkflowToggles(orchestratorState?.config)
       })());
     }
     return infrastructure;

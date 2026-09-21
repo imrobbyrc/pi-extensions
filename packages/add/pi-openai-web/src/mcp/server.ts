@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkerSlice } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice } from "../provider/orchestrator.js";
 import { buildWorkerTask, type AdapterRunSnapshot } from "./subagent-adapter.js";
 type HerdrWorker = WorkerSlice;
 
@@ -114,7 +114,7 @@ export const HERDR_TOOL_DESCRIPTION = [
   "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's execution_spec or decision_graph verbatim (whichever the plan included — a changed, added, or removed decision_graph is rejected), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
-  "accept — accept one completed worker's work: requires run_id, worker_id, the exact Pi-issued handoff envelope, and the verification_fingerprint returned by a prior verify; the report is recomputed from fresh evidence immediately before the mutation and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated. On match: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
+  "accept — accept one completed worker's work: requires run_id, worker_id, the exact Pi-issued handoff envelope, and the verification_fingerprint returned by a prior verify; the report is recomputed from fresh evidence immediately before the mutation and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated (the verification workflow toggle can lift this evidence requirement). On match: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
   "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled execution spec and planning gates), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or a worker prompt that does not byte-match the deterministic minimal contract recomputed from the envelope (projection or authorization binding drift) fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
   "stop — stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
   "Workers always run as Pi agents (kind=pi); openai-web worker models are rejected."
@@ -259,12 +259,14 @@ export async function runHerdrVerification(deps: { runId: string; handoff: strin
   });
 }
 
-export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity }) {
+export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity; workflows?: () => Record<WorkflowToggleId, boolean> }) {
   return (): McpServer => {
     const server = new McpServer({ name: "pi-harness", version: "1.0.0" });
     const workspaceRoot = deps.workspaceRoot;
     const limits = { maxReadLines: deps.config.maxReadLines, maxFileBytes: deps.config.maxFileBytes };
     const track = <R>(handler: (args: any) => Promise<R>) => trackedTool(deps.activity, handler);
+    // Workflow enforcement source: fresh per call so TUI toggles apply without restart; absent = all enabled.
+    const workflows = () => deps.workflows?.() ?? resolveWorkflowToggles(undefined);
 
     server.registerTool(
       "repo_map",
@@ -369,6 +371,13 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and execution_spec or decision_graph (whichever was provided)." });
         }
         if (action === "run") {
+          // Workflow enforcement (fail-closed): the operator's TUI toggles gate the mutating paths.
+          if (!workflows().herdrDelegation) {
+            throw new Error("herdr_run_delegation_disabled: the operator disabled the Herdr delegation workflow; re-enable it in the Lead settings to run workers.");
+          }
+          if (worker_thinking && !workflows().adaptiveWorkerEffort) {
+            throw new Error("herdr_worker_effort_locked: adaptive worker effort is disabled by the operator; omit worker_thinking and the configured profile default applies.");
+          }
           // The envelope's authorized slices are the single source of truth for
           // what each worker is told — already fingerprint-bound to this exact
           // goal/workers/spec, so run-time args can never drift from the plan.
@@ -388,14 +397,17 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }
         if (action === "accept") {
           if (!run_id || !worker_id) throw new Error("herdr accept requires run_id and worker_id.");
-          if (!handoff?.trim() || !verification_fingerprint) throw new Error("herdr accept requires the exact Pi-issued handoff and the verification_fingerprint from herdr action=verify.");
-          // Freshness gate: recompute the verification report from live
-          // evidence NOW and compare against the reviewed fingerprint BEFORE
-          // any mutation — accepted bookkeeping is fingerprint-exempt, so this
-          // matches exactly when nothing else in the run/workspace drifted.
-          const fresh = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
-          if (verificationFingerprint(fresh) !== verification_fingerprint) {
-            throw new Error("herdr accept fingerprint mismatch: current run/workspace evidence no longer matches the reviewed verification report (re-run herdr action=verify and accept the fresh fingerprint).");
+          const evidenceGate = workflows().verificationGate;
+          if (evidenceGate && (!handoff?.trim() || !verification_fingerprint)) throw new Error("herdr accept requires the exact Pi-issued handoff and the verification_fingerprint from herdr action=verify.");
+          if (evidenceGate) {
+            // Freshness gate: recompute the verification report from live
+            // evidence NOW and compare against the reviewed fingerprint BEFORE
+            // any mutation — accepted bookkeeping is fingerprint-exempt, so this
+            // matches exactly when nothing else in the run/workspace drifted.
+            const fresh = await runHerdrVerification({ runId: run_id, handoff: handoff as string, subagent: deps.subagent, workspaceRoot });
+            if (verificationFingerprint(fresh) !== verification_fingerprint) {
+              throw new Error("herdr accept fingerprint mismatch: current run/workspace evidence no longer matches the reviewed verification report (re-run herdr action=verify and accept the fresh fingerprint).");
+            }
           }
           const run = await deps.subagent.accept(run_id, worker_id);
           const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
