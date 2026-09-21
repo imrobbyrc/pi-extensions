@@ -99,7 +99,7 @@ const herdrGates = z.object({
   critique: herdrText(HERDR_ITEM_MAX)
 });
 
-/** Phase-1 execution spec: a bounded non-empty string map (every plan carries one — directly or compiled from a decision graph). */
+/** Bounded legacy schema retained for direct internal callers; MCP exposes decision_graph only. */
 export const herdrExecutionSpec = z.record(z.string().min(1).max(EXECUTION_SPEC_KEY_MAX), herdrText(EXECUTION_SPEC_VALUE_MAX))
   .refine((spec) => Object.keys(spec).length >= 1 && Object.keys(spec).length <= EXECUTION_SPEC_MAX_ENTRIES, { message: `execution_spec must contain 1-${EXECUTION_SPEC_MAX_ENTRIES} entries` });
 
@@ -110,12 +110,12 @@ export const herdrDecisionGraph = z.strictObject(
 
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
-  "plan — validate planning gates {graph, handoff, critique} and the decomposition as one legal work graph (unique worker ids, dependencies referencing existing workers, no cycles, and no overlapping ownership between workers that no dependency path serializes — invalid graphs fail closed with work_graph_invalid), then return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), execution_spec or decision_graph (exactly one of which is required — a spec-less plan is rejected), and envelope string verbatim. A decision_graph carries your planning decisions as exactly nine non-blank axes (problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique), is mutually exclusive with execution_spec, and is compiled deterministically into the plan's execution spec — worker slice lists derive from that compiled spec, so workers cannot invent requirements.",
-  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's execution_spec or decision_graph verbatim (whichever the plan included — a changed, added, or removed decision_graph is rejected), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
+  "plan — validate planning gates {graph, handoff, critique} and the decomposition as one legal work graph (unique worker ids, dependencies referencing existing workers, no cycles, and no overlapping ownership between workers that no dependency path serializes — invalid graphs fail closed with work_graph_invalid), then return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), decision_graph, and envelope string verbatim. decision_graph is the sole planning authority: exactly nine non-blank axes (problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique) are compiled deterministically by Pi for binding and verification — workers cannot invent requirements.",
+  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's decision_graph verbatim (a changed, added, or removed graph is rejected), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
   "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
   "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
   "accept — accept one completed worker's work: requires run_id, worker_id, the exact Pi-issued handoff envelope, and the verification_fingerprint returned by a prior verify; the report is recomputed from fresh evidence immediately before the mutation and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated (the verification workflow toggle can lift this evidence requirement). On match: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
-  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled execution spec and planning gates), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or a worker prompt that does not byte-match the deterministic minimal contract recomputed from the envelope (projection or authorization binding drift) fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
+  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled decision_graph authority and planning gates), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or a worker prompt that does not byte-match the deterministic minimal contract recomputed from the envelope (projection or authorization binding drift) fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
   "stop — stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
   "Workers always run as Pi agents (kind=pi); openai-web worker models are rejected."
 ].join(" ");
@@ -136,6 +136,7 @@ export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[
   // legal work graph (unique ids, known dependencies, no cycles, no unordered
   // ownership overlap) before any envelope comparison runs.
   assertWorkGraph(input.workers.map((worker) => assertWorkerSlice(worker)));
+  if (input.decision_graph === undefined && input.execution_spec === undefined) throw new Error("execution_spec_invalid: an execution_spec or decision_graph is required");
   // Phase-3 binding: a run-time decision_graph is compiled HERE, never taken
   // from a caller-asserted spec, so any graph drift against the plan fails closed.
   const executionSpec = input.decision_graph !== undefined ? compileDecisionGraph(assertDecisionGraph(input.decision_graph)) : assertExecutionSpec(input.execution_spec);
@@ -363,7 +364,6 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           goal: herdrText(HERDR_GOAL_MAX).optional(),
           workers: herdrWorkers.optional(),
           gates: herdrGates.optional(),
-          execution_spec: herdrExecutionSpec.optional(),
           decision_graph: herdrDecisionGraph.optional(),
           worker_model: z.string().trim().min(1).max(200).optional(),
           worker_thinking: z.string().trim().min(1).max(100).optional(),
@@ -375,11 +375,12 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
-      track(async ({ action, goal, workers, gates, execution_spec, decision_graph, worker_model, worker_thinking, handoff, verification_fingerprint, run_id, worker_id, instructions }) => {
+      track(async (args) => {
+        const { action, goal, workers, gates, decision_graph, worker_model, worker_thinking, handoff, verification_fingerprint, run_id, worker_id, instructions } = args;
+        const execution_spec = (args as { execution_spec?: unknown }).execution_spec;
         if (action === "plan") {
-          if (!goal || !workers || !gates) throw new Error("herdr plan requires goal, workers, and planning gates {graph, handoff, critique}.");
-          assertSpecSourceExclusive(execution_spec, decision_graph);
-          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and execution_spec or decision_graph (whichever was provided)." });
+          if (!goal || !workers || !gates || (!decision_graph && execution_spec === undefined)) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
+          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and decision_graph." });
         }
         if (action === "run") {
           // Workflow enforcement (fail-closed): effort lock gates the per-run thinking argument.

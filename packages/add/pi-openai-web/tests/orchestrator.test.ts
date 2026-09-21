@@ -326,11 +326,11 @@ test("handoff envelopes round-trip complete worker slices and metadata-free work
   assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates, executionSpec: { suite: "focused" }, workers: [{ ...sliceWorker, requirements: [] }] }), /worker_slice_invalid/);
 });
 
-test("Lead contract documents declarative worker slices and execution_spec derivation", () => {
+test("Lead contract documents declarative worker slices and decision_graph derivation", () => {
   const prompt = buildLeadContract(undefined);
   assert.match(prompt, /requirements, behaviors, seams, acceptance/);
   assert.match(prompt, /immutably bound into the plan fingerprint and handoff envelope/);
-  assert.match(prompt, /worker slices derive from it/);
+  assert.match(prompt, /Worker slices derive from the decision_graph's compiled authority/);
   assert.match(prompt, /workers cannot invent requirements/);
   assert.match(prompt, /each worker's prompt receives its assigned immutable slice/);
 });
@@ -619,9 +619,9 @@ test("Lead contract documents the decision_graph contract", () => {
   const prompt = buildLeadContract(undefined);
   assert.match(prompt, /decision_graph/);
   assert.match(prompt, /problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique/);
-  assert.match(prompt, /mutually exclusive/);
+  assert.match(prompt, /decision_graph.*sole planning authority/);
   assert.match(prompt, /mechanically compiled/);
-  assert.match(prompt, /a changed, added, or removed decision_graph is rejected/);
+  assert.match(prompt, /a changed, added, or removed graph is rejected/);
 });
 
 // --- Adaptive planning policy (V5 Phase 1: planning depth follows assessed risk) ---
@@ -635,7 +635,7 @@ test("Lead contract defines the three-level adaptive planning policy with compac
   // Low risk permits compact planning: the four compact elements, not all nine Design Graph axes.
   assert.match(prompt, /Low risk[\s\S]*?compact planning is sufficient/);
   assert.match(prompt, /the problem, scope\/boundaries \(what may change and what must not\), intended behavior, and verification/);
-  assert.match(prompt, /multi-worker decomposition is optional at this level, but an execution_spec or decision_graph is always required/);
+  assert.match(prompt, /multi-worker decomposition is optional at this level, but decision_graph is always required/);
   // The V4 planning gates and work-graph rules are not relaxed by adaptation.
   assert.match(prompt, /the planning gates \{graph, handoff, critique\} and the work-graph rules apply identically at every level; only planning depth adapts/);
 });

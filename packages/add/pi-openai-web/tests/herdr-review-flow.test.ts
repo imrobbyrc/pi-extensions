@@ -328,6 +328,17 @@ test("herdr tool registers the full action set including the observational verif
   assert.match(HERDR_TOOL_DESCRIPTION, /never scores or passes\/fails work/);
 });
 
+test("herdr plan/run expose decision_graph as the only planning input", async () => {
+  const herdr = (await registeredHerdrToolsFor(loopHarness(completedHerdrRun()).adapter))[0]!;
+  const shape = (herdr.config.inputSchema as any).shape;
+  assert.equal(shape.execution_spec, undefined);
+  assert.ok(shape.decision_graph, "decision_graph must remain available");
+  await assert.rejects(
+    herdr.handler({ action: "plan", goal: "ship", workers: [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }], gates: planGates }),
+    /decision_graph/
+  );
+});
+
 test("herdr accept handler requires run_id and worker_id and reports the finalized worker", async () => {
   const harness = loopHarness(completedHerdrRun());
   const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
