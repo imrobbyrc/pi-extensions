@@ -29,7 +29,7 @@ npm test
 - `config.test.ts` — config loading and planner-era field rejection.
 - `path-safety.test.ts` — workspace path containment and traversal rejection.
 
-This package's suite currently runs 242 tests (verified via `npm test`). The `@imrobbyrc/pi-core-subagent` suite lives in its own package and is run separately (`bun test`); see that package for its current count.
+This package's suite currently runs 256 tests (verified via `npm test`). The `@imrobbyrc/pi-core-subagent` suite lives in its own package and is run separately (`bun test`); see that package for its current count.
 
 ## Manual/live checks (not in CI)
 

@@ -116,8 +116,17 @@ function fakeClient(frames: Frame[]) {
           const json = JSON.stringify(current.tree);
           return { result: { value: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" } } };
         }
-        if (expression.includes("[data-turn-id=")) {
-          return { result: { value: current.tree } };
+        if (expression.includes("piAtomicTurnCapture")) {
+          if (current.tree === undefined || current.tree === null) return { result: { value: null } };
+          const json = JSON.stringify(current.tree);
+          return { result: { value: {
+            identity: current.state.responseIdentities[0],
+            busy: current.state.busy,
+            stopVisible: current.state.stopVisible,
+            completionVisible: current.state.completionActionVisible,
+            revision: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" },
+            tree: current.tree
+          } } };
         }
         if (expression.includes("stop-button")) {
           stopClicks += 1;

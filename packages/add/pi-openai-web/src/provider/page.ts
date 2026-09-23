@@ -326,15 +326,26 @@ export function assistantRevisionRequiresSerialization(
     || prior.languageKey !== revision.languageKey;
 }
 
-/**
- * Serialize the assistant message at the given index into a JSON tree (answer.ts
- * converts it to markdown in Node). Index-based so ownership is decided by the caller.
- */
-export async function serializeAssistantTurn(client: CdpClient, identity: string): Promise<unknown | undefined> {
-  return evalJson(client, `() => {
+export interface AssistantTurnCapture {
+  identity: string;
+  busy: boolean;
+  stopVisible: boolean;
+  completionVisible: boolean;
+  revision: AssistantTurnRevision;
+  tree: unknown;
+}
+
+/** Atomically capture completion state and content from one DOM revision. */
+export async function captureAssistantTurn(client: CdpClient, identity: string): Promise<AssistantTurnCapture | undefined> {
+  const capture = await evalJson<AssistantTurnCapture | null>(client, `/* piAtomicTurnCapture */ () => {
     const wanted = ${JSON.stringify(identity)};
     const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']');
-    if (!message) return undefined;
+    if (!message) return null;
+    const checksum = (text) => {
+      let sum = 0;
+      for (let index = 0; index < text.length; index += 1) sum = (Math.imul(31, sum) + text.charCodeAt(index)) | 0;
+      return sum;
+    };
     const isExcluded = (node) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return false;
       const tag = node.tagName;
@@ -355,8 +366,24 @@ export async function serializeAssistantTurn(client: CdpClient, identity: string
       if (node.tagName === 'CODE' && !node.querySelector('code')) entry.text = node.textContent;
       return entry;
     };
-    return serialize(message, false);
+    const text = message.textContent || '';
+    const links = [...message.querySelectorAll('a[href]')].map(link => link.getAttribute('href') || '').join('|');
+    const languageKey = [...message.querySelectorAll('code[class*="language-"]')].map(code => code.className).join('|');
+    return {
+      identity: message.getAttribute('data-turn-id') || wanted,
+      busy: Boolean(message.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') || message.getAttribute('aria-busy') === 'true'),
+      stopVisible: Boolean([...document.querySelectorAll('${STOP_BUTTON_SELECTOR}')].find(el => el.offsetParent !== null)),
+      completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
+      revision: { textLength: text.length, textChecksum: checksum(text), childCount: message.childElementCount, linkChecksum: checksum(links), languageKey },
+      tree: serialize(message, false)
+    };
   }`);
+  return capture ?? undefined;
+}
+
+/** Serialize one identity-bound assistant turn. */
+export async function serializeAssistantTurn(client: CdpClient, identity: string): Promise<unknown | undefined> {
+  return (await captureAssistantTurn(client, identity))?.tree;
 }
 
 /** Compatibility serializer; callers binding turns should use serializeAssistantTurn. */

@@ -144,9 +144,18 @@ function watchClient(frames: Frame[]) {
           const json = JSON.stringify(current.tree);
           return { result: { value: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" } } };
         }
-        if (expression.includes("isExcluded")) {
+        if (expression.includes("piAtomicTurnCapture")) {
           serializations += 1;
-          return { result: { value: current.tree } };
+          if (current.tree === undefined || current.tree === null) return { result: { value: null } };
+          const json = JSON.stringify(current.tree);
+          return { result: { value: {
+            identity: current.state.responseIdentities[0],
+            busy: current.state.busy,
+            stopVisible: current.state.stopVisible,
+            completionVisible: current.state.completionActionVisible,
+            revision: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" },
+            tree: current.tree
+          } } };
         }
         if (expression.includes("stop-button")) {
           stopClicks += 1;
@@ -315,11 +324,11 @@ test("unchanged content revision reuses the snapshot; completion still fires", a
     const outcome = await h.run();
     assert.equal(outcome.kind, "completed", outcome.error);
     assert.equal(outcome.markdown, "Stable answer");
-    // Poll timeline: serialize+emit -> stable -> stable-complete.
-    assert.equal(h.pollCount(), 3);
-    // The cheap revision probe runs every poll; full serialization runs once.
-    assert.equal(h.revisionProbeCount(), 3);
-    assert.equal(h.serializeCount(), 1);
+    // Time-based quiescence needs four idle polls at the default cadence.
+    assert.equal(h.pollCount(), 4);
+    // Cheap probes still gate streaming work; completion uses fresh atomic captures.
+    assert.equal(h.revisionProbeCount(), 4);
+    assert.equal(h.serializeCount(), 6);
     assert.deepEqual(emitted, ["Stable answer"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -348,9 +357,9 @@ test("shrinks and same-length rewrites still reserialize and reach onText", asyn
     assert.equal(outcome.kind, "completed", outcome.error);
     assert.equal(outcome.markdown, "axc");
     assert.deepEqual(emitted, ["abcdef", "abc", "axc"]);
-    // Every content revision reserialized; only the final stable polls reused.
-    assert.equal(h.serializeCount(), 3);
-    assert.equal(h.revisionProbeCount(), 5);
+    // Every content revision reserializes; completion adds fresh atomic captures.
+    assert.equal(h.serializeCount(), 8);
+    assert.equal(h.revisionProbeCount(), 7);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

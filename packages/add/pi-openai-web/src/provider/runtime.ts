@@ -5,7 +5,7 @@ import { extractConversationId, isValidConversationId, toTemporaryChatUrl } from
 import type { OpenAIWebModelCatalog } from "./catalog.js";
 import { treeToMarkdown, type DomTreeNode } from "./answer.js";
 import {
-  assistantRevisionRequiresSerialization, attach, currentUrl, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
+  assistantRevisionRequiresSerialization, attach, captureAssistantTurn, currentUrl, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
   readAssistantTurnRevision, readTurnState, serializeAssistantTurn, sleep, stopGeneration, submitPrompt,
   waitForComposer, waitForConversationUrl, type AssistantTurnRevision, type CdpClient,
   type SerializedAssistantTurn, type TurnDomState
@@ -31,6 +31,17 @@ export const DEFAULT_WATCH_POLL_CADENCE = {
   idleMs: 600,
   harnessWaitMs: 1_200
 } as const;
+
+const COMPLETION_SETTLE_MS = { semantic: 1_250, fallback: 2_500 } as const;
+const COMPLETION_SETTLE_CAPTURES = { semantic: 3, fallback: 4 } as const;
+
+interface CompletionSettle {
+  identity: string;
+  markdown: string;
+  kind: keyof typeof COMPLETION_SETTLE_MS;
+  since: number;
+  captures: number;
+}
 
 export function resumeConversationMatches(expectedId: string | undefined, url: string): boolean {
   return !expectedId || extractConversationId(url) === expectedId;
@@ -683,7 +694,7 @@ export class OpenAIWebRuntime {
     // the output path so it can replace stale streamed text.
     let lastText = "";
     let lastSerialized: SerializedAssistantTurn | undefined;
-    let stablePolls = 0;
+    let settle: CompletionSettle | undefined;
     let harnessWasActive = false;
     let harnessSettledGraceUntil = 0;
     const stallGraceAfterHarnessMs = this.config.providerStallGraceMs ?? 30_000;
@@ -742,7 +753,7 @@ export class OpenAIWebRuntime {
         }
       }
       const turnMarkdown = currentFullMarkdown;
-      const markdownChanged = turnMarkdown !== lastText;
+      let markdownChanged = turnMarkdown !== lastText;
       // Tool-call/reasoning turns can have a stable assistant identity but no
       // text or busy marker yet. Identity proves provider turn is alive.
       if (identity && turnMarkdown.length === 0) controller.touchProgress();
@@ -751,7 +762,7 @@ export class OpenAIWebRuntime {
       if (state.stopVisible || state.busy) {
         // Busy state refreshes the browser-activity heartbeat above. Only new
         // assistant text drives completion; hard timeout still bounds a spinner.
-        stablePolls = 0;
+        settle = undefined;
         if (markdownChanged) {
           controller.touchProgress();
           handlers.onText?.(turnMarkdown);
@@ -760,23 +771,48 @@ export class OpenAIWebRuntime {
       } else if (turnMarkdown.length > 0) {
         if (markdownChanged) {
           controller.touchProgress();
-          stablePolls = 0;
           handlers.onText?.(turnMarkdown);
           lastText = turnMarkdown;
-        } else {
-          stablePolls += 1;
+          settle = undefined;
         }
-        // Copy action is ChatGPT's semantic completion signal; text stability alone can
-        // observe a remounted/virtualized partial turn.
-        const semanticCompletion = state.completionActionVisible
-          && state.completionResponseIdentity === identity;
-        // ChatGPT can render a finished response without mounting its copy
-        // action. Stable, non-busy text is the fallback completion signal.
-        if ((semanticCompletion || !state.completionActionVisible)
-          && stablePolls >= 2 && turnMarkdown.length > 0) {
-          controller.transition("completed");
-          this.emit("provider_completed", { model: controller.descriptor.id, chars: turnMarkdown.length });
-          return { kind: "completed", markdown: turnMarkdown };
+
+        // Completion state and content must come from one DOM revision. Copy
+        // action is the semantic signal; missing-copy fallback settles longer.
+        const capture = identity ? await captureAssistantTurn(conversation.client, identity).catch(() => undefined) : undefined;
+        if (!identity || !capture || capture.identity !== identity || capture.busy || capture.stopVisible) {
+          settle = undefined;
+        } else {
+          const markdown = capture.tree ? treeToMarkdown(capture.tree as DomTreeNode) : "";
+          const kind: CompletionSettle["kind"] = capture.completionVisible ? "semantic" : "fallback";
+          lastSerialized = { identity, revision: capture.revision };
+          if (markdown && markdown !== lastText) {
+            handlers.onText?.(markdown);
+            lastText = markdown;
+            markdownChanged = true;
+            controller.touchProgress();
+            settle = undefined;
+          }
+          if (markdown) {
+            const now = Date.now();
+            if (!settle || settle.identity !== identity || settle.markdown !== markdown || settle.kind !== kind) {
+              settle = { identity, markdown, kind, since: now, captures: 1 };
+            } else {
+              settle.captures += 1;
+            }
+            if (harnessSettledGraceUntil <= Date.now()) controller.touchProgress();
+            if (settle.captures >= COMPLETION_SETTLE_CAPTURES[kind]
+              && now - settle.since >= COMPLETION_SETTLE_MS[kind]) {
+              const finalCapture = await captureAssistantTurn(conversation.client, identity).catch(() => undefined);
+              const finalMarkdown = finalCapture?.tree ? treeToMarkdown(finalCapture.tree as DomTreeNode) : "";
+              if (finalCapture?.identity === identity && !finalCapture.busy && !finalCapture.stopVisible
+                && finalCapture.completionVisible === capture.completionVisible && finalMarkdown === settle.markdown) {
+                controller.transition("completed");
+                this.emit("provider_completed", { model: controller.descriptor.id, chars: finalMarkdown.length });
+                return { kind: "completed", markdown: finalMarkdown };
+              }
+              settle = undefined;
+            }
+          }
         }
       }
 
