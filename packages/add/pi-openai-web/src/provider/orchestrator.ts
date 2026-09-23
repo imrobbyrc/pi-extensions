@@ -352,10 +352,11 @@ export interface DecisionGraph {
 /** Shared bound for every decision_graph axis; equal to the spec value bound so the compiled form is always a valid ExecutionSpec. */
 export const DECISION_GRAPH_VALUE_MAX = EXECUTION_SPEC_VALUE_MAX;
 
-/** decision_graph and direct execution_spec describe the same spec slot — supplying both is ambiguous and fails closed. */
-export function assertSpecSourceExclusive(executionSpec: unknown, decisionGraph: unknown): void {
-  if (executionSpec !== undefined && decisionGraph !== undefined) {
-    throw new Error("decision_graph_exclusive: provide either decision_graph or execution_spec, not both");
+/** decision_graph and direct execution_spec describe the same spec slot — supplying both is ambiguous and fails closed. P1: the compact plan is a third source of the same slot and joins the exclusivity check. */
+export function assertSpecSourceExclusive(executionSpec: unknown, decisionGraph: unknown, compactPlan?: unknown): void {
+  const sources = [executionSpec !== undefined, decisionGraph !== undefined, compactPlan !== undefined].filter(Boolean).length;
+  if (sources > 1) {
+    throw new Error("decision_graph_exclusive: provide only one of decision_graph, execution_spec, or compact_plan");
   }
 }
 
@@ -423,7 +424,9 @@ export function buildHerdrHandoff(input: { taskId: string; planFingerprint: stri
   return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, ...(executionSpec ? { executionSpec } : {}), workers, authority: "Pi" });
 }
 
-/** The validated parse result of one Pi-issued handoff envelope. */
+/** The validated parse result of one Pi-issued handoff envelope. P1: version-aware — v1 envelopes keep their exact legacy fields; v2 envelopes additionally carry risk + planningKind. */
+export type HerdrHandoffVersion = "v1" | "v2";
+
 export interface ParsedHerdrHandoff {
   taskId: string;
   planFingerprint: string;
@@ -431,15 +434,35 @@ export interface ParsedHerdrHandoff {
   workers: WorkerSlice[];
   order: string[];
   executionSpec: ExecutionSpec;
+  /** Compatibility boundary result: which protocol the envelope spoke. */
+  version: HerdrHandoffVersion;
+  /** v2 only: the risk level bound into the plan identity. */
+  risk?: RiskLevel;
+  /** v2 only: the planning kind bound into the plan identity. */
+  planningKind?: PlanningKind;
 }
 
 export function parseHerdrHandoff(text: string): ParsedHerdrHandoff {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
-    if (value.protocol !== "pi-provider-herdr-handoff-v1" || value.authority !== "Pi"
+    // Compatibility boundary: legacy v1 envelopes keep their strict semantics;
+    // v2 adds the risk-aware identity fields. Any other protocol is invalid.
+    const isV2 = value.protocol === "pi-provider-herdr-handoff-v2";
+    if (value.protocol !== "pi-provider-herdr-handoff-v1" && !isV2) throw new Error();
+    if (value.authority !== "Pi"
       || typeof value.taskId !== "string" || !value.taskId.trim()
       || typeof value.planFingerprint !== "string" || !value.planFingerprint.trim()
       || !Array.isArray(value.workers) || value.workers.length === 0) throw new Error();
+    let risk: RiskLevel | undefined;
+    let planningKind: PlanningKind | undefined;
+    if (isV2) {
+      risk = assertRiskLevel(value.risk);
+      planningKind = assertPlanningKind(value.planningKind);
+    } else if (value.risk !== undefined || value.planningKind !== undefined) {
+      // A v1-shaped envelope carrying v2 identity fields is a downgrade forgery,
+      // not a legacy envelope — the boundary never relabels risk-aware state onto v1.
+      throw new Error("handoff_version_invalid: a v1 handoff envelope cannot carry risk-aware planning fields");
+    }
     const gates = value.gates as OrchestrationGates | undefined;
     assertOrchestrationGates(gates);
     const executionSpec = assertExecutionSpec(value.executionSpec);
@@ -447,11 +470,154 @@ export function parseHerdrHandoff(text: string): ParsedHerdrHandoff {
     // Fail closed at parse time: a tampered envelope whose workers no longer
     // form one legal work graph is rejected before any caller can run it.
     const order = assertWorkGraph(workers).order;
-    return { taskId: value.taskId, planFingerprint: value.planFingerprint, gates, workers, order, executionSpec };
+    return {
+      taskId: value.taskId,
+      planFingerprint: value.planFingerprint,
+      gates,
+      workers,
+      order,
+      executionSpec,
+      version: isV2 ? "v2" : "v1",
+      ...(risk !== undefined ? { risk } : {}),
+      ...(planningKind !== undefined ? { planningKind } : {})
+    };
   } catch (error) {
-    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid") || error.message.startsWith("work_graph_invalid"))) throw error;
+    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid") || error.message.startsWith("work_graph_invalid") || error.message.startsWith("risk_level_invalid") || error.message.startsWith("planning_kind_invalid") || error.message.startsWith("handoff_version_invalid"))) throw error;
     throw new Error("orchestration_handoff_invalid: expected Pi-issued handoff envelope");
   }
+}
+
+// --- P1 planning foundation: bounded RiskLevel, CompactPlan authority, and risk-aware v2 handoffs ---
+//
+// Compatibility-only slice. CompactPlan is the explicit low-risk planning
+// authority: it compiles deterministically into the SAME ExecutionSpec path
+// decision graphs use (no fabricated shapes/graph/cardinality/boundaries or
+// critique axes — exactly four bounded fields). v2 handoffs bind risk +
+// planning kind into the immutable plan identity while v1 issuance, parsing,
+// and run validation stay byte-stable. Nothing here changes Lead runtime
+// behavior: buildLeadContract and the herdr tool description are untouched,
+// so compact planning is not yet activated — only issuable, parseable, and
+// validatable.
+
+/** Bounded risk levels for planning depth; the v2 identity binds the assessed level verbatim. */
+export const RISK_LEVELS = ["low", "medium", "high"] as const;
+export type RiskLevel = (typeof RISK_LEVELS)[number];
+
+export function assertRiskLevel(risk: unknown): RiskLevel {
+  if (typeof risk !== "string" || !(RISK_LEVELS as readonly string[]).includes(risk)) {
+    throw new Error(`risk_level_invalid: risk must be one of ${JSON.stringify(RISK_LEVELS)}`);
+  }
+  return risk as RiskLevel;
+}
+
+/** Bounded planning kinds: the compact low-risk plan or the full Design Graph. */
+export const PLANNING_KINDS = ["compact", "design-graph"] as const;
+export type PlanningKind = (typeof PLANNING_KINDS)[number];
+
+export function assertPlanningKind(kind: unknown): PlanningKind {
+  if (typeof kind !== "string" || !(PLANNING_KINDS as readonly string[]).includes(kind)) {
+    throw new Error(`planning_kind_invalid: planning_kind must be one of ${JSON.stringify(PLANNING_KINDS)}`);
+  }
+  return kind as PlanningKind;
+}
+
+/**
+ * Low-risk planning authority: exactly these four bounded non-blank fields, no
+ * more, no less. Extra keys are rejected so a compact plan can never silently
+ * grow Design Graph axes — escalation means re-planning with decision_graph.
+ */
+export const COMPACT_PLAN_FIELDS = ["problem", "scope", "behavior", "verification"] as const;
+export type CompactPlanField = (typeof COMPACT_PLAN_FIELDS)[number];
+
+export interface CompactPlan {
+  problem: string;
+  scope: string;
+  behavior: string;
+  verification: string;
+}
+
+/** Shared bound for every compact_plan field; equal to the spec value bound so the compiled form is always a valid ExecutionSpec. */
+export const COMPACT_PLAN_VALUE_MAX = EXECUTION_SPEC_VALUE_MAX;
+
+/** Validate a compact plan: exactly four required, bounded, non-blank string fields; throws compact_plan_invalid on any shape drift. */
+export function assertCompactPlan(plan: unknown): CompactPlan {
+  if (typeof plan !== "object" || plan === null || Array.isArray(plan)) {
+    throw new Error(`compact_plan_invalid: expected an object with exactly four fields: ${COMPACT_PLAN_FIELDS.join(", ")}`);
+  }
+  const record = plan as Record<string, unknown>;
+  const extra = Object.keys(record).filter((key) => !(COMPACT_PLAN_FIELDS as readonly string[]).includes(key));
+  if (extra.length > 0) throw new Error(`compact_plan_invalid: unknown field ${JSON.stringify(extra[0])}; exactly four fields are allowed: ${COMPACT_PLAN_FIELDS.join(", ")}`);
+  const normalized = {} as CompactPlan;
+  for (const field of COMPACT_PLAN_FIELDS) {
+    const value = record[field];
+    if (typeof value !== "string" || !value.trim()) throw new Error(`compact_plan_invalid: ${field} is required and must be a non-blank string`);
+    if (value.length > COMPACT_PLAN_VALUE_MAX) throw new Error(`compact_plan_invalid: ${field} must be at most ${COMPACT_PLAN_VALUE_MAX} characters`);
+    normalized[field] = value;
+  }
+  return normalized;
+}
+
+/**
+ * P1 mechanical compile: the exact four compact fields map verbatim onto the
+ * existing ExecutionSpec authority path — one `compact.<field>` entry per
+ * field, fixed field order, values untouched. No re-reasoning and no invented
+ * axes: the compiled spec is the single authority a compact plan binds
+ * (fingerprint, envelope, run validation), so a compact_plan is just an input
+ * spelling for one canonical spec, and field key order never matters.
+ */
+export function compileCompactPlan(plan: CompactPlan): ExecutionSpec {
+  const spec: ExecutionSpec = {};
+  for (const field of COMPACT_PLAN_FIELDS) spec[`compact.${field}`] = plan[field];
+  return spec;
+}
+
+/**
+ * Stable v2 fingerprint: the v1 goal + workers + spec identity extended with
+ * the risk-aware planning kind and level. Changing any identity ingredient —
+ * goal, workers, bound spec, compact-plan content, risk level, or planning
+ * kind — changes the hash and invalidates the handoff/run binding.
+ */
+export function planFingerprintV2(goal: string, workers: unknown[], executionSpec: ExecutionSpec | undefined, risk: RiskLevel, planningKind: PlanningKind): string {
+  const spec = canonicalExecutionSpec(executionSpec);
+  return createHash("sha256").update(`${goal}\n${canonicalWorkers(workers)}\n${spec}\nv2\nrisk=${risk}\nplanningKind=${planningKind}`).digest("hex").slice(0, 32);
+}
+
+/** Build an explicit v2 (risk-aware) handoff envelope: the v1 shape plus risk and planningKind, both bound into the plan fingerprint. */
+export function buildHerdrHandoffV2(input: { taskId: string; planFingerprint: string; gates?: OrchestrationGates; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>; executionSpec?: ExecutionSpec; risk: RiskLevel; planningKind: PlanningKind }): string {
+  assertOrchestrationGates(input.gates);
+  if (!input.taskId.trim() || !input.planFingerprint.trim() || !input.workers.length) throw new Error("orchestration_handoff_invalid: task, plan fingerprint, and workers are required");
+  const executionSpec = assertExecutionSpec(input.executionSpec);
+  const workers = input.workers.map((worker) => assertWorkerSlice(worker));
+  assertWorkGraph(workers);
+  return JSON.stringify({ protocol: "pi-provider-herdr-handoff-v2", taskId: input.taskId, planFingerprint: input.planFingerprint, gates: input.gates, ...(executionSpec ? { executionSpec } : {}), workers, authority: "Pi", risk: input.risk, planningKind: input.planningKind });
+}
+
+/**
+ * P1 issuance for risk-aware planning: the compact plan (or full decision
+ * graph) compiles into the ExecutionSpec authority BEFORE planFingerprint and
+ * handoff issuance, and risk + planning kind join the immutable plan identity.
+ * The planning kind must structurally match the supplied authority; the whole
+ * work-graph validation applies identically to v2.
+ */
+export function issueHerdrHandoffV2(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>, gates: OrchestrationGates, risk: unknown, planningKind: unknown, planning: { compactPlan?: unknown; decisionGraph?: unknown } = {}): string {
+  const level = assertRiskLevel(risk);
+  const kind = assertPlanningKind(planningKind);
+  assertSpecSourceExclusive(undefined, planning.decisionGraph, planning.compactPlan);
+  if (kind === "compact" && planning.compactPlan === undefined) throw new Error("handoff_planning_mismatch: planning_kind=compact requires a compact_plan");
+  if (kind === "design-graph" && planning.decisionGraph === undefined) throw new Error("handoff_planning_mismatch: planning_kind=design-graph requires a decision_graph");
+  const spec = kind === "compact" ? compileCompactPlan(assertCompactPlan(planning.compactPlan)) : compileDecisionGraph(assertDecisionGraph(planning.decisionGraph));
+  const slices = workers.map((worker) => assertWorkerSlice(worker));
+  // Whole-graph validation at the issuance boundary: identical to v1.
+  assertWorkGraph(slices);
+  return buildHerdrHandoffV2({
+    taskId: randomUUID(),
+    planFingerprint: planFingerprintV2(goal, workers, spec, level, kind),
+    gates,
+    workers: slices,
+    executionSpec: spec,
+    risk: level,
+    planningKind: kind
+  });
 }
 
 // --- VerificationReport (Phase 5: post-implementation evidence artifact) ---
