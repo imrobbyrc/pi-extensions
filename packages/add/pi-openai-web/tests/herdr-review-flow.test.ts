@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { SubagentMcpAdapter, buildWorkerTask, type AdapterRunSnapshot } from "../src/mcp/subagent-adapter.js";
 import { createHarnessMcpFactory, HERDR_TOOL_DESCRIPTION } from "../src/mcp/server.js";
-import type { WorkerSlice } from "../src/provider/orchestrator.js";
+import { issueHerdrHandoffV2, type WorkerSlice } from "../src/provider/orchestrator.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -738,4 +738,74 @@ test("workflow toggles are enforced: review loop off stops retaining completed w
   const adapterOff = new SubagentMcpAdapter(controller as unknown as SubagentController, () => session, undefined, () => false);
   adapterOff.status();
   assert.equal(calls.filter((call) => call === "shutdown").length, 1, "review loop off releases the pane when idle");
+});
+
+// --- P1: verify binds v2 risk-aware handoffs exactly like v1, and tampering fails closed ---
+
+const v2PlanGates = { graph: "graph", handoff: "brief", critique: "independent" };
+const v2CompactPlan = {
+  problem: "stabilize the streamed turn completion path",
+  scope: "src/provider/turn.ts only",
+  behavior: "streamed turns finalize exactly once",
+  verification: "slow-turn-resilience tests stay green"
+};
+
+/** Plan a v2 risk-aware envelope through the real herdr handler (compatibility foundation; not yet advertised to the Lead). */
+async function planV2Envelope(herdr: RegisteredTool["handler"], workerId = "w1"): Promise<string> {
+  const planned = parseToolText(await herdr({
+    action: "plan",
+    goal: "ship v2",
+    workers: [{ id: workerId, objective: "ship", owns: ["src/**"], depends_on: [] }],
+    gates: v2PlanGates,
+    compact_plan: v2CompactPlan,
+    risk: "low",
+    planning_kind: "compact"
+  }));
+  assert.equal(planned.ok, true);
+  return planned.handoff as string;
+}
+
+test("herdr verify binds a v2 handoff to the run with the same bounded four-dimension report", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent))[0]!;
+  const envelope = await planV2Envelope(herdr.handler);
+  assert.equal(JSON.parse(envelope).protocol, "pi-provider-herdr-handoff-v2");
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  const result = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  assert.equal(result.action, "verify");
+  assert.deepEqual(Object.keys(result.report), ["spec", "design", "quality", "evidence"]);
+  assert.equal(result.report.spec.taskId, JSON.parse(envelope).taskId);
+  assert.equal(result.report.spec.planFingerprint, JSON.parse(envelope).planFingerprint);
+  assert.deepEqual(result.report.quality.workers.map((worker: any) => worker.id), ["w1"]);
+  // The worker prompt stays the deterministic minimal contract — no v2 planning state.
+  const slice: WorkerSlice = { id: "w1", objective: "ship", owns: ["src/**"], dependsOn: [] };
+  const prompt = buildWorkerTask(slice, envelope);
+  assert.ok(!prompt.includes("pi-provider-herdr-handoff-v2"));
+  assert.ok(!prompt.includes("planningKind"));
+  assert.ok(!prompt.includes("stabilize the streamed turn completion path"), "compact-plan content never reaches the worker");
+  // Deterministic: re-verify returns the identical report and fingerprint.
+  const again = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  assert.deepEqual(again.report, result.report);
+  assert.equal(again.verification_fingerprint, result.verification_fingerprint);
+});
+
+test("herdr verify fails closed on v2 envelope tampering", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent))[0]!;
+  const envelope = await planV2Envelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  // Structurally valid but different identity: flipping the risk level recomputes
+  // a different worker binding, so the observed prompt no longer matches.
+  const riskFlipped = envelope.replace('"risk":"low"', '"risk":"medium"');
+  await assert.rejects(
+    herdr.handler({ action: "verify", run_id: "run-1", handoff: riskFlipped }),
+    /herdr_verify_prompt_mismatch/,
+    "risk drift invalidates the worker authorization binding"
+  );
+  // Structurally invalid tamper: unbounded risk value is rejected at the parse boundary.
+  const riskInvalid = envelope.replace('"risk":"low"', '"risk":"critical"');
+  await assert.rejects(herdr.handler({ action: "verify", run_id: "run-1", handoff: riskInvalid }), /herdr_verify_handoff_invalid: risk_level_invalid/);
+  // Downgrade forgery: relabeling v2 as v1 drops the risk-aware identity — rejected.
+  const downgraded = envelope.replace("pi-provider-herdr-handoff-v2", "pi-provider-herdr-handoff-v1");
+  await assert.rejects(herdr.handler({ action: "verify", run_id: "run-1", handoff: downgraded }), /herdr_verify_handoff_invalid: handoff_version_invalid/);
 });

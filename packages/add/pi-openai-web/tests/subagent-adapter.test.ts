@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { SubagentMcpAdapter, buildWorkerTask, deriveWorkerBinding, renderWorkerSliceSections } from "../src/mcp/subagent-adapter.js";
 import { createHarnessMcpFactory } from "../src/mcp/server.js";
-import { issueHerdrHandoff, type WorkerSlice } from "../src/provider/orchestrator.js";
+import { issueHerdrHandoff, issueHerdrHandoffV2, type WorkerSlice } from "../src/provider/orchestrator.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -233,6 +233,59 @@ test("herdr tool run rejects drifted slice metadata before any worker starts", a
     /fingerprint/
   );
   assert.equal(runs.length, 0, "no worker may start on drifted slice metadata");
+});
+
+// --- P1: v2 risk-aware handoffs keep the minimal worker contract byte-stable ---
+
+const v2Gates = { graph: "graph", handoff: "handoff", critique: "critique" };
+const v2CompactPlan = {
+  problem: "stabilize the streamed turn completion path",
+  scope: "src/provider/turn.ts only",
+  behavior: "streamed turns finalize exactly once",
+  verification: "slow-turn-resilience tests stay green"
+};
+
+test("a v2 handoff yields the identical minimal prompt structure with its own binding", async () => {
+  const { controller, runs } = capturingController();
+  const adapter = new SubagentMcpAdapter(controller, () => session, autoGate);
+  const handoff = issueHerdrHandoffV2("ship v2", [bareWorker], v2Gates, "low", "compact", { compactPlan: v2CompactPlan });
+  await adapter.run({ goal: "ship v2", workers: [bareWorker], handoff });
+  const task = runs[0]!.tasks[0]!.task;
+  // Behaviorally unchanged contract: same deterministic projection, bound to THIS envelope.
+  assert.equal(task, buildWorkerTask(bareWorker, handoff));
+  assert.ok(task.startsWith("fix the bug\n\nOwned paths:\n- src\n\nScope boundary:"), "objective, owns, and scope guidance only — no planning-envelope state");
+  assert.match(task, /Authorization binding: [0-9a-f]{64}/);
+  // No v2 planning-envelope state leaks into the worker prompt.
+  assert.ok(!task.includes("pi-provider-herdr-handoff-v2"));
+  assert.ok(!task.includes("planningKind"));
+  assert.ok(!task.includes("compact.scope"));
+  assert.ok(!task.includes("stabilize the streamed turn completion path"), "compact-plan content is Lead-only state");
+  assert.ok(!task.includes("ship v2"), "the global goal is Lead-only state");
+});
+
+test("v2 run with slice metadata keeps the deterministic additive projection", async () => {
+  const { controller, runs } = capturingController();
+  const adapter = new SubagentMcpAdapter(controller, () => session, autoGate);
+  const worker: WorkerSlice = { ...bareWorker, requirements: ["planned requirement"] };
+  const handoff = issueHerdrHandoffV2("ship v2", [worker], v2Gates, "low", "compact", { compactPlan: v2CompactPlan });
+  await adapter.run({ goal: "ship v2", workers: [worker], handoff });
+  const task = runs[0]!.tasks[0]!.task;
+  assert.equal(task, buildWorkerTask(worker, handoff));
+  assert.match(task, /Requirements \(immutable plan slice[^\n]*\):\n- planned requirement/);
+  assert.ok(!task.includes("pi-provider-herdr-handoff-v2") && !task.includes("planningKind"));
+});
+
+test("worker bindings are deterministic per envelope and never shared across versions", () => {
+  const v1 = issueHerdrHandoff("goal", [bareWorker], gates, { suite: "focused" });
+  const v2 = issueHerdrHandoffV2("goal", [bareWorker], v2Gates, "low", "compact", { compactPlan: v2CompactPlan });
+  assert.equal(deriveWorkerBinding(v1, bareWorker), deriveWorkerBinding(v1, bareWorker), "v1 bindings stay deterministic");
+  assert.equal(deriveWorkerBinding(v2, bareWorker), deriveWorkerBinding(v2, bareWorker), "v2 bindings stay deterministic");
+  // Different envelope text (v1 vs v2, or a fresh v2 taskId) binds differently.
+  assert.notEqual(deriveWorkerBinding(v1, bareWorker), deriveWorkerBinding(v2, bareWorker));
+  const reissuedV2 = issueHerdrHandoffV2("goal", [bareWorker], v2Gates, "low", "compact", { compactPlan: v2CompactPlan });
+  assert.notEqual(deriveWorkerBinding(v2, bareWorker), deriveWorkerBinding(reissuedV2, bareWorker));
+  // Field drift still changes the v2 binding exactly as for v1.
+  assert.notEqual(deriveWorkerBinding(v2, bareWorker), deriveWorkerBinding(v2, { ...bareWorker, objective: "different" }));
 });
 
 test("inspect returns the raw status snapshot without invoking any lifecycle transition", () => {

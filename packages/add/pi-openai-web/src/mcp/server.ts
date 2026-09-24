@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readContextFile, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, planFingerprint, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, compileDecisionGraph, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, issueHerdrHandoffV2, planFingerprint, planFingerprintV2, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, assertRiskLevel, assertPlanningKind, assertCompactPlan, compileDecisionGraph, compileCompactPlan, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, COMPACT_PLAN_FIELDS, COMPACT_PLAN_VALUE_MAX, RISK_LEVELS, PLANNING_KINDS, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice, type RiskLevel, type PlanningKind } from "../provider/orchestrator.js";
 import { buildWorkerTask, type AdapterRunSnapshot } from "./subagent-adapter.js";
 type HerdrWorker = WorkerSlice;
 
@@ -108,6 +108,15 @@ export const herdrDecisionGraph = z.strictObject(
   Object.fromEntries(DECISION_GRAPH_AXES.map((axis) => [axis, herdrText(DECISION_GRAPH_VALUE_MAX)])) as Record<(typeof DECISION_GRAPH_AXES)[number], z.ZodString>
 );
 
+/** P1 low-risk planning authority: exactly the four bounded non-blank compact fields, extra keys rejected. */
+export const herdrCompactPlan = z.strictObject(
+  Object.fromEntries(COMPACT_PLAN_FIELDS.map((field) => [field, herdrText(COMPACT_PLAN_VALUE_MAX)])) as Record<(typeof COMPACT_PLAN_FIELDS)[number], z.ZodString>
+);
+
+/** P1 bounded risk-aware identity fields (v2 handoffs); v1 envelopes reject them at the compatibility boundary. */
+export const herdrRiskLevel = z.enum(RISK_LEVELS);
+export const herdrPlanningKind = z.enum(PLANNING_KINDS);
+
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
   "plan — validate planning gates {graph, handoff, critique} and the decomposition as one legal work graph (unique worker ids, dependencies referencing existing workers, no cycles, and no overlapping ownership between workers that no dependency path serializes — invalid graphs fail closed with work_graph_invalid), then return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), decision_graph, and envelope string verbatim. decision_graph is the sole planning authority: exactly nine non-blank axes (problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique) are compiled deterministically by Pi for binding and verification — workers cannot invent requirements.",
@@ -121,36 +130,58 @@ export const HERDR_TOOL_DESCRIPTION = [
 ].join(" ");
 
 /**
- * Strict frozen provider tool allowlist: bounded read/list/search/repo-map/
- * git status/diff plus one Pi-native herdr tool. Never subagent/bash/edit/write.
+ * Strict run-boundary validation: the caller's planning authority (execution_spec, decision_graph, or — P1 — compact_plan plus risk/planning_kind on v2 envelopes) is compiled HERE and compared to the exact authority embedded in the Pi-issued handoff.
  * Returns the envelope's validated WorkerSlices plus their deterministic
  * graph order: they are the single source of truth for worker prompts
  * (fingerprint-bound to this exact request).
  */
-export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; execution_spec?: unknown; decision_graph?: unknown; handoff?: string }): { workers: WorkerSlice[]; order: string[] } {
+export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[]; execution_spec?: unknown; decision_graph?: unknown; compact_plan?: unknown; risk?: unknown; planning_kind?: unknown; handoff?: string }): { workers: WorkerSlice[]; order: string[] } {
   if (!input.goal) throw new Error("herdr run requires goal.");
   if (!input.workers?.length) throw new Error("herdr run requires 1-4 workers.");
   if (!input.handoff?.trim()) throw new Error("herdr run requires planning handoff.");
-  assertSpecSourceExclusive(input.execution_spec, input.decision_graph);
+  // P1: the compact plan is a third spelling of the same spec slot — all three remain mutually exclusive.
+  assertSpecSourceExclusive(input.execution_spec, input.decision_graph, input.compact_plan);
   // Run-boundary fail-closed: the submitted decomposition must itself be one
   // legal work graph (unique ids, known dependencies, no cycles, no unordered
   // ownership overlap) before any envelope comparison runs.
   assertWorkGraph(input.workers.map((worker) => assertWorkerSlice(worker)));
-  if (input.decision_graph === undefined && input.execution_spec === undefined) throw new Error("execution_spec_invalid: an execution_spec or decision_graph is required");
-  // Phase-3 binding: a run-time decision_graph is compiled HERE, never taken
-  // from a caller-asserted spec, so any graph drift against the plan fails closed.
-  const executionSpec = input.decision_graph !== undefined ? compileDecisionGraph(assertDecisionGraph(input.decision_graph)) : assertExecutionSpec(input.execution_spec);
+  if (input.decision_graph === undefined && input.execution_spec === undefined && input.compact_plan === undefined) throw new Error("execution_spec_invalid: an execution_spec or decision_graph is required");
+  // Phase-3/P1 binding: the caller's planning authority is compiled HERE, never
+  // taken from a caller-asserted spec, so any authority drift against the plan fails closed.
+  const sourceName = input.compact_plan !== undefined ? "compact_plan" : input.decision_graph !== undefined ? "decision_graph" : "execution_spec";
+  const executionSpec = input.compact_plan !== undefined ? compileCompactPlan(assertCompactPlan(input.compact_plan))
+    : input.decision_graph !== undefined ? compileDecisionGraph(assertDecisionGraph(input.decision_graph))
+    : assertExecutionSpec(input.execution_spec);
   const parsed = parseHerdrHandoff(input.handoff);
-  // Spec binding: the envelope's embedded spec must equal THIS run's spec exactly —
+  // P1 compatibility boundary: v2 envelopes bound risk + planning kind into the
+  // plan identity, so the caller must restate both and they must match exactly.
+  if (parsed.version === "v2") {
+    if (input.risk === undefined || input.planning_kind === undefined) {
+      throw new Error("herdr run v2 handoff requires the plan's risk and planning_kind restated (re-run herdr action=plan).");
+    }
+    const risk = assertRiskLevel(input.risk);
+    const planningKind = assertPlanningKind(input.planning_kind);
+    if (parsed.risk !== risk || parsed.planningKind !== planningKind) {
+      throw new Error("herdr run risk/planning_kind differs from the plan (re-run herdr action=plan).");
+    }
+    // Structural fidelity: the restated authority shape must match the bound planning kind.
+    if (planningKind === "compact" && input.compact_plan === undefined) throw new Error("herdr run planning_kind=compact requires the plan's compact_plan.");
+    if (planningKind === "design-graph" && input.decision_graph === undefined) throw new Error("herdr run planning_kind=design-graph requires the plan's decision_graph.");
+  } else if (input.compact_plan !== undefined || input.risk !== undefined || input.planning_kind !== undefined) {
+    throw new Error("herdr run handoff is a v1 envelope and does not carry risk-aware planning fields (re-run herdr action=plan).");
+  }
+  // Spec binding: the envelope's embedded spec must equal THIS run's compiled authority exactly —
   // adding, removing, or changing it after plan fails closed.
   if (canonicalExecutionSpec(parsed.executionSpec) !== canonicalExecutionSpec(executionSpec)) {
-    throw new Error(input.decision_graph !== undefined
-      ? "herdr run decision_graph differs from the plan's decision_graph (re-run herdr action=plan)."
-      : "herdr run execution_spec differs from the plan's execution_spec (re-run herdr action=plan).");
+    throw new Error(`herdr run ${sourceName} differs from the plan's planning authority (re-run herdr action=plan).`);
   }
   // Task binding: the envelope's planFingerprint must be the exact hash of THIS
-  // goal + workers (+ spec), so stale or borrowed envelopes from other plans are rejected.
-  if (parsed.planFingerprint !== planFingerprint(input.goal, input.workers, executionSpec)) {
+  // goal + workers + compiled authority (+ risk/kind on v2), so stale or
+  // borrowed envelopes from other plans are rejected.
+  const fingerprintMatches = parsed.version === "v2"
+    ? parsed.planFingerprint === planFingerprintV2(input.goal, input.workers, executionSpec, parsed.risk as RiskLevel, parsed.planningKind as PlanningKind)
+    : parsed.planFingerprint === planFingerprint(input.goal, input.workers, executionSpec);
+  if (!fingerprintMatches) {
     throw new Error("herdr run handoff does not match this goal/workers (plan fingerprint mismatch; re-run herdr action=plan).");
   }
   return { workers: parsed.workers, order: parsed.order };
@@ -365,6 +396,9 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           workers: herdrWorkers.optional(),
           gates: herdrGates.optional(),
           decision_graph: herdrDecisionGraph.optional(),
+          compact_plan: herdrCompactPlan.optional(),
+          risk: herdrRiskLevel.optional(),
+          planning_kind: herdrPlanningKind.optional(),
           worker_model: z.string().trim().min(1).max(200).optional(),
           worker_thinking: z.string().trim().min(1).max(100).optional(),
           handoff: z.string().max(HERDR_HANDOFF_MAX).optional(),
@@ -378,8 +412,20 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
       track(async (args) => {
         const { action, goal, workers, gates, decision_graph, worker_model, worker_thinking, handoff, verification_fingerprint, run_id, worker_id, instructions } = args;
         const execution_spec = (args as { execution_spec?: unknown }).execution_spec;
+        // P1 risk-aware fields (v2 handoffs): schema-validated above, consumed only when present.
+        const compact_plan = (args as { compact_plan?: unknown }).compact_plan;
+        const risk = (args as { risk?: unknown }).risk;
+        const planning_kind = (args as { planning_kind?: unknown }).planning_kind;
         if (action === "plan") {
-          if (!goal || !workers || !gates || (!decision_graph && execution_spec === undefined)) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
+          if (!goal || !workers || !gates) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
+          // P1 risk-aware path: any v2 field present → v2 issuance. The compact
+          // plan (or decision graph) compiles into the spec authority BEFORE the
+          // fingerprint, and risk + planning kind join the immutable identity.
+          // Not yet advertised to the Lead (compatibility foundation only).
+          if (compact_plan !== undefined || risk !== undefined || planning_kind !== undefined) {
+            return text({ ok: true, handoff: issueHerdrHandoffV2(goal, workers, gates, risk, planning_kind, { compactPlan: compact_plan, decisionGraph: decision_graph }), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, planning authority, risk, and planning_kind." });
+          }
+          if (!decision_graph && execution_spec === undefined) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
           return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and decision_graph." });
         }
         if (action === "run") {
@@ -391,7 +437,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           // The envelope's authorized slices are the single source of truth for
           // what each worker is told — already fingerprint-bound to this exact
           // goal/workers/spec, so run-time args can never drift from the plan.
-          const authorized = validateHerdrRunInput({ goal, workers, execution_spec, decision_graph, handoff });
+          const authorized = validateHerdrRunInput({ goal, workers, execution_spec, decision_graph, compact_plan, risk, planning_kind, handoff });
           const run = await deps.subagent.run({ goal, workers: authorized.workers, handoff, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}) });
           return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
         }

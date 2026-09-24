@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph, createHarnessMcpFactory } from "../src/mcp/server.js";
-import { issueHerdrHandoff, parseHerdrHandoff, planFingerprint, assertDecisionGraph, compileDecisionGraph, resolveWorkflowToggles, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, DEFAULT_ORCHESTRATOR_CONFIG } from "../src/provider/orchestrator.js";
+import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph, herdrCompactPlan, herdrRiskLevel, herdrPlanningKind, createHarnessMcpFactory } from "../src/mcp/server.js";
+import { issueHerdrHandoff, issueHerdrHandoffV2, parseHerdrHandoff, planFingerprint, planFingerprintV2, assertDecisionGraph, assertRiskLevel, assertPlanningKind, compileDecisionGraph, compileCompactPlan, resolveWorkflowToggles, COMPACT_PLAN_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, DEFAULT_ORCHESTRATOR_CONFIG } from "../src/provider/orchestrator.js";
 import { SubagentMcpAdapter, type AdapterRunSnapshot } from "../src/mcp/subagent-adapter.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -468,5 +468,161 @@ test("toggle enforcement: verificationGate=false skips fingerprint check and rea
     /subagent_context_unavailable/,
     "gate off: error must come from adapter (context), not from the fingerprint check"
   );
+});
+
+// --- P1: CompactPlan authority + risk-aware v2 handoff run binding ---
+
+const p1Gates = gates;
+const p1CompactPlan = {
+  problem: "fix the failing import in one module",
+  scope: "src/provider/token-estimate.ts and its focused test only",
+  behavior: "the estimate function returns a number again; nothing else changes",
+  verification: "focused token-estimate tests pass"
+};
+const p1Workers = [{ id: "w1", objective: "fix import", owns: ["src/provider/token-estimate.ts"], depends_on: [] }];
+type P1Worker = typeof p1Workers[number];
+const p1Goal = "fix the failing import";
+
+function compactHandoff(overrides: { goal?: string; plan?: Record<string, string>; risk?: string; kind?: string; workers?: P1Worker[] } = {}): string {
+  return issueHerdrHandoffV2(
+    overrides.goal ?? p1Goal,
+    overrides.workers ?? p1Workers,
+    p1Gates,
+    overrides.risk ?? "low",
+    overrides.kind ?? "compact",
+    { compactPlan: overrides.plan ?? p1CompactPlan }
+  );
+}
+
+function p1Run(overrides: { goal?: string; workers?: P1Worker[]; plan?: Record<string, string>; risk?: string; kind?: string; handoff?: string } = {}) {
+  return {
+    goal: overrides.goal ?? p1Goal,
+    workers: overrides.workers ?? p1Workers,
+    compact_plan: overrides.plan ?? p1CompactPlan,
+    risk: overrides.risk ?? "low",
+    planning_kind: overrides.kind ?? "compact",
+    handoff: overrides.handoff ?? compactHandoff()
+  };
+}
+
+test("v2 compact plan round-trips deterministically through issuance and run validation", () => {
+  const handoff = compactHandoff();
+  const authorized = validateHerdrRunInput(p1Run({ handoff }));
+  // The envelope's authorized slices are the single source of truth, exactly like v1.
+  assert.deepEqual(authorized.workers, [{ id: "w1", objective: "fix import", owns: ["src/provider/token-estimate.ts"], dependsOn: [] }]);
+  assert.deepEqual(authorized.order, ["w1"]);
+  // Deterministic identity: the envelope fingerprint is the v2 hash of THIS goal/workers/authority/risk/kind.
+  const parsed = parseHerdrHandoff(handoff);
+  assert.equal(parsed.planFingerprint, planFingerprintV2(p1Goal, p1Workers, compileCompactPlan(p1CompactPlan), "low", "compact"));
+});
+
+test("v2 run binding invalidates when the compact-plan content changes", () => {
+  const handoff = compactHandoff();
+  // Changed compact-plan content: the compiled authority no longer matches the envelope's spec.
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, plan: { ...p1CompactPlan, scope: "everything" } })), /compact_plan differs/);
+  // Removing a field at run time is a structural drift, not a value drift.
+  const { verification: _verification, ...partial } = p1CompactPlan;
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, plan: partial })), /compact_plan_invalid/);
+});
+
+test("v2 run binding invalidates when the risk level or planning kind changes", () => {
+  const handoff = compactHandoff();
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, risk: "medium" })), /risk\/planning_kind differs/);
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, kind: "design-graph" })), /risk\/planning_kind differs/);
+  // Bounded values are enforced before any comparison.
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, risk: "critical" })), /risk_level_invalid/);
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, kind: "full" })), /planning_kind_invalid/);
+});
+
+test("v2 run binding invalidates when the goal or workers change", () => {
+  const handoff = compactHandoff();
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, goal: "other goal" })), /fingerprint/);
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, workers: [{ ...p1Workers[0], id: "w2" }] })), /fingerprint/);
+});
+
+test("v2 run fails closed on a tampered envelope", () => {
+  const handoff = compactHandoff();
+  // Tampered embedded authority (valid string, different value): the spec comparison fires.
+  const specTampered = handoff.replace(JSON.stringify(p1CompactPlan.scope), JSON.stringify("drifted scope"));
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff: specTampered })), /compact_plan differs/);
+  // The same tamper with the drifted authority restated fails on the fingerprint instead.
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff: specTampered, plan: { ...p1CompactPlan, scope: "drifted scope" } })), /fingerprint/);
+  // Structurally invalid tamper: unbounded risk value.
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff: handoff.replace('"risk":"low"', '"risk":"critical"') })), /risk_level_invalid/);
+});
+
+test("v2 run requires restating risk and planning_kind", () => {
+  const handoff = compactHandoff();
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, compact_plan: p1CompactPlan, handoff }), /v2 handoff requires the plan's risk and planning_kind/);
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, compact_plan: p1CompactPlan, risk: "low", handoff }), /v2 handoff requires the plan's risk and planning_kind/);
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, compact_plan: p1CompactPlan, planning_kind: "compact", handoff }), /v2 handoff requires the plan's risk and planning_kind/);
+});
+
+test("v2 run requires the restated authority shape to match the bound planning kind", () => {
+  const compactEnvelope = compactHandoff();
+  // kind=compact must restate compact_plan (not decision_graph, not a bare spec).
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, decision_graph: decisionGraph, risk: "low", planning_kind: "compact", handoff: compactEnvelope }), /planning_kind=compact requires the plan's compact_plan/);
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, execution_spec: compileCompactPlan(p1CompactPlan), risk: "low", planning_kind: "compact", handoff: compactEnvelope }), /planning_kind=compact requires the plan's compact_plan/);
+  // kind=design-graph must restate decision_graph.
+  const graphEnvelope = issueHerdrHandoffV2(p1Goal, p1Workers, p1Gates, "high", "design-graph", { decisionGraph });
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, compact_plan: p1CompactPlan, risk: "high", planning_kind: "design-graph", handoff: graphEnvelope }), /planning_kind=design-graph requires the plan's decision_graph/);
+  // v2 envelopes cannot be validated through the legacy direct-spec spelling at all.
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, execution_spec: compileCompactPlan(p1CompactPlan), risk: "low", planning_kind: "compact", handoff: compactEnvelope }), /planning_kind=compact requires the plan's compact_plan/);
+});
+
+test("v1 envelopes reject v2 planning fields at run validation", () => {
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: base.workers, compact_plan: p1CompactPlan, handoff: validHandoff }), /v1 envelope and does not carry risk-aware planning fields/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, risk: "low", handoff: validHandoff }), /v1 envelope and does not carry risk-aware planning fields/);
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, planning_kind: "compact", handoff: validHandoff }), /v1 envelope and does not carry risk-aware planning fields/);
+  // The exclusivity guard still fires first when two spec sources are given.
+  assert.throws(() => validateHerdrRunInput({ ...base, execution_spec: spec, compact_plan: p1CompactPlan, handoff: validHandoff }), /decision_graph_exclusive/);
+  // v1 plans and runs remain fully intact without any v2 field.
+  assert.doesNotThrow(() => validateHerdrRunInput({ ...base, execution_spec: spec, handoff: validHandoff }));
+});
+
+test("compact plan schema bounds at the MCP boundary", () => {
+  assert.ok(herdrCompactPlan.safeParse(p1CompactPlan).success);
+  const { verification: _verification, ...missing } = p1CompactPlan;
+  assert.equal(herdrCompactPlan.safeParse(missing).success, false, "missing field rejected");
+  assert.equal(herdrCompactPlan.safeParse({ ...p1CompactPlan, extra: "x" }).success, false, "extra field rejected");
+  assert.equal(herdrCompactPlan.safeParse({ ...p1CompactPlan, problem: " " }).success, false, "blank field rejected");
+  assert.equal(herdrCompactPlan.safeParse({ ...p1CompactPlan, problem: 42 }).success, false, "non-string field rejected");
+  assert.equal(herdrCompactPlan.safeParse({ ...p1CompactPlan, problem: "x".repeat(COMPACT_PLAN_VALUE_MAX + 1) }).success, false, "oversized field rejected");
+  assert.equal(herdrCompactPlan.safeParse("plan").success, false, "non-object rejected");
+});
+
+test("risk and planning_kind schemas are bounded enums at the MCP boundary", () => {
+  assert.deepEqual(herdrRiskLevel.options, ["low", "medium", "high"]);
+  assert.deepEqual(herdrPlanningKind.options, ["compact", "design-graph"]);
+  assert.ok(herdrRiskLevel.safeParse("low").success);
+  assert.equal(herdrRiskLevel.safeParse("critical").success, false);
+  assert.ok(herdrPlanningKind.safeParse("compact").success);
+  assert.equal(herdrPlanningKind.safeParse("full").success, false);
+});
+
+test("herdr plan issues v2 envelopes for compact planning and run accepts them through validation", async () => {
+  workflowsRef = resolveWorkflowToggles(DEFAULT_ORCHESTRATOR_CONFIG);
+  const planned = parseText(await sharedHerdrHandler!({ action: "plan", goal: "compact ship", workers: toggleWorkers, gates: toggleGates, compact_plan: p1CompactPlan, risk: "low", planning_kind: "compact" })) as { ok: boolean; handoff: string };
+  assert.equal(planned.ok, true);
+  assert.equal(JSON.parse(planned.handoff).protocol, "pi-provider-herdr-handoff-v2");
+  // Run with the same authority passes validation and reaches the adapter (no session in unit tests).
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "run", goal: "compact ship", workers: toggleWorkers, compact_plan: p1CompactPlan, risk: "low", planning_kind: "compact", handoff: planned.handoff }),
+    /subagent_context_unavailable/,
+    "v2 run must pass validation and reach the adapter"
+  );
+  // Drifted authority fails closed before any worker starts.
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "run", goal: "compact ship", workers: toggleWorkers, compact_plan: { ...p1CompactPlan, scope: "drifted" }, risk: "low", planning_kind: "compact", handoff: planned.handoff }),
+    /compact_plan differs/
+  );
+  // Incomplete v2 plan args fail closed at issuance.
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "plan", goal: "compact ship", workers: toggleWorkers, gates: toggleGates, compact_plan: p1CompactPlan }),
+    /planning_kind_invalid|handoff_planning_mismatch|risk_level_invalid/
+  );
+  // The v1 plan path is untouched: no v2 field → v1 envelope, unchanged behavior.
+  const v1Planned = parseText(await sharedHerdrHandler!({ action: "plan", goal: "v1 ship", workers: toggleWorkers, gates: toggleGates, decision_graph: decisionGraph })) as { handoff: string };
+  assert.equal(JSON.parse(v1Planned.handoff).protocol, "pi-provider-herdr-handoff-v1");
 });
 

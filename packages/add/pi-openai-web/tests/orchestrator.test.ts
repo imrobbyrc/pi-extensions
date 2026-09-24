@@ -19,9 +19,12 @@ import {
   handleOrchestratorCli,
   configureOrchestratorUI,
   buildHerdrHandoff,
+  buildHerdrHandoffV2,
   parseHerdrHandoff,
   issueHerdrHandoff,
+  issueHerdrHandoffV2,
   planFingerprint,
+  planFingerprintV2,
   canonicalWorkers,
   assertOrchestrationGates,
   assertExecutionSpec,
@@ -29,16 +32,28 @@ import {
   assertSpecSourceExclusive,
   assertWorkGraph,
   assertWorkerSlice,
+  assertRiskLevel,
+  assertPlanningKind,
+  assertCompactPlan,
   WORKER_COUNT_MAX,
   compileDecisionGraph,
+  compileCompactPlan,
   canonicalExecutionSpec,
   DECISION_GRAPH_AXES,
   DECISION_GRAPH_VALUE_MAX,
   EXECUTION_SPEC_KEY_MAX,
   EXECUTION_SPEC_MAX_ENTRIES,
   EXECUTION_SPEC_VALUE_MAX,
+  COMPACT_PLAN_FIELDS,
+  COMPACT_PLAN_VALUE_MAX,
+  RISK_LEVELS,
+  PLANNING_KINDS,
   WORKER_METADATA_ITEM_MAX,
   WORKER_METADATA_LIST_MAX,
+  type RiskLevel,
+  type PlanningKind,
+  type CompactPlan,
+  type ParsedHerdrHandoff,
   buildVerificationReport,
   verificationFingerprint,
   VERIFICATION_DIMENSIONS,
@@ -413,6 +428,185 @@ test("decision_graph and execution_spec are mutually exclusive at issuance", () 
   assert.throws(() => assertSpecSourceExclusive({ runtime: "node" }, decisionGraph), /decision_graph_exclusive/);
   assert.doesNotThrow(() => assertSpecSourceExclusive(undefined, decisionGraph));
   assert.doesNotThrow(() => assertSpecSourceExclusive({ runtime: "node" }, undefined));
+});
+
+// --- P1 planning foundation: bounded RiskLevel, CompactPlan authority, v2 handoffs ---
+
+const p1Gates = { graph: "graph", handoff: "handoff", critique: "critique" };
+const compactPlan: CompactPlan = {
+  problem: "fix the doc typo without touching runtime code",
+  scope: "docs/TEST_PLAN.md only",
+  behavior: "documentation text changes only",
+  verification: "reread the rendered section"
+};
+
+function level(value: unknown): RiskLevel { return assertRiskLevel(value); }
+function kind(value: unknown): PlanningKind { return assertPlanningKind(value); }
+
+test("RiskLevel is bounded to exactly low, medium, high", () => {
+  assert.deepEqual(RISK_LEVELS, ["low", "medium", "high"]);
+  for (const risk of RISK_LEVELS) assert.equal(level(risk), risk);
+  for (const bad of [undefined, null, "LOW", "", "critical", "none", "low ", 42, true]) {
+    assert.throws(() => level(bad), /risk_level_invalid/, `risk ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("PlanningKind is bounded to exactly compact and design-graph", () => {
+  assert.deepEqual(PLANNING_KINDS, ["compact", "design-graph"]);
+  for (const planningKind of PLANNING_KINDS) assert.equal(kind(planningKind), planningKind);
+  for (const bad of [undefined, null, "full", "COMPACT", "", "compact ", 42]) {
+    assert.throws(() => kind(bad), /planning_kind_invalid/, `kind ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("assertCompactPlan accepts exactly problem, scope, behavior, and verification", () => {
+  assert.deepEqual(COMPACT_PLAN_FIELDS, ["problem", "scope", "behavior", "verification"]);
+  assert.deepEqual(assertCompactPlan(compactPlan), compactPlan);
+  // Missing field.
+  const { verification: _verification, ...missing } = compactPlan;
+  assert.throws(() => assertCompactPlan(missing), /compact_plan_invalid: verification is required/);
+  // Blank field.
+  assert.throws(() => assertCompactPlan({ ...compactPlan, scope: "   " }), /compact_plan_invalid: scope/);
+  // Extra field: a compact plan can never grow Design Graph axes.
+  assert.throws(() => assertCompactPlan({ ...compactPlan, shapes: "no shapes in a compact plan" }), /compact_plan_invalid: unknown field "shapes"/);
+  assert.throws(() => assertCompactPlan({ ...compactPlan, critique: "no critique either" }), /compact_plan_invalid: unknown field "critique"/);
+  // Oversized field.
+  assert.throws(() => assertCompactPlan({ ...compactPlan, problem: "x".repeat(COMPACT_PLAN_VALUE_MAX + 1) }), /compact_plan_invalid: problem/);
+  // Non-string field values and non-object shapes.
+  for (const bad of [null, undefined, "plan", 42, [], { ...compactPlan, behavior: 7 }]) {
+    assert.throws(() => assertCompactPlan(bad), /compact_plan_invalid/, `plan ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("compileCompactPlan deterministically compiles into the ExecutionSpec authority path without fabricating axes", () => {
+  const compiled = compileCompactPlan(assertCompactPlan(compactPlan));
+  assert.deepEqual(compiled, {
+    "compact.problem": compactPlan.problem,
+    "compact.scope": compactPlan.scope,
+    "compact.behavior": compactPlan.behavior,
+    "compact.verification": compactPlan.verification
+  });
+  // Exactly four entries in fixed field order — no invented axes.
+  assert.deepEqual(Object.keys(compiled), ["compact.problem", "compact.scope", "compact.behavior", "compact.verification"]);
+  for (const fabricated of ["decision.problem", "decision.shapes", "decision.graph", "decision.cardinality", "decision.boundaries", "decision.critique"]) {
+    assert.equal(fabricated in compiled, false, `compact compilation must not fabricate ${fabricated}`);
+  }
+  // Deterministic: field key order never matters, repeated compiles are identical.
+  assert.deepEqual(compileCompactPlan({ verification: compactPlan.verification, behavior: compactPlan.behavior, scope: compactPlan.scope, problem: compactPlan.problem }), compiled);
+  // The compiled form is a valid ExecutionSpec (shared bound coherence).
+  assert.deepEqual(assertExecutionSpec(compiled), compiled);
+  assert.equal(COMPACT_PLAN_VALUE_MAX, EXECUTION_SPEC_VALUE_MAX);
+});
+
+test("v2 handoff issuance round-trips the compact plan with risk and planning kind", () => {
+  const workers = [{ id: "w1", objective: "fix docs", owns: ["docs/**"], depends_on: [] }];
+  const envelope = issueHerdrHandoffV2("fix docs", workers, p1Gates, "low", "compact", { compactPlan });
+  const raw = JSON.parse(envelope);
+  assert.equal(raw.protocol, "pi-provider-herdr-handoff-v2");
+  assert.equal(raw.authority, "Pi");
+  assert.equal(raw.risk, "low");
+  assert.equal(raw.planningKind, "compact");
+  const parsed = parseHerdrHandoff(envelope);
+  assert.equal(parsed.version, "v2");
+  assert.equal(parsed.risk, "low");
+  assert.equal(parsed.planningKind, "compact");
+  const compiled = compileCompactPlan(assertCompactPlan(compactPlan));
+  assert.deepEqual(parsed.executionSpec, compiled, "the envelope carries the compiled compact authority as its single spec");
+  assert.deepEqual(parsed.workers, [{ id: "w1", objective: "fix docs", owns: ["docs/**"], dependsOn: [] }]);
+  // The fingerprint binds goal + workers + compiled authority + risk + planning kind.
+  assert.equal(parsed.planFingerprint, planFingerprintV2("fix docs", workers, compiled, "low", "compact"));
+});
+
+test("v2 handoffs round-trip deterministically through build and parse", () => {
+  const workers = [{ id: "w1", objective: "fix docs", owns: ["docs/**"], dependsOn: [] }];
+  const envelope = issueHerdrHandoffV2("fix docs", workers, p1Gates, "low", "compact", { compactPlan });
+  const parsed = parseHerdrHandoff(envelope);
+  const rebuilt = buildHerdrHandoffV2({ taskId: parsed.taskId, planFingerprint: parsed.planFingerprint, gates: p1Gates, workers: parsed.workers, executionSpec: parsed.executionSpec, risk: "low", planningKind: "compact" });
+  assert.equal(rebuilt, envelope, "rebuilding from the parsed fields reproduces the exact envelope bytes");
+  assert.deepEqual(parseHerdrHandoff(rebuilt), parsed);
+});
+
+test("v2 design-graph issuance compiles through the same authority path", () => {
+  const workers = [{ id: "w1", objective: "fix", owns: ["src/**"], depends_on: [] }];
+  const envelope = issueHerdrHandoffV2("goal", workers, p1Gates, "high", "design-graph", { decisionGraph });
+  const parsed = parseHerdrHandoff(envelope);
+  assert.equal(parsed.version, "v2");
+  assert.equal(parsed.risk, "high");
+  assert.equal(parsed.planningKind, "design-graph");
+  const compiled = compileDecisionGraph(assertDecisionGraph(decisionGraph));
+  assert.deepEqual(parsed.executionSpec, compiled);
+  assert.equal(parsed.planFingerprint, planFingerprintV2("goal", workers, compiled, "high", "design-graph"));
+});
+
+test("v2 issuance fails closed on kind/authority mismatch and invalid risk/kind/plan shapes", () => {
+  const workers = [{ id: "w1", objective: "fix", owns: ["src/**"], depends_on: [] }];
+  // planning_kind=compact requires a compact_plan; design-graph requires a decision_graph.
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", {}), /handoff_planning_mismatch: planning_kind=compact requires a compact_plan/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { decisionGraph }), /handoff_planning_mismatch/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "design-graph", { compactPlan }), /handoff_planning_mismatch/);
+  // Both authorities at once is the existing exclusivity failure.
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { compactPlan, decisionGraph }), /decision_graph_exclusive/);
+  assert.throws(() => assertSpecSourceExclusive(undefined, decisionGraph, compactPlan), /decision_graph_exclusive/);
+  // Bounded identity fields.
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "critical", "compact", { compactPlan }), /risk_level_invalid/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "full", { compactPlan }), /planning_kind_invalid/);
+  // Structurally invalid compact plan.
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { compactPlan: { ...compactPlan, extra: "x" } }), /compact_plan_invalid/);
+  // Work-graph validation applies identically to v2 issuance.
+  assert.throws(() => issueHerdrHandoffV2("goal", [], p1Gates, "low", "compact", { compactPlan }), /work_graph_invalid/);
+});
+
+test("v2 fingerprint binds risk, planning kind, plan content, goal, workers, and spec", () => {
+  const workers = [{ id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] }];
+  const spec = compileCompactPlan(assertCompactPlan(compactPlan));
+  const base = planFingerprintV2("goal", workers, spec, "low", "compact");
+  assert.match(base, /^[0-9a-f]{32}$/);
+  // Deterministic.
+  assert.equal(planFingerprintV2("goal", workers, spec, "low", "compact"), base);
+  // Every identity ingredient changes the hash.
+  assert.notEqual(planFingerprintV2("other goal", workers, spec, "low", "compact"), base, "goal drift invalidates the binding");
+  assert.notEqual(planFingerprintV2("goal", [{ ...workers[0], id: "w2" }], spec, "low", "compact"), base, "worker drift invalidates the binding");
+  assert.notEqual(planFingerprintV2("goal", workers, { ...spec, "compact.scope": "elsewhere" }, "low", "compact"), base, "plan-content drift invalidates the binding");
+  assert.notEqual(planFingerprintV2("goal", workers, spec, "medium", "compact"), base, "risk drift invalidates the binding");
+  assert.notEqual(planFingerprintV2("goal", workers, spec, "low", "design-graph"), base, "planning-kind drift invalidates the binding");
+  // v1 and v2 identities never collide.
+  assert.notEqual(base, planFingerprint("goal", workers, spec));
+});
+
+test("v1 handoffs keep parsing under their current strict semantics and never gain v2 fields", () => {
+  const workers = [{ id: "w1", objective: "fix", owns: ["src/**"], dependsOn: [] }];
+  const spec = { suite: "focused" };
+  const v1 = issueHerdrHandoff("goal", workers, p1Gates, spec);
+  const parsed: ParsedHerdrHandoff = parseHerdrHandoff(v1);
+  assert.equal(parsed.version, "v1");
+  assert.equal(parsed.risk, undefined);
+  assert.equal(parsed.planningKind, undefined);
+  assert.equal(parsed.planFingerprint, planFingerprint("goal", workers, assertExecutionSpec(spec)), "the v1 fingerprint formula is unchanged");
+  // Arbitrary legacy extra keys still parse: v1 strictness is unchanged.
+  assert.equal(parseHerdrHandoff(JSON.stringify({ ...JSON.parse(v1), note: "legacy extra" })).version, "v1");
+  // But a v1-shaped envelope carrying v2 identity fields is rejected (no downgrade path).
+  assert.throws(() => parseHerdrHandoff(JSON.stringify({ ...JSON.parse(v1), risk: "low" })), /handoff_version_invalid/);
+  assert.throws(() => parseHerdrHandoff(JSON.stringify({ ...JSON.parse(v1), planningKind: "compact" })), /handoff_version_invalid/);
+});
+
+test("v2 envelopes fail closed on tampered identity fields, protocol, and embedded shapes", () => {
+  const workers = [{ id: "w1", objective: "fix docs", owns: ["docs/**"], depends_on: [] }];
+  const envelope = issueHerdrHandoffV2("fix docs", workers, p1Gates, "low", "compact", { compactPlan });
+  // Tampered risk / planning kind values.
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"risk":"low"', '"risk":"critical"')), /risk_level_invalid/);
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"risk":"low"', '"risk":42')), /risk_level_invalid/);
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"planningKind":"compact"', '"planningKind":"full"')), /planning_kind_invalid/);
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"planningKind":"compact"', '"planningKind":null')), /planning_kind_invalid/);
+  // Stripping the identity fields from a v2 envelope fails closed.
+  assert.throws(() => parseHerdrHandoff(envelope.replace(',"risk":"low","planningKind":"compact"', "")), /risk_level_invalid/);
+  // Unknown protocol.
+  assert.throws(() => parseHerdrHandoff(envelope.replace("pi-provider-herdr-handoff-v2", "pi-provider-herdr-handoff-v9")), /orchestration_handoff_invalid/);
+  // Downgrade forgery: relabeling v2 as v1 drops the risk-aware identity — rejected.
+  assert.throws(() => parseHerdrHandoff(envelope.replace("pi-provider-herdr-handoff-v2", "pi-provider-herdr-handoff-v1")), /handoff_version_invalid/);
+  // Structurally invalid embedded spec.
+  assert.throws(() => parseHerdrHandoff(envelope.replace(/"executionSpec":\{[^}]*\}/, '"executionSpec":42')), /execution_spec_invalid/);
+  // Tampered worker slices still fail the work-graph parse.
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"objective":"fix docs"', '"objective":""')), /worker_slice_invalid/);
 });
 
 // --- Whole work-graph validation (Phase 4) ---
