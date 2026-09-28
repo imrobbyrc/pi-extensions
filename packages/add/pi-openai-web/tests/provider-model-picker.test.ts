@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openModelPicker } from "../src/provider/model-picker.js";
+import { openModelPicker, readPickerTriggerLabel } from "../src/provider/model-picker.js";
 import type { CdpClient } from "../src/provider/page.js";
 
 /** Minimal CDP double for the picker-open probe. */
@@ -40,4 +40,18 @@ test("openModelPicker ignores a stale unrelated menu and opens the model picker"
   const state = { modelRows: false, staleMenu: true };
   assert.equal(await openModelPicker(pickerClient(state)), true);
   assert.equal(state.modelRows, true);
+});
+
+test("readPickerTriggerLabel supports ChatGPT's labelled model button", async () => {
+  let expression = "";
+  const client = {
+    Runtime: {
+      evaluate: async ({ expression: value }: { expression: string }) => {
+        expression = value;
+        return { result: { value: value.includes('Select ChatGPT model') ? 'Thinking effortMedium' : null } };
+      }
+    }
+  } as unknown as CdpClient;
+  assert.equal(await readPickerTriggerLabel(client), "Thinking effortMedium");
+  assert.match(expression, /Select ChatGPT model/);
 });

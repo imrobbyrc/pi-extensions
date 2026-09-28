@@ -10,14 +10,14 @@ import { extractConversationId, isTemporaryChatUrl, toTemporaryChatUrl } from ".
 export type CdpClient = Awaited<ReturnType<typeof CDP>>;
 type Runtime = CdpClient["Runtime"];
 
-export const COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"]';
+export const COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"]';
 export const STOP_BUTTON_SELECTOR = [
   'button[data-testid="stop-button"]',
   'button[aria-label="Stop streaming"]',
   'button[aria-label*="Stop"]'
 ].join(", ");
 
-export const ASSISTANT_MESSAGE_SELECTOR = '[data-turn="assistant"], [data-message-author-role="assistant"]';
+export const ASSISTANT_MESSAGE_SELECTOR = '[data-turn="assistant"], [data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]';
 export const COMPOSER_SELECTOR = '[contenteditable="true"]';
 
 /** DOM snapshot of provider turn progress; contains no prompt/response bodies. */
@@ -124,11 +124,13 @@ export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
   const state = await evalJson<TurnDomState>(client, `() => {
     const containers = [...document.querySelectorAll('[data-turn-id-container]')].filter(el =>
       !el.parentElement?.closest('[data-turn-id-container]'));
-    const turnIdentities = containers.map(el => el.getAttribute('data-turn-id-container')).filter(Boolean);
+    const fallbackContainers = [...document.querySelectorAll('[data-content-search-unit-key$=":user"], [data-content-search-unit-key$=":assistant"]')];
+    const turnIdentities = (containers.length ? containers : fallbackContainers)
+      .map(el => el.getAttribute('data-turn-id-container') || el.getAttribute('data-content-search-unit-key')).filter(Boolean);
     const identities = (selector) => [...document.querySelectorAll(selector)]
-      .map(el => el.getAttribute('data-turn-id')).filter(Boolean);
-    const userIdentities = identities('[data-turn-id][data-message-author-role="user"], [data-turn-id][data-turn="user"]');
-    const responseIdentities = identities('[data-turn-id][data-message-author-role="assistant"], [data-turn-id][data-turn="assistant"]');
+      .map(el => el.getAttribute('data-turn-id') || el.getAttribute('data-content-search-unit-key')).filter(Boolean);
+    const userIdentities = identities('[data-turn-id][data-message-author-role="user"], [data-turn-id][data-turn="user"], [data-content-search-unit-key$=":user"]');
+    const responseIdentities = identities('[data-turn-id][data-message-author-role="assistant"], [data-turn-id][data-turn="assistant"], [data-content-search-unit-key$=":assistant"]');
     if (turnIdentities.some(id => typeof id !== 'string') || new Set(turnIdentities).size !== turnIdentities.length
       || [...userIdentities, ...responseIdentities].some(id => !turnIdentities.includes(id))) {
       throw new Error('ChatGPT conversation turn has no stable logical identity');
@@ -284,7 +286,8 @@ export interface SerializedAssistantTurn {
 export async function readAssistantTurnRevision(client: CdpClient, identity: string): Promise<AssistantTurnRevision | undefined> {
   const revision = await evalJson<AssistantTurnRevision | null>(client, `/* piRevisionProbe */ (() => {
     const wanted = ${JSON.stringify(identity)};
-    const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']');
+    const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
+      || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
     if (!message) return null;
     const checksum = (text) => {
       let sum = 0;
@@ -339,7 +342,8 @@ export interface AssistantTurnCapture {
 export async function captureAssistantTurn(client: CdpClient, identity: string): Promise<AssistantTurnCapture | undefined> {
   const capture = await evalJson<AssistantTurnCapture | null>(client, `/* piAtomicTurnCapture */ () => {
     const wanted = ${JSON.stringify(identity)};
-    const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']');
+    const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
+      || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
     if (!message) return null;
     const checksum = (text) => {
       let sum = 0;

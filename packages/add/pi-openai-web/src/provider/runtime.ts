@@ -428,6 +428,15 @@ export class OpenAIWebRuntime {
   }
 
   private async ensureConversation(descriptor: OpenAIWebModelDescriptor): Promise<ProviderConversation> {
+    const current = this.conversation;
+    if (current?.client.Runtime?.evaluate) {
+      try {
+        await current.client.Runtime.evaluate({ expression: "1" });
+      } catch {
+        await current.client.close().catch(() => {});
+        this.conversation = undefined;
+      }
+    }
     const wantedKey = descriptorKey(descriptor.browserModelLabel, descriptor.effort);
     const branchKey = this.deps.getBranchKey();
     // Pi session changes are handled by session_start. Keep this fallback so a

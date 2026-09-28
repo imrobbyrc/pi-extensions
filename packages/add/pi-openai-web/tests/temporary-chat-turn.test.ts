@@ -146,6 +146,40 @@ test("record falls back to targetId and never passes invalid conversation IDs to
   }
 });
 
+test("reconnects when the existing CDP WebSocket is closed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-stale-cdp-test-"));
+  try {
+    const runtime = new OpenAIWebRuntime({
+      config: baseConfig(dir),
+      catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+      ensureBrowser: async () => {},
+      getBranchKey: () => "session-1"
+    });
+    let closed = 0;
+    const replacement = { targetId: "tab-reconnected" };
+    (runtime as any).conversation = {
+      targetId: "tab-stale",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "session-1",
+      leaseKey: "session-1:lease",
+      epoch: 0,
+      bootstrapped: true,
+      syncedMessageCount: 1,
+      client: {
+        Runtime: { evaluate: async () => { throw new Error("WebSocket is not open: readyState 3 (CLOSED)"); } },
+        close: async () => { closed += 1; }
+      }
+    };
+    (runtime as any).reconnectConversation = async () => replacement;
+
+    const conversation = await (runtime as any).ensureConversation(descriptor);
+    assert.equal(conversation, replacement);
+    assert.equal(closed, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("same Pi session reuses target; changed branch resets it", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-session-lifecycle-test-"));
   try {

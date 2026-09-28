@@ -18,7 +18,9 @@ const UPGRADE_ROW_PATTERN = /upgrade|upsell|pro$|plus plan|business|enterprise/i
 
 export const FIND_TRIGGER = `(() => {
   const slots = [...document.querySelectorAll('[data-composer-transition-slot="trailing"], [data-composer-transition-slot="end"]')];
-  const triggers = slots.flatMap(slot => [...slot.querySelectorAll('button[aria-haspopup="menu"]')]).filter(el => el.offsetParent !== null);
+  const slotTriggers = slots.flatMap(slot => [...slot.querySelectorAll('button[aria-haspopup="menu"]')]);
+  const labelledTriggers = [...document.querySelectorAll('button[aria-label="Select ChatGPT model"], button[aria-label="Select model"]')];
+  const triggers = [...new Set([...slotTriggers, ...labelledTriggers])].filter(el => el.offsetParent !== null);
   const trigger = triggers.find(el => ${EFFORT_LABEL.toString()}.test((el.textContent || '').trim()))
     ?? triggers[0];
   return trigger || null;
@@ -74,9 +76,9 @@ export const FIND_MODEL_ROW = (label: string): string =>
 /** The effort "Power" control: a menuitem containing the effort slider. */
 export const FIND_EFFORT_POWER_ITEM = `[...document.querySelectorAll('[role="menuitem"]')]
   .filter(el => el.offsetParent !== null)
-  .find(el => el.querySelector('[data-model-reasoning-effort-slider]'))`;
+  .find(el => el.getAttribute('aria-label') === 'Power' || el.querySelector('[data-model-reasoning-effort-slider], [data-model-picker-power-slider]'))`;
 
-export const FIND_SLIDER = `[...document.querySelectorAll('[data-model-reasoning-effort-slider] [role="slider"]')].find(el => el.offsetParent !== null)`;
+export const FIND_SLIDER = `[...document.querySelectorAll('[role="menuitem"][aria-label="Power"] [role="slider"], [data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"]')].find(el => el.offsetParent !== null)`;
 
 /** Open the model/effort picker (idempotent) and wait for model rows to be visible. */
 export async function openModelPicker(client: CdpClient): Promise<boolean> {
@@ -200,7 +202,7 @@ export async function readLockedPositions(client: CdpClient, total: number): Pro
   const locked = await evalJson<number[]>(client, `(() => {
     const slider = (${FIND_SLIDER});
     if (!slider) return [];
-    const track = slider.closest('[data-model-reasoning-effort-slider]');
+    const track = slider.closest('[data-model-reasoning-effort-slider], [data-model-picker-power-slider], [role="menuitem"][aria-label="Power"]');
     const ticks = track ? [...track.querySelectorAll('span[data-locked]')] : [];
     return ticks.map((tick, index) => tick.getAttribute('data-locked') === 'true' ? index + 1 : 0).filter(position => position > 0);
   })()`);
@@ -241,17 +243,34 @@ export async function setEffortPosition(client: CdpClient, position: number): Pr
   const coords = await evalJson<{ x: number; y: number } | null>(client, `(() => {
     const slider = (${FIND_SLIDER});
     if (!slider) return null;
-    const track = slider.closest('[data-model-reasoning-effort-slider]')?.querySelector('[data-orientation="horizontal"]');
+    const owner = slider.closest('[data-model-reasoning-effort-slider], [data-model-picker-power-slider], [role="menuitem"][aria-label="Power"]');
+    const track = owner?.querySelector('[data-orientation="horizontal"]');
     const ticks = track ? [...track.querySelectorAll('span[data-locked]')] : [];
     const tick = ticks[${position - 1}] ?? null;
     const rect = (tick ?? track ?? slider).getBoundingClientRect();
-    const x = tick ? rect.left + rect.width / 2 : rect.left + (rect.width * ${position - 0.5}) / ${Math.max(1, position)};
+    const min = Number(slider.getAttribute('aria-valuemin'));
+    const max = Number(slider.getAttribute('aria-valuemax'));
+    const ratio = Number.isFinite(min) && Number.isFinite(max) && max > min ? (${position - 1} - min) / (max - min) : 0.5;
+    const x = tick ? rect.left + rect.width / 2 : rect.left + rect.width * Math.max(0, Math.min(1, ratio));
     return { x: Math.round(x), y: Math.round(rect.top + rect.height / 2) };
   })()`);
   if (!coords || !Number.isFinite(coords.x) || coords.x <= 0) return null;
   await client.Input.dispatchMouseEvent({ type: "mouseMoved", x: coords.x, y: coords.y });
   await client.Input.dispatchMouseEvent({ type: "mousePressed", x: coords.x, y: coords.y, button: "left", clickCount: 1 });
   await client.Input.dispatchMouseEvent({ type: "mouseReleased", x: coords.x, y: coords.y, button: "left", clickCount: 1 });
+  // New ChatGPT UI exposes keyboard-only Power control despite rendering a track.
+  // Click first, then use focused arrow keys when the value did not move.
+  const target = position - 1;
+  const before = await readEffortSlider(client);
+  if (before && before.value !== target) {
+    await evalJson(client, `(${FIND_EFFORT_POWER_ITEM})?.focus()`);
+    const direction = target > before.value ? "ArrowRight" : "ArrowLeft";
+    const keyCode = direction === "ArrowRight" ? 39 : 37;
+    for (let value = before.value; value !== target; value += target > before.value ? 1 : -1) {
+      await client.Input.dispatchKeyEvent({ type: "keyDown", key: direction, code: direction, windowsVirtualKeyCode: keyCode });
+      await client.Input.dispatchKeyEvent({ type: "keyUp", key: direction, code: direction, windowsVirtualKeyCode: keyCode });
+    }
+  }
   // Poll until the value settles on the requested position.
   for (let i = 0; i < 10; i++) {
     await sleep(150);
@@ -300,7 +319,9 @@ export async function readPickerTriggerLabel(client: CdpClient): Promise<string 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const label = await evalJson<string | null>(client, `/* piPickerTrigger */ (() => {
       const slots = [...document.querySelectorAll('[data-composer-transition-slot="trailing"], [data-composer-transition-slot="end"]')];
-      const triggers = slots.flatMap(slot => [...slot.querySelectorAll('button[aria-haspopup="menu"]')]).filter(el => el.offsetParent !== null);
+      const slotTriggers = slots.flatMap(slot => [...slot.querySelectorAll('button[aria-haspopup="menu"]')]);
+      const labelledTriggers = [...document.querySelectorAll('button[aria-label="Select ChatGPT model"], button[aria-label="Select model"]')];
+      const triggers = [...new Set([...slotTriggers, ...labelledTriggers])].filter(el => el.offsetParent !== null);
       const trigger = triggers.find(el => ${EFFORT_LABEL.toString()}.test((el.textContent || '').trim())) ?? triggers[0];
       return trigger ? ((trigger.textContent || '').replace(/\\s+/g, ' ').trim() || null) : null;
     })()`);
