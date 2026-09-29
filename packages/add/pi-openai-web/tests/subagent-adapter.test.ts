@@ -18,7 +18,7 @@ const autoGate = { ui: () => undefined, autoApprove: () => true };
 const bareWorker: WorkerSlice = { id: "w1", objective: "fix the bug", owns: ["src"], dependsOn: [] };
 
 function capturingController() {
-  const runs: Array<{ tasks: Array<{ id: string; task: string; needs?: string[] }> }> = [];
+  const runs: Array<{ concurrency: number; tasks: Array<{ id: string; task: string; needs?: string[] }> }> = [];
   const controller = {
     run: (request: unknown) => {
       const typed = request as { tasks: Array<{ id: string }> };
@@ -31,6 +31,23 @@ function capturingController() {
   };
   return { controller: controller as unknown as SubagentController, runs };
 }
+
+test("configured concurrency reaches core run and follows live settings", async () => {
+  const { controller, runs } = capturingController();
+  let limit = 1;
+  const adapter = new SubagentMcpAdapter(controller, () => session, autoGate, undefined, () => limit);
+  for (const expected of [1, 2, 3, 4]) {
+    limit = expected;
+    await adapter.run({ goal: "ship", workers: [bareWorker], handoff: issueHerdrHandoff("ship", [bareWorker], gates, { suite: `limit-${expected}` }) });
+    assert.equal(runs.at(-1)?.concurrency, expected);
+  }
+  limit = 8; // Previously persisted config cannot exceed four available worker nodes.
+  await adapter.run({ goal: "ship", workers: [bareWorker], handoff: issueHerdrHandoff("ship", [bareWorker], gates, { suite: "legacy-limit" }) });
+  assert.equal(runs.at(-1)?.concurrency, 4);
+  limit = Number.NaN;
+  await adapter.run({ goal: "ship", workers: [bareWorker], handoff: issueHerdrHandoff("ship", [bareWorker], gates, { suite: "invalid-limit" }) });
+  assert.equal(runs.at(-1)?.concurrency, 3);
+});
 
 test("worker task prompts serialize the assigned declarative slice", async () => {
   const { controller, runs } = capturingController();

@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { listDirectory, readContextFile, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { parseHerdrHandoff, issueHerdrHandoff, issueHerdrHandoffV2, planFingerprint, planFingerprintV2, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, assertRiskLevel, assertPlanningKind, assertCompactPlan, compileDecisionGraph, compileCompactPlan, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, COMPACT_PLAN_FIELDS, COMPACT_PLAN_VALUE_MAX, RISK_LEVELS, PLANNING_KINDS, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice, type RiskLevel, type PlanningKind } from "../provider/orchestrator.js";
+import { parseHerdrHandoff, issueHerdrHandoff, issueHerdrHandoffV2, planFingerprint, planFingerprintV2, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, assertRiskLevel, assertPlanningKind, assertRiskPlanningPair, assertCompactPlan, compileDecisionGraph, compileCompactPlan, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, COMPACT_PLAN_FIELDS, COMPACT_PLAN_VALUE_MAX, RISK_LEVELS, PLANNING_KINDS, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice, type RiskLevel, type PlanningKind } from "../provider/orchestrator.js";
 import { buildWorkerTask, type AdapterRunSnapshot } from "./subagent-adapter.js";
 type HerdrWorker = WorkerSlice;
 
@@ -119,14 +119,13 @@ export const herdrPlanningKind = z.enum(PLANNING_KINDS);
 
 export const HERDR_TOOL_DESCRIPTION = [
   "Single Pi-native harness tool. Actions:",
-  "plan — validate planning gates {graph, handoff, critique} and the decomposition as one legal work graph (unique worker ids, dependencies referencing existing workers, no cycles, and no overlapping ownership between workers that no dependency path serializes — invalid graphs fail closed with work_graph_invalid), then return a Pi-issued handoff envelope; the later run must reuse the exact same goal, workers (including any optional requirements/behaviors/seams/acceptance slice lists), decision_graph, and envelope string verbatim. decision_graph is the sole planning authority: exactly nine non-blank axes (problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique) are compiled deterministically by Pi for binding and verification — workers cannot invent requirements.",
-  "run — start a Herdr execution with a bounded 1-4 Pi-worker decomposition (each worker may carry optional declarative requirements/behaviors/seams/acceptance lists, immutably bound into the plan and serialized into that worker's prompt), the plan's decision_graph verbatim (a changed, added, or removed graph is rejected), plus the handoff envelope from plan (explicit TUI confirmation in Pi; returns a run handle immediately).",
-  "status — read persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed worker stays live in its pane, awaiting your review — it is NOT auto-cleaned.",
-  "correct — send bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session and completes again for re-review (repeatable); a still-running worker is steered mid-flight.",
-  "accept — accept one completed worker's work: requires run_id, worker_id, the exact Pi-issued handoff envelope, and the verification_fingerprint returned by a prior verify; the report is recomputed from fresh evidence immediately before the mutation and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated (the verification workflow toggle can lift this evidence requirement). On match: finalizes the review loop and closes its pane (idempotent). Accept each worker whose work you approve, then report to the user.",
-  "verify — observational evidence, never a gate: bind the exact Pi-issued handoff envelope to one run (run_id plus the verbatim envelope from plan/run) and derive a deterministic bounded VerificationReport with exactly four dimensions — spec (compiled decision_graph authority and planning gates), design (authorized worker slices in deterministic work-graph order), quality (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending), and evidence (current git status/diff observations plus bounded worker evidence from the run snapshot). Read-only: never calls correct/accept/stop, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or passes/fails work. Malformed or tampered envelopes, unknown runs, worker-set mismatch, or a worker prompt that does not byte-match the deterministic minimal contract recomputed from the envelope (projection or authorization binding drift) fail closed. The response also carries verification_fingerprint — a deterministic SHA-256 over the report with accept bookkeeping excluded — which action=accept requires verbatim.",
-  "stop — stop a run and close its panes, including unaccepted completed workers (omit run_id to reap all owned panes).",
-  "Workers always run as Pi agents (kind=pi); openai-web worker models are rejected."
+  "plan — return a Pi-issued handoff for goal, 1–4 workers, and planning authority. v2 low: risk=low, planning_kind=compact, compact_plan {problem,scope,behavior,verification}, no gates. v2 medium/high: planning_kind=design-graph, decision_graph and gates {graph,handoff,critique}. v1 keeps strict gates. Worker ids, dependencies and owned paths form a legal work graph; slices cannot invent requirements.",
+  "run — repeat exact goal, workers, authority, v2 risk/planning_kind and handoff from plan. Pi validates binding and asks the user to confirm before starting Pi workers.",
+  "status — inspect workers and panes; completed workers await review when reviewLoop is enabled.",
+  "correct — send feedback to one worker; completed workers reopen in the SAME pane and session.",
+  "accept — finalize one worker and close its pane. With verificationGate on, provide the exact bound handoff. v2 low needs diff review but no fingerprint; v1 and v2 medium/high need a fresh verify fingerprint. Any supplied fingerprint is checked. With verificationGate off, handoff and fingerprint are not required; semantic review remains necessary.",
+  "verify — read-only VerificationReport (spec, design, quality, evidence), never scores or passes/fails work. Binds handoff to observed run, worker set and exact prompt, plus git observations; returns verification_fingerprint. Does not correct, accept, stop or close panes.",
+  "stop — stop a run and close its panes, including unaccepted workers. Workers are Pi agents only."
 ].join(" ");
 
 /**
@@ -161,6 +160,7 @@ export function validateHerdrRunInput(input: { goal?: string; workers?: unknown[
     }
     const risk = assertRiskLevel(input.risk);
     const planningKind = assertPlanningKind(input.planning_kind);
+    assertRiskPlanningPair(risk, planningKind);
     if (parsed.risk !== risk || parsed.planningKind !== planningKind) {
       throw new Error("herdr run risk/planning_kind differs from the plan (re-run herdr action=plan).");
     }
@@ -417,7 +417,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         const risk = (args as { risk?: unknown }).risk;
         const planning_kind = (args as { planning_kind?: unknown }).planning_kind;
         if (action === "plan") {
-          if (!goal || !workers || !gates) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
+          if (!goal || !workers) throw new Error("herdr plan requires goal and workers.");
           // P1 risk-aware path: any v2 field present → v2 issuance. The compact
           // plan (or decision graph) compiles into the spec authority BEFORE the
           // fingerprint, and risk + planning kind join the immutable identity.
@@ -425,7 +425,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           if (compact_plan !== undefined || risk !== undefined || planning_kind !== undefined) {
             return text({ ok: true, handoff: issueHerdrHandoffV2(goal, workers, gates, risk, planning_kind, { compactPlan: compact_plan, decisionGraph: decision_graph }), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, planning authority, risk, and planning_kind." });
           }
-          if (!decision_graph && execution_spec === undefined) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
+          if (!gates || (!decision_graph && execution_spec === undefined)) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
           return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and decision_graph." });
         }
         if (action === "run") {
@@ -454,15 +454,24 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         if (action === "accept") {
           if (!run_id || !worker_id) throw new Error("herdr accept requires run_id and worker_id.");
           const evidenceGate = workflows().verificationGate;
-          if (evidenceGate && (!handoff?.trim() || !verification_fingerprint)) throw new Error("herdr accept requires the exact Pi-issued handoff and the verification_fingerprint from herdr action=verify.");
           if (evidenceGate) {
-            // Freshness gate: recompute the verification report from live
-            // evidence NOW and compare against the reviewed fingerprint BEFORE
-            // any mutation — accepted bookkeeping is fingerprint-exempt, so this
-            // matches exactly when nothing else in the run/workspace drifted.
-            const fresh = await runHerdrVerification({ runId: run_id, handoff: handoff as string, subagent: deps.subagent, workspaceRoot });
-            if (verificationFingerprint(fresh) !== verification_fingerprint) {
-              throw new Error("herdr accept fingerprint mismatch: current run/workspace evidence no longer matches the reviewed verification report (re-run herdr action=verify and accept the fresh fingerprint).");
+            if (!handoff?.trim()) throw new Error("herdr accept requires the exact Pi-issued handoff (and a verification_fingerprint for v1 or medium/high risk).");
+            const plan = parseHerdrHandoff(handoff);
+            const lightweight = plan.version === "v2" && plan.risk === "low" && !verification_fingerprint;
+            if (lightweight) {
+              // A low-risk claim relaxes verification only after matching the
+              // exact worker prompts observed in THIS run to the handoff.
+              if (typeof deps.subagent.inspect !== "function") throw new Error("herdr_verify_unavailable: read-only run inspection is required.");
+              const bound = bindHerdrRunToHandoff(handoff, run_id, await deps.subagent.inspect(run_id));
+              if (!bound.workers.some((worker) => worker.id === worker_id)) throw new Error("herdr accept worker is not authorized by this handoff.");
+            } else {
+              if (!verification_fingerprint) throw new Error("herdr accept requires the exact Pi-issued handoff and the verification_fingerprint from herdr action=verify.");
+              // Strict plans (and low plans with an explicit fingerprint) must
+              // still match fresh workspace/run evidence immediately before accept.
+              const fresh = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
+              if (verificationFingerprint(fresh) !== verification_fingerprint) {
+                throw new Error("herdr accept fingerprint mismatch: current run/workspace evidence no longer matches the reviewed verification report (re-run herdr action=verify and accept the fresh fingerprint).");
+              }
             }
           }
           const run = await deps.subagent.accept(run_id, worker_id);

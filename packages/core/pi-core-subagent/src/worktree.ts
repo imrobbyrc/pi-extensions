@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, uptime } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -194,10 +195,12 @@ function ownerFile(path: string): string {
 }
 
 function dropDir(root: string, path: string): void {
+	// Let Git own worktree deletion; removing the path afterward can delete a new checkout at the same location.
 	try {
 		git(root, ["worktree", "remove", "--force", path]);
-	} catch {
-		if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+	} catch (error) {
+		// Git can unregister the checkout but fail to remove unrelated files left in its directory.
+		if (worktreePaths(root)?.some((registered) => samePath(registered, path)) !== false) throw error;
 	}
 	rmSync(ownerFile(path), { force: true });
 	prune(root);
@@ -295,12 +298,14 @@ export function reapDeadWorktrees(root: string, isLive: (path: string) => boolea
 }
 
 export function claimWorktree(wt: Worktree): void {
+	const marker = ownerFile(wt.path);
+	const temp = `${marker}.${randomUUID()}.tmp`;
 	try {
-		writeFileSync(
-			ownerFile(wt.path),
-			JSON.stringify({ pid: process.pid, host: hostname(), boot: bootId(), at: Date.now() }),
-		);
-	} catch {}
+		writeFileSync(temp, JSON.stringify({ pid: process.pid, host: hostname(), boot: bootId(), at: Date.now() }), { mode: 0o600 });
+		renameSync(temp, marker);
+	} catch {
+		rmSync(temp, { force: true });
+	}
 }
 
 export function ownerAlive(path: string, ownedHere?: (path: string) => boolean): boolean {

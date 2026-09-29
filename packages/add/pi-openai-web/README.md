@@ -4,17 +4,17 @@ Pi-native harness with an **always-on ChatGPT Web Lead Architect**: ChatGPT Web 
 
 ## Release status
 
-**V4 safety baseline, implemented and tested (229 harness tests, plus the core subagent suite in `packages/core/pi-core-subagent`).**
+**Risk-aware Herdr protocol implemented and tested.** The core subagent suite lives in `packages/core/pi-core-subagent`.
 
 One product, one flow:
 
 - **OpenAI Web Lead (always on)** — ChatGPT Web behaves like a native Pi model through `/model openai-web/<id>`, with dynamic model/effort discovery, exact browser selection, bounded context, and structured checkpoint compaction.
 - **Strict lead tools** — the Lead sees exactly eight MCP tools: seven bounded read-only workspace inspections (including optional root `CONTEXT.md` guidance via `read_context`) plus one Pi-native `herdr` execution tool. No shell, no writes, no subagent spawning, no browser worker tabs.
-- **Decision-graph planning & work-graph validation** — every plan requires the nine-axis `decision_graph` and planning gates (`graph`, `handoff`, `critique`); Pi compiles the graph only for deterministic binding and verification, and every 1–4 worker decomposition is validated as one legal work graph (unique ids, acyclic dependencies, non-overlapping ownership) before a Pi-issued handoff envelope binds it to a deterministic plan fingerprint.
+- **Risk-aware planning & work-graph validation** — v2 low-risk plans use four-field `compact_plan` without gates; v2 medium/high and legacy v1 retain full-graph/strict-gate behavior. Every 1–4 worker graph validates ids, dependencies and ownership before handoff. Risk and planning kind join the v2 fingerprint.
 - **Asynchronous native Herdr** — one `herdr` MCP tool with `plan | run | status | correct | accept | stop | verify` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
-- **Observational verification & fingerprint-bound acceptance** — `herdr verify` binds the exact Pi-issued handoff envelope to one actual run and derives a deterministic bounded `VerificationReport` (exactly four dimensions: spec, design, quality, evidence) from the parsed handoff, the raw run snapshot, and current git status/diff, plus a `verification_fingerprint` (deterministic SHA-256). The report is read-only evidence for review — never a score, never a pass/fail. `herdr accept` additionally requires that fingerprint: the report is recomputed from fresh evidence immediately before the mutation, and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated.
+- **Risk-bound acceptance** — `herdr verify` produces read-only evidence (spec, design, quality, evidence) and a fingerprint. v2 low-risk work can be accepted after diff review without a fingerprint, but the handoff must match the actual run and worker prompts. v1 and v2 medium/high require a fresh verification fingerprint; drift fails closed.
 
-**V5 — adaptive planning depth (landed).** Planning depth scales to assessed risk: **low-risk** work (docs, comments, config, single-file or test-only edits) gets a compact plan (problem, scope/boundaries, behavior, verification), while **medium/high-risk** work retains the full Design Graph (nine sections, with broader verification expectations at high risk). The planning gates, work-graph rules, and the verify → fresh-fingerprint accept safety floor stay identical at every depth; only the depth adapts. See [Planning depth](#planning-depth-v5-adaptive-planning).
+Planning and review now scale with assessed risk. One worker is the default; independent owned paths may run concurrently, up to four. See [Planning depth](#planning-depth-v5-adaptive-planning).
 
 The former planner subsystem (`/planner`, task store, submit_plan/submit_review protocol, browser worker tabs, Pi subagent delegation) has been removed.
 
@@ -32,15 +32,15 @@ Select a discovered ChatGPT Web model/effort as your active Pi model:
 /model openai-web/gpt-5-6-sol-medium
 ```
 
-ChatGPT Web streams responses natively into Pi. The Lead Architect contract is injected into every provider turn: the Lead reasons, assesses risk, and plans at the depth that risk justifies — always through the mandatory planning gates (`graph`, `handoff`, `critique`) — before submitting a worker decomposition through the `herdr` tool. Pi shows you the plan, asks for explicit confirmation, then Herdr splits panes and starts Pi workers. The Lead inspects `git_status`/`git_diff` afterwards, sends bounded `correct` rounds to the worker's own pane until the work is good, then `verify`s the run and `accept`s each approved worker with the fresh verification fingerprint to close its pane, and reports the result.
+ChatGPT Web streams responses into Pi. The Lead plans low-risk work with `compact_plan` or medium/high work with `decision_graph`, then delegates through `herdr`. Pi asks for explicit confirmation before workers start. The Lead reviews `git_status`/`git_diff`, sends bounded corrections when needed, and accepts each approved worker. Medium/high and legacy v1 acceptance require fresh verification evidence.
 
 ```text
-Lead turn → herdr plan (planning gates, fingerprinted handoff envelope)
-          → herdr run (1–4 workers, DAG, ownership scopes)
-          → explicit TUI confirmation in Pi
-          → Herdr panes, Pi workers (kind=pi)
-          → herdr status / correct (same pane, repeatable) / verify → accept (fresh fingerprint)
-          → Lead reviews diff → result
+Lead turn → herdr plan (low: compact; medium/high: graph + gates)
+          → herdr run (1 worker default; 1–4 allowed, bounded concurrency)
+          → explicit TUI confirmation → Pi workers in Herdr panes
+          → status / correct → Lead reviews diff
+          → low: accept with bound handoff; medium/high/v1: verify → accept with fresh fingerprint
+          → result
 ```
 
 ## Start here
@@ -157,7 +157,7 @@ Strict frozen allowlist — the only tools the Lead can see:
 | `repo_map` | read-only | Bounded directory tree |
 | `git_status` | read-only | Git status |
 | `git_diff` | read-only | Git diff (staged or unstaged) |
-| `herdr` | **mutating** (the `verify` action is read-only) | `plan \| run \| status \| correct \| accept \| stop \| verify` — Pi-native worker execution; `verify` derives the observational VerificationReport and its `verification_fingerprint`, which `accept` requires |
+| `herdr` | **mutating** (the `verify` action is read-only) | `plan \| run \| status \| correct \| accept \| stop \| verify` — Pi-native workers; `verify` yields a fingerprint required for v1 and v2 medium/high acceptance |
 
 The `herdr` tool is honestly annotated (`readOnlyHint: false`, `destructiveHint: true`). Everything else is read-only. There are no shell, edit, write, install, migration, git-mutation, or subagent tools at any endpoint.
 
@@ -175,17 +175,17 @@ The `herdr` tool is honestly annotated (`readOnlyHint: false`, `destructiveHint:
 
 ### Planning depth (V5 adaptive planning)
 
-Planning is mandatory before delegation, and its depth scales to the risk the Lead assesses from workspace evidence. The planning gates (`graph`, `handoff`, `critique`), the work-graph rules, and the verify → fresh-fingerprint accept safety floor apply identically at every level — only the depth adapts.
+Planning is mandatory before delegation. v2 binds `risk` and `planning_kind` into the handoff; they cannot change at run or accept. The Lead assesses risk from workspace evidence. Work-graph validation and human confirmation apply at every level; gates and verification depth differ.
 
 | Assessed risk | Planning depth |
 | --- | --- |
-| **Low** — docs, comments, config, single-file or test-only edits | Compact plan: problem, scope/boundaries, intended behavior, verification. `decision_graph` is still required; multi-worker decomposition is optional at this level |
-| **Medium** — normal multi-surface behavioral changes (features spanning multiple files, modules, or surfaces) | Full Design Graph, in order: Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, Critique |
-| **High** — architecture, concurrency, auth/security, migrations/data integrity, lifecycle-sensitive changes, or complex multi-worker dependency work | Full Design Graph (same nine sections) plus broader verification expectations — wider test surface and explicit failure/boundary analysis |
+| **Low** — localized docs, config or one-file changes | v2 `risk=low`, `planning_kind=compact`, `compact_plan` with problem, scope, behavior, verification; no gates; inspect diff before bound-handoff accept |
+| **Medium** — multi-surface behavior | v2 `risk=medium`, `planning_kind=design-graph`, nine-axis `decision_graph` and gates; verify before accept |
+| **High** — auth, migration, concurrency, data integrity or lifecycle | v2 full graph and gates; wider test/failure evidence; fresh verify before accept |
 
 Escalate, never downgrade: inspection or new evidence revealing complexity beyond the assessed level re-rates the task and re-plans at the higher rigor before delegation, and an in-flight task is never silently downgraded to lighter review.
 
-*Status: V5 adaptive planning is landed on main — planning depth adapts to the assessed risk while the planning gates and safety floor stay mandatory at every level.*
+Legacy v1 handoffs remain strict. Existing v2 low handoffs that include valid gates remain readable. `adaptivePlanning=false` asks the Lead for a full graph; `verificationGate=false` removes the fingerprint gate, not semantic review. `adaptive` favors one worker; `aggressive` favors useful parallelism only across independent owned paths.
 
 ### Contract
 
@@ -193,8 +193,11 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
 
 ```json
 {
-  "action": "run",
+  "action": "plan",
   "goal": "add rate limiting with tests",
+  "risk": "medium",
+  "planning_kind": "design-graph",
+  "gates": { "graph": "reviewed graph", "handoff": "worker brief", "critique": "reviewed failure cases" },
   "decision_graph": {
     "problem": "requests can overwhelm the API",
     "shapes": "middleware plus focused tests",
@@ -207,15 +210,16 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
     "critique": "one worker decomposition is sufficient"
   },
   "workers": [
-    { "id": "worker-core", "objective": "implement limiter", "owns": ["src/limiter/**"], "depends_on": [] },
-    { "id": "worker-tests", "objective": "add test coverage", "owns": ["test/**"], "depends_on": ["worker-core"] }
+    { "id": "worker-core", "objective": "implement limiter and tests", "owns": ["src/limiter/**", "test/**"], "depends_on": [] }
   ]
 }
 ```
 
-- 1–4 workers; cycles, overlapping/empty scopes, and `openai-web` worker models are rejected.
-- Workers always run as Pi agents (`herdr agent start --kind pi`); the default profile is Luna Max (`openai-codex/gpt-5.6-luna`, thinking `max`), configurable via `/openai-web orches`.
-- Dependency-free workers with proven non-overlapping scopes run in parallel in one shared working tree.
+For a low-risk change, use `risk=low`, `planning_kind=compact` and `compact_plan` with only `problem`, `scope`, `behavior` and `verification`; omit `gates` and `decision_graph`. Pass the returned handoff and the same fields to `run`.
+
+- One worker by default; 1–4 allowed. Cycles, overlapping/empty scopes, and `openai-web` worker models are rejected. Reuse the returned handoff verbatim with the same plan fields in `run`.
+- Workers run as Pi agents (`herdr agent start --kind pi`); model and thinking profile are configurable via `/openai-web orches`.
+- Independent workers with non-overlapping scopes run concurrently in one shared working tree, up to the configured 1–4 concurrency cap.
 - Workers cannot spawn panes, delegate, switch models, commit, push, deploy, or expand scope. Unowned or ambiguous source mutations fail closed against the run baseline.
 
 ### Confirmation gate
@@ -227,8 +231,8 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
 - `run` returns the run handle immediately; execution continues in the background.
 - `status` reads the persisted run lifecycle (workers, panes, baselines, failures, correction rounds). A completed herdr worker stays live in its pane awaiting review — it is never auto-cleaned while reviewable.
 - `correct` sends bounded review feedback to one exact worker: a completed worker reopens in its SAME pane and session (same agent, accumulated context) and completes again for re-review — repeatable, the round count shows in `status`; a still-running worker is steered mid-flight. The worker is always reused, never replaced.
-- `accept` accepts one completed worker's work: it requires the exact Pi-issued handoff envelope plus the `verification_fingerprint` returned by a prior `verify`; the report is recomputed from fresh evidence immediately before the mutation, and any drift (stale report, changed workspace, corrected worker) fails closed before anything is mutated. On match: marks the worker accepted and closes its pane (idempotent). This is the required finalization for every approved worker.
-- `verify` derives a post-implementation `VerificationReport` for one run: it requires `run_id` plus the exact Pi-issued handoff envelope, parses it through the existing envelope parser, and binds it to the actual run — the authorized worker set must match the run's workers and every worker task prompt must carry the exact envelope prefix; any mismatch (malformed or tampered envelope, unknown run, worker-set drift, prompt drift) fails closed with a verification-specific error. The report carries exactly four dimensions — `spec` (the bound `decision_graph` plus planning gates), `design` (authorized worker slices in deterministic work-graph order), `quality` (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending; volatile timestamps are omitted), and `evidence` (current `git_status`/`git_diff` observations plus bounded worker evidence already in the run snapshot). Deterministic for the same observations, and purely observational: it never calls `correct`/`accept`/`stop`, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or gates acceptance. The response also carries a `verification_fingerprint` — a deterministic SHA-256 over the report with accept bookkeeping excluded — which `accept` requires verbatim as a freshness binding on the reviewed evidence. Inspection goes through a read-only raw snapshot channel (the adapter's `inspect` seam), never through `status`, whose adapter implementation can auto-shutdown a run after acceptance.
+- `accept` finalizes one completed worker and closes its pane. With `verificationGate` on, v2 low requires a handoff bound to the observed run and worker prompts, but no fingerprint. v1 and v2 medium/high require that handoff plus a fresh `verify` fingerprint; drift fails closed. A fingerprint supplied for low is also checked. With the gate off, the Lead still reviews the diff.
+- `verify` derives a post-implementation `VerificationReport` for one run: it requires `run_id` plus the exact Pi-issued handoff envelope, parses it through the existing envelope parser, and binds it to the actual run — the authorized worker set must match the run's workers and every worker task prompt must exactly match the deterministic worker contract derived from the envelope; any mismatch (malformed or tampered envelope, unknown run, worker-set drift, prompt drift) fails closed with a verification-specific error. The report carries exactly four dimensions — `spec` (the bound compiled planning authority and any gates), `design` (authorized worker slices in deterministic work-graph order), `quality` (observed run/worker lifecycle facts only: statuses, correction rounds, acceptance, cleanup-pending; volatile timestamps are omitted), and `evidence` (current `git_status`/`git_diff` observations plus bounded worker evidence already in the run snapshot). Deterministic for the same observations, and purely observational: it never calls `correct`/`accept`/`stop`, never mutates worker/run state, never auto-cleans reviewable panes, and never scores or gates acceptance. The response also carries a `verification_fingerprint` — a deterministic SHA-256 over the report with accept bookkeeping excluded — which strict acceptance requires as a freshness binding on reviewed evidence. Inspection goes through a read-only raw snapshot channel (the adapter's `inspect` seam), never through `status`, whose adapter implementation can auto-shutdown a run after acceptance.
 - `stop` stops a run and closes its owned panes, including unaccepted completed workers (omit `run_id` to reap all owned panes).
 
 ## Provider features
@@ -250,8 +254,8 @@ The Lead submits a bounded decomposition; Pi validates it fail-closed:
 | `/openai-web models [refresh]` | Show (or re-discover) the model catalog |
 | `/openai-web reset` | Reset the provider conversation (next turn opens a fresh Temporary Chat) |
 | `/openai-web compact` | Compact the conversation via validated checkpoint |
-| `/openai-web orches` / `/openai-web config` / `/openai-web ui` | Lead/worker profile TUI: worker model, thinking, max parallel workers (1–8), strategy, scope |
-| `/openai-web orches <cmd>` | Non-interactive: `status`, `model <id>`, `thinking <level>`, `workers <1-8>`, `strategy <adaptive\|aggressive>`, `scope <project\|global\|session>` |
+| `/openai-web orches` / `/openai-web config` / `/openai-web ui` | Lead/worker profile TUI: worker model, thinking, max concurrent workers (1–4), strategy, scope |
+| `/openai-web orches <cmd>` | Non-interactive: `status`, `model <id>`, `thinking <level>`, `workers <1-4>`, `strategy <adaptive\|aggressive>`, `scope <project\|global\|session>` |
 | `/openai-web doctor` | Diagnostics: catalog, infrastructure, credential, lead profile, Herdr, recent runs |
 
 ## Setup and configuration
@@ -319,8 +323,6 @@ State persists outside the repository by default:
 │   ├── model-catalog.json
 │   ├── resume.json
 │   └── sessions/
-└── provider/
-    └── sessions/
 ```
 
 Read [`SECURITY.md`](SECURITY.md) before exposing MCP. Key boundaries:
@@ -337,9 +339,9 @@ Read [`SECURITY.md`](SECURITY.md) before exposing MCP. Key boundaries:
 
 - ChatGPT UI settings and app-picker markup can change; manual selection may be required.
 - MCP server has no OAuth/pairing; never expose the loopback endpoint directly to the public internet.
-- Worker concurrency is bounded to 1–4 per run and 1–8 in the lead profile; Herdr pane management assumes a single shared machine.
+- Work graphs contain 1–4 workers; configured concurrency is also 1–4 per scheduler wave. Older saved values 5–8 load at an effective cap of 4 without rewriting the file.
 - Pi extension events do not provide authoritative per-command test output; workers must surface their own evidence.
 
 ## Roadmap
 
-The V4 safety baseline — decision-graph planning, work-graph validation, observational `verify`, and fingerprint-bound fresh-evidence `accept` — is complete and validated with 229 harness tests plus the core subagent suite in `@imrobbyrc/pi-core-subagent`. V5 adaptive planning depth has landed. Remaining work and future ideas are tracked in [`ROADMAP.md`](ROADMAP.md). Historical V0–V2 milestones (planner subsystem, browser worker tabs, Pi subagent delegation) are retained there as clearly labeled superseded history.
+The risk-aware protocol preserves work-graph validation, human confirmation, minimal worker prompts and strict legacy acceptance. Run `npm test` and `npm run typecheck` for the current test count. Future ideas live in [`ROADMAP.md`](ROADMAP.md); V0–V2 history there is superseded.

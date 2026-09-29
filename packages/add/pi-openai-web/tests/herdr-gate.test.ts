@@ -527,8 +527,13 @@ test("v2 run binding invalidates when the compact-plan content changes", () => {
 
 test("v2 run binding invalidates when the risk level or planning kind changes", () => {
   const handoff = compactHandoff();
-  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, risk: "medium" })), /risk\/planning_kind differs/);
-  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, kind: "design-graph" })), /risk\/planning_kind differs/);
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, risk: "medium" })), /handoff_planning_mismatch/);
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff, kind: "design-graph" })), /handoff_planning_mismatch/);
+  // Even a matching forged fingerprint cannot authorize an invalid pair.
+  const forged = JSON.parse(handoff);
+  forged.risk = "high";
+  forged.planFingerprint = planFingerprintV2(p1Goal, p1Workers, compileCompactPlan(p1CompactPlan), "high", "compact");
+  assert.throws(() => validateHerdrRunInput(p1Run({ handoff: JSON.stringify(forged), risk: "high" })), /handoff_planning_mismatch/);
   // Bounded values are enforced before any comparison.
   assert.throws(() => validateHerdrRunInput(p1Run({ handoff, risk: "critical" })), /risk_level_invalid/);
   assert.throws(() => validateHerdrRunInput(p1Run({ handoff, kind: "full" })), /planning_kind_invalid/);

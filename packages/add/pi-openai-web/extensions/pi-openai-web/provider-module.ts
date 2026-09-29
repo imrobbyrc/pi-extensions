@@ -146,7 +146,8 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
           ui: () => uiContext,
           autoApprove: () => cfg.harnessAutoApproveHerdrRun === true
         },
-        () => resolveWorkflowToggles(orchestratorState?.config).reviewLoop
+        () => resolveWorkflowToggles(orchestratorState?.config).reviewLoop,
+        () => orchestratorState?.config.maxParallelWorkers ?? 3
       );
       infrastructure = new HarnessRuntime(cfg, () => createHarnessMcpFactory({
         config: cfg,

@@ -219,14 +219,14 @@ export function createOrchestratorSettingsComponent(options: OrchestratorGuiOpti
     {
       id: "maxParallelWorkers",
       label: "Max Workers",
-      description: "Max parallel Herdr worker panes allowed (1 to 8).",
+      description: "Max concurrent workers in a 1–4 worker plan (1 to 4).",
       currentValue: String(maxParallelWorkers),
-      values: ["1", "2", "3", "4", "5", "6", "7", "8"]
+      values: ["1", "2", "3", "4"]
     },
     {
       id: "delegationStrategy",
       label: "Delegation Strategy",
-      description: "adaptive (modular tasks) vs aggressive (all code changes).",
+      description: "adaptive prefers one worker; aggressive splits independent owned paths when useful.",
       currentValue: delegationStrategy,
       values: ["adaptive", "aggressive"]
     },

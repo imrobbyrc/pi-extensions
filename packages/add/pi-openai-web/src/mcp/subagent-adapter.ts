@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
-import { WORKER_METADATA_FIELDS, canonicalWorkers, type WorkerMetadataField, type WorkerSlice } from "../provider/orchestrator.js";
+import { WORKER_METADATA_FIELDS, DEFAULT_ORCHESTRATOR_CONFIG, canonicalWorkers, effectiveMaxParallelWorkers, type WorkerMetadataField, type WorkerSlice } from "../provider/orchestrator.js";
 
 // Structural snapshots (controller is typed loosely by the local .d.ts; the
 // shapes come from @imrobbyrc/pi-core-subagent TaskSnapshot/RunSnapshot).
@@ -126,7 +126,8 @@ export class SubagentMcpAdapter {
     private readonly context: () => ExtensionContext | undefined,
     private readonly gate?: HerdrRunGateSource,
     /** Workflow enforcement: when provided and false, completed workers stop being retained for review (panes release when idle). */
-    private readonly reviewLoop?: () => boolean
+    private readonly reviewLoop?: () => boolean,
+    private readonly maxParallelWorkers?: () => number
   ) {}
 
   async run(request: { goal: string; workers: WorkerSlice[]; workerModel?: string; workerThinking?: string; handoff: string }) {
@@ -165,7 +166,7 @@ export class SubagentMcpAdapter {
       ...(worker.dependsOn.length ? { needs: worker.dependsOn } : {})
     }));
     // Tasks mode rejects top-level prompt; the worker contract travels with each task.
-    const run = this.controller.run({ tasks, runtime: "herdr" }, ctx);
+    const run = this.controller.run({ tasks, runtime: "herdr", concurrency: effectiveMaxParallelWorkers(this.maxParallelWorkers?.() ?? DEFAULT_ORCHESTRATOR_CONFIG.maxParallelWorkers) }, ctx);
     this.consumedHandoffs.add(handoff);
     return { id: run.id, status: run.status, workers: run.tasks.map((task: { id: string; status: string }) => ({ id: task.id, state: task.status })) };
   }

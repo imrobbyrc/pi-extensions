@@ -3,19 +3,27 @@
 > **Supersession notice (ADR-016, V3).** The planner subsystem, browser worker tabs,
 > and the Pi subagent bridge were removed. The product is now: always-on OpenAI Web
 > Lead Architect + strict bounded lead tools (including root CONTEXT.md guidance) + asynchronous native Herdr
-> `run|status|correct|accept|stop` (supervised review loop; see ADR-016 consequences)
+> `plan|run|status|correct|accept|stop|verify` (supervised review loop; see ADR-016 consequences)
 > + Herdr-managed Pi workers only. ADR-004, ADR-006,
 > ADR-008, ADR-009, ADR-010, ADR-011, ADR-013, and ADR-015 describe that removed
 > architecture and are **superseded**; they are retained below, clearly labeled, as
-> decision history only. Current guidance lives in ADR-016 and the still-valid ADRs
+> decision history only. Current risk-aware policy lives in ADR-018; harness boundaries remain in ADR-016 and the still-valid ADRs
 > (001, 002, 003, 005, 007, 012, 014, with their planner-era clauses void).
+
+## ADR-018 — Risk-aware planning and review
+
+Decision: v2 low-risk work uses `compact_plan` (problem, scope, behavior, verification) without planning gates. v2 medium/high uses the nine-axis `decision_graph` and gates. Risk and planning kind are fingerprint-bound, must match each other, and cannot change at run time. Existing v1 handoffs remain strict; existing v2 low handoffs with valid gates remain readable. The Lead assesses semantic risk; a fingerprint binds its choice but does not prove it correct.
+
+One worker is the default. `adaptive` prefers one; `aggressive` favors splits only when owned paths are independent and parallelism helps. Work graphs have 1–4 workers. The lead profile passes its effective 1–4 concurrency limit to the core scheduler; saved 5–8 values load capped at 4 without rewriting them.
+
+With the verification gate on, v2 low `accept` binds the handoff to the observed run and worker prompts without requiring a fingerprint. v1 and v2 medium/high still require `verify` and a fresh fingerprint. A supplied low-risk fingerprint is checked. The Lead reviews the diff in all cases; disabling the gate removes fingerprint enforcement, not semantic review. Worker prompt projection, human confirmation, ownership and core scheduler stay unchanged. The handoff fingerprint is unkeyed binding, not cryptographic proof of issuer identity.
 
 ## ADR-016 — V3: planner removed; one harness, Herdr workers only
 
 Decision: collapse the product into one flow. The `openai-web` provider is the
 always-on Lead Architect; the MCP surface is a strict frozen allowlist (seven bounded
 read-only workspace tools, including root CONTEXT.md guidance, plus one `herdr` tool); worker execution is exclusively
-the asynchronous native `herdr` tool with `run|status|correct|accept|stop` actions over
+the asynchronous native `herdr` tool with `plan|run|status|correct|accept|stop|verify` actions over
 Herdr-managed Pi agents (`--kind pi`). Removed entirely: `/planner` and
 `/chatgpt-plan-*` commands, the task store, `submit_plan`/`submit_plan_revision`/
 `submit_review` protocol writes, browser worker tabs (`spawn_worker`,

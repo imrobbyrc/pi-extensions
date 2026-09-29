@@ -559,7 +559,9 @@ describe("herdr runtime", () => {
 			return undefined;
 		};
 
-		const m = new SubagentManager(stubPi, fake);
+		const notices: string[] = [];
+		const pi = { ...stubPi, sendUserMessage: (message: string) => notices.push(message) } as typeof stubPi;
+		const m = new SubagentManager(pi, fake);
 		const details = m.startInBackground({ agent: "notifier", task: "t10", runtime: "herdr" }, stubCtx);
 		for (let i = 0; i < 30; i++) {
 			await new Promise((r) => setTimeout(r, 20));
@@ -567,6 +569,11 @@ describe("herdr runtime", () => {
 		}
 		const task = m.getRun(details.run.id)?.tasks[0];
 		expect(task?.notifiedParent).toBe(true);
+		for (let i = 0; i < 30 && m.getRun(details.run.id)?.status === "running"; i++) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		expect(notices.filter((message) => message.includes("heads up"))).toHaveLength(1);
+		expect(notices.some((message) => message.includes("summary already reported"))).toBe(false);
 	});
 
 	test("11. steer while working and idle", async () => {

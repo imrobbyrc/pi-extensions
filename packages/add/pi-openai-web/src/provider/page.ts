@@ -82,6 +82,13 @@ export async function sleep(ms: number): Promise<void> {
 }
 
 const COMPOSER_READY_FN = `() => [...document.querySelectorAll('${COMPOSER_SELECTOR}')].some(el => el.offsetParent !== null)`;
+const SEND_BUTTON_FN = `() => {
+  const el = [...document.querySelectorAll('${COMPOSER_SELECTOR}')].filter(el => el.offsetParent !== null).at(-1);
+  const button = el?.closest('form')?.querySelector('button[type="submit"][aria-label="Send"]');
+  if (!button || button.disabled || button.offsetParent === null) return false;
+  button.click();
+  return true;
+}`;
 
 export async function waitForComposer(client: CdpClient, timeoutMs = 60_000): Promise<void> {
   if (!(await waitFor(client, COMPOSER_READY_FN, timeoutMs))) {
@@ -107,17 +114,24 @@ export async function focusComposer(client: CdpClient): Promise<void> {
 
 /** Submit text via the composer. Caller must already have confirmed fresh state when required. */
 export async function submitPrompt(client: CdpClient, text: string): Promise<void> {
+  const previousUsers = new Set((await readTurnState(client)).userIdentities);
   await focusComposer(client);
   const hasExistingText = await evalJson<boolean>(client, `() => {
     const el = [...document.querySelectorAll('${COMPOSER_SELECTOR}')].filter(el => el.offsetParent !== null).at(-1);
     return Boolean(el && (el.textContent || '').trim().length > 0);
   }`);
-  if (hasExistingText) {
-    await clearComposer(client);
-  }
+  if (hasExistingText) await clearComposer(client);
   await client.Input.insertText({ text });
-  await client.Input.dispatchKeyEvent({ type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
-  await client.Input.dispatchKeyEvent({ type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  // Click Send until the button accepts it; it mounts/disables while the composer settles.
+  if (!await waitFor(client, SEND_BUTTON_FN, 5_000)) throw new Error("ChatGPT Send button is unavailable");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      if ((await readTurnState(client)).userIdentities.some(id => !previousUsers.has(id))) return;
+    } catch { /* transient navigation */ }
+    await sleep(250);
+  }
+  throw new Error("ChatGPT did not confirm the submitted user message");
 }
 
 export async function readTurnState(client: CdpClient): Promise<TurnDomState> {

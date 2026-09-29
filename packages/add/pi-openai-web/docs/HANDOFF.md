@@ -1,6 +1,6 @@
 # Handoff snapshot
 
-## Current architecture (V3)
+## Current architecture (risk-aware v2 handoffs; v1 compatible)
 
 One product, no planner:
 
@@ -9,18 +9,18 @@ Pi user → /model openai-web/<id>  (always-on Lead Architect)
 Lead turn → strict MCP allowlist (7 read-only tools, including optional root `CONTEXT.md`, + `herdr`)
 Lead → MCP herdr → `@imrobbyrc/pi-core-subagent` API → Herdr run (1–4 Pi workers, DAG + owns scopes)
 Pi TUI → explicit confirmation → Herdr panes start (kind=pi)
-Lead → herdr status / correct / stop
-Pi → package controller reaps panes on shutdown; package state persists in its configured Pi agent state.
+Lead → git_status/git_diff → herdr status / correct
+Low v2 → accept with bound handoff; medium/high/v1 → verify → accept with fresh fingerprint
+Pi → package controller reaps panes on accept/stop; package state persists in its configured Pi agent state.
 ```
 
 Key sources:
 
 - `src/mcp/server.ts` — strict frozen allowlist + `herdr` tool (honest annotations).
-- `@imrobbyrc/pi-core-subagent/api` — public worker engine facade (`run|status|steer|cancel|reply|shutdown`). This is the only worker orchestration implementation.
+- `@imrobbyrc/pi-core-subagent/api` — public worker engine facade and sole scheduler.
 - `src/mcp/subagent-adapter.ts` — maps MCP `herdr` actions to the package API.
-- `@imrobbyrc/pi-core-subagent/api` — worker execution facade and lifecycle owner.
 - `src/provider/` — openai-web provider substrate: discovery, runtime, catalog, compaction, transcripts, resume.
-- `src/provider/orchestrator.ts` — always-on Lead contract, lead profile persistence, handoff envelope (graph/handoff/critique gates).
+- `src/provider/orchestrator.ts` — Lead contract, 1–4 concurrency config, v1/v2 handoffs and risk-aware plan authority.
 - `extensions/pi-openai-web/provider-module.ts` — composition root: `/openai-web` command, provider registration, confirmation capture, shutdown reaping.
 
 ## Removed (do not reintroduce)
@@ -39,4 +39,4 @@ npm run typecheck
 npm test
 ```
 
-90 planner tests and 159 core subagent tests must pass. Live checks: `npm run doctor`, `scripts/live-discovery-probe.ts`, then one real package API Herdr cycle with `run` → `status` → `steer` → completion observed.
+Use current package test counts from the commands, not historical totals. For live checks, run `npm run doctor`, then confirm low compact plan→run→diff→accept, medium graph→verify→accept, two independent workers with concurrency=1, and correction→fresh verify→accept. Live runs require browser login, tunnel, Herdr server, and user confirmation.

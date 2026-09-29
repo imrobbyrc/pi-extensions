@@ -612,11 +612,8 @@ export class SubagentManager {
 	}
 
 	private notifyTask(run: RunSnapshot, task: TaskSnapshot, kind: "completed" | "failed" | "aborted"): void {
-		// ponytail: child already pushed its summary via notify_parent — pointer only, no second copy. Upgrade: drop notice entirely if the pointer noise also proves useless.
-		const body =
-			kind === "completed" && task.notifiedParent
-				? `Task ${task.agent} (${task.id}) completed in run ${run.id} — summary already reported. Use subagent_result(runId: "${run.id}", taskId: "${task.id}") for full output.`
-				: makeTaskNotice(run, task, kind);
+		if (kind === "completed" && task.notifiedParent) return;
+		const body = makeTaskNotice(run, task, kind);
 
 		if (this.collectParked(run.id, { kind: "done", taskId: task.id, agent: task.agent, text: body })) {
 			this.emit("subagent:notification", { runId: run.id, taskId: task.id, kind, body });

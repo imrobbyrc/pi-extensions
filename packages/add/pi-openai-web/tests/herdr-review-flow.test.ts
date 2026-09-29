@@ -326,13 +326,16 @@ test("herdr tool registers the full action set including the observational verif
   assert.match(HERDR_TOOL_DESCRIPTION, /verify/);
   assert.match(HERDR_TOOL_DESCRIPTION, /VerificationReport/);
   assert.match(HERDR_TOOL_DESCRIPTION, /never scores or passes\/fails work/);
+  // Phase 4 baseline: 3744 characters before redundant prose was removed.
+  assert.ok(HERDR_TOOL_DESCRIPTION.length <= 3744 * 0.6);
 });
 
-test("herdr plan/run expose decision_graph as the only planning input", async () => {
+test("herdr plan/run expose graph and compact planning authorities", async () => {
   const herdr = (await registeredHerdrToolsFor(loopHarness(completedHerdrRun()).adapter))[0]!;
   const shape = (herdr.config.inputSchema as any).shape;
   assert.equal(shape.execution_spec, undefined);
   assert.ok(shape.decision_graph, "decision_graph must remain available");
+  assert.ok(shape.compact_plan, "compact_plan must be available");
   await assert.rejects(
     herdr.handler({ action: "plan", goal: "ship", workers: [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }], gates: planGates }),
     /decision_graph/
@@ -368,12 +371,12 @@ test("herdr accept without the evidence inputs rejects before any accept mutatio
   // Neither the handoff nor the fingerprint: fail closed before touching the lifecycle.
   await assert.rejects(
     herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1" }),
-    /herdr accept requires the exact Pi-issued handoff and the verification_fingerprint/
+    /herdr accept requires the exact Pi-issued handoff/
   );
   // Handoff present but the fingerprint omitted: still fails closed.
   await assert.rejects(
     herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }),
-    /herdr accept requires the exact Pi-issued handoff and the verification_fingerprint/
+    /verification_fingerprint/
   );
   assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0, "no evidence means no accept ever reaches the adapter");
   assert.equal((harness.adapter.inspect("run-1") as any).tasks[0].acceptedAt, undefined, "the worker stays unaccepted");
@@ -742,7 +745,6 @@ test("workflow toggles are enforced: review loop off stops retaining completed w
 
 // --- P1: verify binds v2 risk-aware handoffs exactly like v1, and tampering fails closed ---
 
-const v2PlanGates = { graph: "graph", handoff: "brief", critique: "independent" };
 const v2CompactPlan = {
   problem: "stabilize the streamed turn completion path",
   scope: "src/provider/turn.ts only",
@@ -756,7 +758,6 @@ async function planV2Envelope(herdr: RegisteredTool["handler"], workerId = "w1")
     action: "plan",
     goal: "ship v2",
     workers: [{ id: workerId, objective: "ship", owns: ["src/**"], depends_on: [] }],
-    gates: v2PlanGates,
     compact_plan: v2CompactPlan,
     risk: "low",
     planning_kind: "compact"
@@ -765,17 +766,82 @@ async function planV2Envelope(herdr: RegisteredTool["handler"], workerId = "w1")
   return planned.handoff as string;
 }
 
+test("v2 low plans and runs without gates; graph and v1 still require gates", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const requests: any[] = [];
+  const herdr = (await registeredHerdrToolsFor({ ...harness.mcpSubagent, run: async (request: any) => {
+    requests.push(request);
+    return { id: "run-1", status: "running", workers: [{ id: "w1", state: "pending" }] };
+  } }))[0]!;
+  const handoff = await planV2Envelope(herdr.handler);
+  const workers = [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }];
+  const result = parseToolText(await herdr.handler({ action: "run", goal: "ship v2", workers, compact_plan: v2CompactPlan, risk: "low", planning_kind: "compact", handoff }));
+  assert.equal(result.ok, true);
+  assert.equal(requests[0].handoff, handoff);
+  await assert.rejects(herdr.handler({ action: "plan", goal: "ship", workers, risk: "medium", planning_kind: "design-graph", decision_graph: Object.fromEntries(["problem", "shapes", "graph", "cardinality", "boundaries", "behavior", "scope", "verification", "critique"].map((key) => [key, "required"])) }), /orchestration_gate_required/);
+  await assert.rejects(herdr.handler({ action: "plan", goal: "ship", workers, execution_spec: { suite: "focused" } }), /planning gates/);
+  await assert.rejects(herdr.handler({ action: "plan", goal: "ship v2", workers, compact_plan: v2CompactPlan, risk: "low", planning_kind: "compact", gates: { graph: "", handoff: "brief", critique: "review" } }), /orchestration_gate_required/);
+});
+
+test("v2 low accepts without fingerprint only with handoff bound to observed run", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planV2Envelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1" }), /exact Pi-issued handoff/);
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope.replace('"risk":"low"', '"risk":"medium"') }), /handoff_planning_mismatch/);
+  const other = await planV2Envelope(herdr.handler);
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: other }), /herdr_verify_prompt_mismatch/);
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "other", handoff: envelope }), /worker is not authorized/);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+  const accepted = parseToolText(await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }));
+  assert.equal(accepted.ok, true);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 1);
+});
+
+test("v2 low cannot bypass binding when read-only inspection is unavailable", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const { inspect: _inspect, ...withoutInspect } = harness.mcpSubagent;
+  const herdr = (await registeredHerdrToolsFor(withoutInspect))[0]!;
+  const envelope = await planV2Envelope(herdr.handler);
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }), /herdr_verify_unavailable/);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+});
+
+test("v2 medium/high still require fresh verification fingerprints", async () => {
+  const graph = Object.fromEntries(["problem", "shapes", "graph", "cardinality", "boundaries", "behavior", "scope", "verification", "critique"].map((key) => [key, "reviewed"]));
+  for (const risk of ["medium", "high"] as const) {
+    const harness = loopHarness(completedHerdrRun());
+    const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+    const envelope = issueHerdrHandoffV2("ship", [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }], { graph: "graph", handoff: "brief", critique: "reviewed" }, risk, "design-graph", { decisionGraph: graph });
+    harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+    await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }), /verification_fingerprint/);
+    assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+  }
+});
+
+test("v2 low checks explicitly supplied fingerprints instead of ignoring them", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planV2Envelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: "0".repeat(64) }), /fingerprint mismatch/);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+});
+
 test("herdr verify binds a v2 handoff to the run with the same bounded four-dimension report", async () => {
   const harness = loopHarness(completedHerdrRun());
   const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent))[0]!;
   const envelope = await planV2Envelope(herdr.handler);
   assert.equal(JSON.parse(envelope).protocol, "pi-provider-herdr-handoff-v2");
+  assert.equal(JSON.parse(envelope).gates, undefined, "low-risk planning needs no duplicate gates");
   harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
   const result = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
   assert.equal(result.action, "verify");
   assert.deepEqual(Object.keys(result.report), ["spec", "design", "quality", "evidence"]);
   assert.equal(result.report.spec.taskId, JSON.parse(envelope).taskId);
   assert.equal(result.report.spec.planFingerprint, JSON.parse(envelope).planFingerprint);
+  assert.equal(result.report.spec.gates, undefined);
   assert.deepEqual(result.report.quality.workers.map((worker: any) => worker.id), ["w1"]);
   // The worker prompt stays the deterministic minimal contract — no v2 planning state.
   const slice: WorkerSlice = { id: "w1", objective: "ship", owns: ["src/**"], dependsOn: [] };
@@ -794,13 +860,12 @@ test("herdr verify fails closed on v2 envelope tampering", async () => {
   const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent))[0]!;
   const envelope = await planV2Envelope(herdr.handler);
   harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
-  // Structurally valid but different identity: flipping the risk level recomputes
-  // a different worker binding, so the observed prompt no longer matches.
+  // Risk drift also breaks the required risk/planning pair at the parse boundary.
   const riskFlipped = envelope.replace('"risk":"low"', '"risk":"medium"');
   await assert.rejects(
     herdr.handler({ action: "verify", run_id: "run-1", handoff: riskFlipped }),
-    /herdr_verify_prompt_mismatch/,
-    "risk drift invalidates the worker authorization binding"
+    /herdr_verify_handoff_invalid: handoff_planning_mismatch/,
+    "risk drift fails before worker authorization binding"
   );
   // Structurally invalid tamper: unbounded risk value is rejected at the parse boundary.
   const riskInvalid = envelope.replace('"risk":"low"', '"risk":"critical"');

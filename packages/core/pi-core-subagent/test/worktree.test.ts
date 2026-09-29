@@ -33,7 +33,8 @@ const git = (args: string[], cwd = repo) => execFileSync("git", args, { cwd, enc
 beforeAll(() => {
 	repo = mkdtempSync(join(tmpdir(), "wt-repo-"));
 	git(["init", "-q", "-b", "main"]);
-
+	// Isolate test checkouts from machine-global post-checkout hooks.
+	git(["config", "core.hooksPath", "/dev/null"]);
 	git(["config", "user.name", "test"]);
 	git(["config", "user.email", "test@local"]);
 	writeFileSync(join(repo, "a.txt"), "hello\n");
@@ -201,8 +202,21 @@ describe("worktree", () => {
 		writeFileSync(`${wt.path}.owner`, JSON.stringify({ ...marker, pid: 2147483647 }));
 		expect(ownerAlive(wt.path)).toBe(false);
 		expect(reapDeadWorktrees(repo, ownerAlive)).toBe(1);
-		expect(existsSync(wt.path)).toBe(false);
+		expect(git(["worktree", "list", "--porcelain"])).not.toContain(`worktree ${wt.path}`);
+		expect(existsSync(join(wt.path, "live.txt"))).toBe(false);
 		expect(git(["show", "--name-only", "--format=", wt.branch])).toContain("live.txt");
+	});
+
+	test("claimWorktree atomically replaces an existing owner marker", () => {
+		const wt = createWorktree(repo, "run_claim", "task_claim")!;
+		claimWorktree(wt);
+		const marker = `${wt.path}.owner`;
+		const before = statSync(marker).ino;
+		claimWorktree(wt);
+		expect(statSync(marker).ino).not.toBe(before);
+		expect(JSON.parse(readFileSync(marker, "utf8")).pid).toBe(process.pid);
+		expect(ownerAlive(wt.path)).toBe(true);
+		removeWorktree(wt);
 	});
 
 	test("claimed worktree does not commit its owner marker into the branch", () => {
@@ -266,11 +280,22 @@ describe("worktree", () => {
 		removeWorktree(wt!);
 	});
 
-	test("removeByBranch removes the worktree dir by branch name", () => {
+	test("failed Git removal preserves a locked worktree and its owner", () => {
+		const wt = createWorktree(repo, "run_locked", "task_locked")!;
+		claimWorktree(wt);
+		git(["worktree", "lock", wt.path]);
+		expect(() => removeWorktree(wt)).toThrow();
+		expect(existsSync(wt.path)).toBe(true);
+		expect(existsSync(`${wt.path}.owner`)).toBe(true);
+		git(["worktree", "unlock", wt.path]);
+	});
+
+	test("removeByBranch unregisters the checkout by branch name", () => {
 		const wt = createWorktree(repo, "run_11", "task_11")!;
 		expect(existsSync(wt.path)).toBe(true);
 		removeByBranch(repo, wt.branch);
-		expect(existsSync(wt.path)).toBe(false);
+		expect(git(["worktree", "list", "--porcelain"])).not.toContain(`worktree ${wt.path}`);
+		expect(existsSync(join(wt.path, "a.txt"))).toBe(false);
 		expect(git(["branch", "--list", wt.branch])).toBe(wt.branch);
 	});
 });

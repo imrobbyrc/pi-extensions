@@ -150,7 +150,8 @@ function makeWatch(
   cfg: HarnessConfig,
   frames: Frame[],
   isHarnessActive?: () => Promise<boolean>,
-  handlers?: { onText?: (fullTextSoFar: string) => void }
+  handlers?: { onText?: (fullTextSoFar: string) => void },
+  stopHarness?: () => Promise<void>
 ): WatchHarness {
   const { client, stopClickCount } = fakeClient(frames);
   const graceEvents: Array<{ reason: string | undefined }> = [];
@@ -160,6 +161,7 @@ function makeWatch(
     ensureBrowser: async () => {},
     getBranchKey: () => "branch-1",
     ...(isHarnessActive ? { isHarnessActive } : {}),
+    ...(stopHarness ? { stopHarness } : {}),
     activity: (event, detail) => {
       if (event === "provider_stall_grace") graceEvents.push({ reason: detail?.reason as string | undefined });
     }
@@ -231,13 +233,15 @@ test("genuinely silent turn still fails with provider_turn_stalled", async () =>
   const dir = await mkdtemp(join(tmpdir(), "pi-grace-silent-"));
   try {
     const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 10_000 });
-    const h = makeWatch(cfg, [{ state: domState({}) }]); // no browser or harness activity
+    let shutdowns = 0;
+    const h = makeWatch(cfg, [{ state: domState({}) }], undefined, undefined, async () => { shutdowns += 1; }); // no browser or harness activity
     const outcome = await h.run();
     assert.equal(outcome.kind, "failed");
     assert.match(outcome.error ?? "", /provider_turn_stalled after 200ms without progress/);
     assert.equal(h.controller.state, "failed");
     assert.equal(h.graceEvents.length, 0, "no grace without harness activity");
     assert.equal(h.stopClickCount(), 1, "stall failure must stop browser generation");
+    assert.equal(shutdowns, 0, "provider stall must not destroy reviewable Herdr runs");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -261,13 +265,15 @@ test("hard turn timeout still fires while harness stays active", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-grace-timeout-"));
   try {
     const cfg = baseConfig(dir, { stallTimeoutMs: 250, turnTimeoutMs: 1_500 });
-    const h = makeWatch(cfg, [{ state: domState({}) }], async () => true); // harness active forever
+    let shutdowns = 0;
+    const h = makeWatch(cfg, [{ state: domState({}) }], async () => true, undefined, async () => { shutdowns += 1; }); // harness active forever
     const outcome = await h.run();
     assert.equal(outcome.kind, "failed");
     assert.match(outcome.error ?? "", /provider_turn_timeout after 1500ms/);
     assert.equal(h.controller.state, "failed");
     assert.ok(h.graceEvents.some(event => event.reason === "harness_active"), "grace was engaged yet the hard timeout still won");
     assert.equal(h.stopClickCount(), 1, "timeout failure must stop browser generation");
+    assert.equal(shutdowns, 0, "provider timeout must leave worker lifecycle recoverable");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

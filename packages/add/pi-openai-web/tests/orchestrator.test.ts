@@ -193,6 +193,11 @@ test("saveOrchestratorConfig unlinks project config when saving to global scope"
   }
 });
 
+test("legacy 1–8 worker settings load within current 1–4 graph capacity", async () => {
+  const loaded = await loadOrchestratorState(undefined, undefined, { ...DEFAULT_ORCHESTRATOR_CONFIG, maxParallelWorkers: 8 });
+  assert.equal(loaded.config.maxParallelWorkers, 4);
+});
+
 test("saveOrchestratorConfig does not write when scope is session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-orches-test-"));
   try {
@@ -260,7 +265,7 @@ test("provider to Herdr handoff requires graph, handoff, and critique gates", ()
   const envelope = buildHerdrHandoff({ taskId: "task-1", planFingerprint: "fp", gates: { graph: "graph", handoff: "brief", critique: "independent" }, workers: [{ id: "w", objective: "ship", owns: ["src/**"], dependsOn: [] }], executionSpec: { suite: "focused" } });
   const parsed = parseHerdrHandoff(envelope);
   assert.equal(parsed.taskId, "task-1");
-  assert.equal(parsed.gates.critique, "independent");
+  assert.equal(parsed.gates?.critique, "independent");
   assert.throws(() => parseHerdrHandoff(JSON.stringify({ protocol: "pi-provider-herdr-handoff-v1" })), /orchestration_handoff_invalid/);
 });
 
@@ -356,13 +361,20 @@ test("handoff envelopes round-trip complete worker slices and metadata-free work
   assert.throws(() => buildHerdrHandoff({ taskId: "t", planFingerprint: "fp", gates, executionSpec: { suite: "focused" }, workers: [{ ...sliceWorker, requirements: [] }] }), /worker_slice_invalid/);
 });
 
-test("Lead contract documents declarative worker slices and decision_graph derivation", () => {
+test("Lead policy stays below 60% of the measured pre-slim baseline", () => {
+  // Character baselines before phase 4: Lead 7018, reminder 727.
+  assert.ok(buildLeadContract(undefined).length <= 7018 * 0.6);
+  assert.ok(LEAD_PROTOCOL_REMINDER.length <= 727 * 0.6);
+});
+
+test("Lead contract keeps bounded worker slices and risk-aware planning", () => {
   const prompt = buildLeadContract(undefined);
   assert.match(prompt, /requirements, behaviors, seams, acceptance/);
-  assert.match(prompt, /immutably bound into the plan fingerprint and handoff envelope/);
-  assert.match(prompt, /Worker slices derive from the decision_graph's compiled authority/);
-  assert.match(prompt, /workers cannot invent requirements/);
-  assert.match(prompt, /each worker's prompt receives its assigned immutable slice/);
+  assert.match(prompt, /Worker slices must trace to the plan; workers cannot invent requirements/);
+  assert.match(prompt, /Default to one worker/);
+  assert.match(prompt, /aggressive favors useful splits, adaptive favors one/);
+  assert.match(prompt, /risk=low, planning_kind=compact, compact_plan/);
+  assert.doesNotMatch(prompt, /decision_graph is always required/);
 });
 
 // --- DecisionGraph compile authority (Phase 3) ---
@@ -517,6 +529,16 @@ test("v2 handoff issuance round-trips the compact plan with risk and planning ki
   assert.equal(parsed.planFingerprint, planFingerprintV2("fix docs", workers, compiled, "low", "compact"));
 });
 
+test("v2 low compact omits gates; medium/high and v1 still require them", () => {
+  const workers = [{ id: "w1", objective: "fix docs", owns: ["docs/**"], depends_on: [] }];
+  const low = issueHerdrHandoffV2("fix docs", workers, undefined, "low", "compact", { compactPlan });
+  assert.equal(JSON.parse(low).gates, undefined);
+  assert.equal(parseHerdrHandoff(low).gates, undefined);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, undefined, "medium", "design-graph", { decisionGraph }), /orchestration_gate_required/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, undefined, "high", "design-graph", { decisionGraph }), /orchestration_gate_required/);
+  assert.throws(() => parseHerdrHandoff(low.replace('"risk":"low"', '"risk":"medium"')), /handoff_planning_mismatch/);
+});
+
 test("v2 handoffs round-trip deterministically through build and parse", () => {
   const workers = [{ id: "w1", objective: "fix docs", owns: ["docs/**"], dependsOn: [] }];
   const envelope = issueHerdrHandoffV2("fix docs", workers, p1Gates, "low", "compact", { compactPlan });
@@ -544,6 +566,10 @@ test("v2 issuance fails closed on kind/authority mismatch and invalid risk/kind/
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", {}), /handoff_planning_mismatch: planning_kind=compact requires a compact_plan/);
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { decisionGraph }), /handoff_planning_mismatch/);
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "design-graph", { compactPlan }), /handoff_planning_mismatch/);
+  for (const risk of ["medium", "high"] as const) {
+    assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, risk, "compact", { compactPlan }), /handoff_planning_mismatch/);
+  }
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "design-graph", { decisionGraph }), /handoff_planning_mismatch/);
   // Both authorities at once is the existing exclusivity failure.
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { compactPlan, decisionGraph }), /decision_graph_exclusive/);
   assert.throws(() => assertSpecSourceExclusive(undefined, decisionGraph, compactPlan), /decision_graph_exclusive/);
@@ -592,6 +618,10 @@ test("v1 handoffs keep parsing under their current strict semantics and never ga
 test("v2 envelopes fail closed on tampered identity fields, protocol, and embedded shapes", () => {
   const workers = [{ id: "w1", objective: "fix docs", owns: ["docs/**"], depends_on: [] }];
   const envelope = issueHerdrHandoffV2("fix docs", workers, p1Gates, "low", "compact", { compactPlan });
+  // Valid individual fields must still form a valid risk/planning pair.
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"risk":"low"', '"risk":"high"')), /handoff_planning_mismatch/);
+  assert.throws(() => parseHerdrHandoff(envelope.replace('"planningKind":"compact"', '"planningKind":"design-graph"')), /handoff_planning_mismatch/);
+  assert.throws(() => buildHerdrHandoffV2({ ...JSON.parse(envelope), risk: "high" }), /handoff_planning_mismatch/);
   // Tampered risk / planning kind values.
   assert.throws(() => parseHerdrHandoff(envelope.replace('"risk":"low"', '"risk":"critical"')), /risk_level_invalid/);
   assert.throws(() => parseHerdrHandoff(envelope.replace('"risk":"low"', '"risk":42')), /risk_level_invalid/);
@@ -817,96 +847,71 @@ test("parseHerdrHandoff fails closed on tampered graph structure", () => {
   assert.throws(() => parseHerdrHandoff(forgedOverlap), /both own "src\/shared.ts"/);
 });
 
-test("Lead contract documents the whole work-graph contract", () => {
+test("Lead contract keeps work-graph and ownership constraints", () => {
   const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /one legal work graph/);
-  assert.match(prompt, /no overlapping ownership between workers that no dependency path serializes/);
-  assert.match(prompt, /work_graph_invalid/);
+  assert.match(prompt, /legal work graph/);
+  assert.match(prompt, /unique ids, valid dependencies, no cycles or unordered overlapping ownership/);
 });
 
-test("Lead contract documents the decision_graph contract", () => {
+test("Lead contract names both planning authorities and exact run binding", () => {
   const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /decision_graph/);
-  assert.match(prompt, /problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique/);
-  assert.match(prompt, /decision_graph.*sole planning authority/);
-  assert.match(prompt, /mechanically compiled/);
-  assert.match(prompt, /a changed, added, or removed graph is rejected/);
+  assert.match(prompt, /risk=low, planning_kind=compact, compact_plan \{problem, scope, behavior, verification\} without gates/);
+  assert.match(prompt, /risk=medium\|high, planning_kind=design-graph, decision_graph \{problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique\} plus gates/);
+  assert.match(prompt, /repeat exact goal, workers, planning authority, risk and planning_kind with handoff/);
 });
 
 // --- Adaptive planning policy (V5 Phase 1: planning depth follows assessed risk) ---
 
-test("Lead contract defines the three-level adaptive planning policy with compact low-risk planning", () => {
+test("Lead contract keeps three risk levels and compact low-risk planning", () => {
   const prompt = buildLeadContract(undefined);
-  // Exactly three qualitative levels are named.
-  assert.match(prompt, /Low risk/);
-  assert.match(prompt, /Medium risk/);
-  assert.match(prompt, /High risk/);
-  // Low risk permits compact planning: the four compact elements, not all nine Design Graph axes.
-  assert.match(prompt, /Low risk[\s\S]*?compact planning is sufficient/);
-  assert.match(prompt, /the problem, scope\/boundaries \(what may change and what must not\), intended behavior, and verification/);
-  assert.match(prompt, /multi-worker decomposition is optional at this level, but decision_graph is always required/);
-  // The V4 planning gates and work-graph rules are not relaxed by adaptation.
-  assert.match(prompt, /the planning gates \{graph, handoff, critique\} and the work-graph rules apply identically at every level; only planning depth adapts/);
+  assert.match(prompt, /Low risk \(localized docs\/config\/single-file\)/);
+  assert.match(prompt, /Medium risk \(multi-surface behavior\)/);
+  assert.match(prompt, /High risk \(auth\/security, migration, concurrency, data integrity, lifecycle\)/);
+  assert.match(prompt, /without gates/);
 });
 
-test("Lead contract keeps the full Design Graph mandatory for medium and high risk", () => {
+test("Lead contract keeps full graph and stronger high-risk evidence", () => {
   const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /Medium risk[\s\S]*?render the complete Design Graph sections in order — Problem, Shapes, Graph, Cardinality, Boundaries, Behavior, Scope, Test Layers, and Critique/);
-  assert.match(prompt, /High risk — architecture, concurrency, auth\/security, migrations\/data integrity, lifecycle-sensitive changes, or complex multi-worker dependency work: the full Design Graph/);
-  assert.match(prompt, /broader verification expectations — wider test surface and explicit failure\/boundary analysis/);
+  assert.match(prompt, /Medium risk[\s\S]*High risk[\s\S]*decision_graph/);
+  assert.match(prompt, /High risk needs wider tests and failure\/boundary analysis/);
 });
 
-test("Lead contract mandates escalation on discovered complexity and forbids silent downgrades", () => {
-  const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /Escalate, never downgrade/);
-  assert.match(prompt, /raise the assessment and re-plan at the higher rigor before delegating/);
-  assert.match(prompt, /a low-risk task that grows must produce the full Design Graph/);
-  assert.match(prompt, /never silently downgrade an in-flight task to lighter review to bypass stronger gates/);
+test("Lead contract requires re-planning on escalation", () => {
+  assert.match(buildLeadContract(undefined), /Escalate and re-plan when new evidence increases risk; never downgrade an in-flight plan to bypass review/);
 });
 
-test("Lead contract defaults to the lightest justified depth and preserves V4 review and accept invariants", () => {
+test("Lead contract keeps review and risk-bound acceptance", () => {
   const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /plan at the lightest level the evidence justifies/);
-  // Semantic review stays with the Lead and stays proportional to the planned dimensions.
-  assert.match(prompt, /review semantically against the dimensions you planned with/);
-  assert.match(prompt, /Send bounded corrections via action=correct/);
-  // Deterministic verification, fingerprint-gated accept, and freshness language survive adaptation.
-  assert.match(prompt, /verification_fingerprint/);
-  assert.match(prompt, /recomputed from fresh evidence immediately before acceptance/);
-  assert.match(prompt, /accept each worker via action=accept/);
+  assert.match(prompt, /Plan at the lightest justified risk/);
+  assert.match(prompt, /Inspect git_status\/git_diff and focused evidence before accepting v2 low risk with its bound handoff/);
+  assert.match(prompt, /For medium\/high and v1, use verify then accept with the fresh verification_fingerprint/);
+  assert.match(prompt, /pane marked idle or a notify_parent message does not prove the task is completed/);
+  assert.match(prompt, /report settlement pending and recheck/);
+  assert.match(prompt, /Never stop a running worker solely because lastActivity is unchanged/);
+  assert.match(prompt, /explicit error, user cancellation, or runtime timeout/);
+  assert.match(prompt, /correct reuses the same worker session/);
+  assert.match(prompt, /Accept or stop each worker to release its pane/);
 });
 
-test("LEAD_PROTOCOL_REMINDER states the adaptive policy instead of unconditional full-graph planning", () => {
+test("LEAD_PROTOCOL_REMINDER keeps risk, cardinality, and review policy", () => {
   assert.match(LEAD_PROTOCOL_REMINDER, /^\[LEAD-PROTOCOL:/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /low: compact problem\/scope\/boundaries\/behavior\/verification/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /medium\/high: full Design Graph Problem → Shapes → Graph → Cardinality → Boundaries → Behavior → Scope → Test Layers → Critique/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /escalate on discovered complexity, never downgrade in-flight/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /review against the dimensions you planned with/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /low=compact_plan without gates; medium\/high=decision_graph with gates/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /one worker unless independent scopes justify more/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /escalate, never downgrade/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /medium\/high\/v1=verify then accept with fresh fingerprint/);
 });
 
 // --- Adaptive worker effort (V5 Phase 2: per-run thinking follows assessed risk) ---
 
-test("Lead contract maps assessed risk to per-run worker effort: low→low, medium/high→high", () => {
-  const prompt = buildLeadContract(undefined);
-  // The action=run bullet names the exact per-run argument mapping.
-  assert.match(prompt, /action=run: submit the exact same goal[\s\S]*?worker_thinking=low for low-risk plans, worker_thinking=high for medium\/high-risk plans/);
-  // The planning protocol restates the mapping at the same assessed risk as planning depth.
-  assert.match(prompt, /Worker effort matches the same risk assessment: run low-risk plans with worker_thinking=low and medium\/high-risk plans with worker_thinking=high/);
-  // Adaptive effort is per-run guidance only, never a persisted decision.
-  assert.match(prompt, /it applies to that run only/);
+test("Lead contract maps risk to per-run worker effort", () => {
+  assert.match(buildLeadContract(undefined), /For run, set worker_thinking=low for low risk, high for medium\/high/);
 });
 
-test("per-run adaptive effort never rewrites an explicit user worker-thinking override", () => {
+test("explicit effort overrides adaptive guidance without rewriting profile", () => {
   const prompt = buildLeadContract(undefined);
-  // The configured value is displayed as a profile default, distinct from per-run guidance.
-  assert.match(prompt, /thinking: high \(profile default/);
-  // An explicit user override wins verbatim…
-  assert.match(prompt, /honor that level verbatim/);
-  // …and the persisted configuration is never rewritten to impose adaptive guidance.
-  assert.match(prompt, /never rewrite the persisted configuration to impose adaptive guidance/);
-  // Explicitly configured values still surface as the profile default (config compatibility).
+  assert.match(prompt, /Explicit user effort overrides this guidance; never rewrite the persisted thinking profile/);
   const custom = buildLeadContract({ workerModel: "m/x", workerThinking: "max", maxParallelWorkers: 2, delegationStrategy: "adaptive" });
-  assert.match(custom, /thinking: max \(profile default/);
+  assert.match(custom, /thinking profile: max/);
 });
 
 test("DEFAULT_ORCHESTRATOR_CONFIG keeps the configurable workerThinking setting", () => {
@@ -914,12 +919,9 @@ test("DEFAULT_ORCHESTRATOR_CONFIG keeps the configurable workerThinking setting"
   assert.equal(DEFAULT_ORCHESTRATOR_CONFIG.workerThinking, "high");
 });
 
-test("LEAD_PROTOCOL_REMINDER carries the adaptive worker-effort mapping", () => {
-  assert.match(LEAD_PROTOCOL_REMINDER, /worker_thinking=low for low risk, worker_thinking=high for medium\/high/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /an explicit user setting wins, never rewrite persisted config/);
-  // The Phase-1 planning-depth policy wording survives alongside the new effort rule.
-  assert.match(LEAD_PROTOCOL_REMINDER, /plan at the assessed risk/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /never downgrade in-flight/);
+test("LEAD_PROTOCOL_REMINDER keeps explicit effort and escalation", () => {
+  assert.match(LEAD_PROTOCOL_REMINDER, /explicit worker effort wins/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /escalate, never downgrade/);
 });
 
 // --- VerificationReport (Phase 5: post-implementation evidence artifact) ---
@@ -1117,13 +1119,10 @@ test("the pure builder refuses to invent facts for a missing authorized worker",
   );
 });
 
-test("Lead contract documents the observational verify action", () => {
+test("Lead contract keeps observational verify and strict acceptance", () => {
   const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /action=plan\|run\|status\|correct\|accept\|stop\|verify/);
-  assert.match(prompt, /action=verify: bind the exact Pi-issued handoff envelope to one run/);
-  assert.match(prompt, /spec, design, quality, evidence/);
-  assert.match(prompt, /never a score or pass\/fail/);
-  assert.match(prompt, /worker-set or prompt\/envelope mismatches fail closed/);
+  assert.match(prompt, /use verify then accept with the fresh verification_fingerprint and exact handoff/);
+  assert.match(prompt, /Verify is observational, not a quality verdict/);
 });
 
 test("Lead contract is unconditional and forbids subagent delegation", () => {
@@ -1134,15 +1133,13 @@ test("Lead contract is unconditional and forbids subagent delegation", () => {
     delegationStrategy: "adaptive"
   });
   assert.match(prompt, /LEAD ARCHITECT MODE \(always on\)/);
-  assert.match(prompt, /Lead Architect and Orchestrator/);
+  assert.match(prompt, /You are the Lead Architect/);
   assert.match(prompt, /zai\/glm-5\.3/);
   assert.match(prompt, /high/);
   assert.match(prompt, /adaptive/);
   assert.match(prompt, /herdr/);
-  assert.match(prompt, /action=run/);
-  assert.match(prompt, /never spawn Pi subagents/);
-  assert.match(prompt, /never mutate source/);
-  assert.match(prompt, /never run shell commands/);
+  assert.match(prompt, /For run, repeat exact goal/);
+  assert.match(prompt, /never edit, run shell commands, spawn subagents, or create panes yourself/);
   // Contract is stable without config (undefined falls back to defaults).
   assert.match(buildLeadContract(undefined), /LEAD ARCHITECT MODE/);
 });
@@ -1173,8 +1170,9 @@ test("handleOrchestratorCli handles status, model, thinking, workers, strategy, 
   await assert.rejects(() => handleOrchestratorCli(["thinking"], current, onSave), /Missing thinking level/);
 
   // workers
-  await handleOrchestratorCli(["workers", "5"], { ...current, config: savedConfig }, onSave);
-  assert.equal(savedConfig.maxParallelWorkers, 5);
+  await handleOrchestratorCli(["workers", "4"], { ...current, config: savedConfig }, onSave);
+  assert.equal(savedConfig.maxParallelWorkers, 4);
+  await assert.rejects(() => handleOrchestratorCli(["workers", "5"], current, onSave), /Invalid worker count/);
   await assert.rejects(() => handleOrchestratorCli(["workers", "9"], current, onSave), /Invalid worker count/);
   await assert.rejects(() => handleOrchestratorCli(["workers", "0"], current, onSave), /Invalid worker count/);
   await assert.rejects(() => handleOrchestratorCli(["workers"], current, onSave), /Missing worker count/);
@@ -1254,7 +1252,7 @@ test("configureOrchestratorUI supports custom model and worker count input", asy
       },
       input: async (prompt: string) => {
         if (prompt.includes("model ID")) return "custom-org/custom-model";
-        if (prompt.includes("parallel workers")) return "6";
+        if (prompt.includes("parallel workers")) return "4";
         return "";
       },
       editor: async () => {},
@@ -1274,7 +1272,7 @@ test("configureOrchestratorUI supports custom model and worker count input", asy
   assert.ok(savedConfig);
   assert.equal(savedConfig.workerModel, "custom-org/custom-model");
   assert.equal(savedConfig.workerThinking, "max");
-  assert.equal(savedConfig.maxParallelWorkers, 6);
+  assert.equal(savedConfig.maxParallelWorkers, 4);
   assert.equal(savedConfig.delegationStrategy, "aggressive");
   assert.equal(savedScope, "global");
 });
@@ -1306,22 +1304,20 @@ test("OpenAIWebRuntime injects the always-on Lead contract into buildPrompt", ()
   // Turn 1 (not bootstrapped): full Lead contract with strict tool allowlist.
   const prompt1 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Plan an architecture" }] }, { bootstrapped: false, syncedMessageCount: 0 });
   assert.match(prompt1, /LEAD ARCHITECT MODE \(always on\)/);
-  assert.match(prompt1, /Lead Architect and Orchestrator/);
+  assert.match(prompt1, /You are the Lead Architect/);
   assert.match(prompt1, /zai\/glm-5\.3/);
-  assert.match(prompt1, /read_context, read_file, list_directory, search_workspace, repo_map, git_status, git_diff, herdr/);
-  assert.match(prompt1, /call read_context once/);
-  assert.match(prompt1, /never spawn Pi subagents/);
+  assert.match(prompt1, /Inspect through the "Pi Workspace" MCP read tools only/);
+  assert.match(prompt1, /Use read_context once/);
+  assert.match(prompt1, /never edit, run shell commands, spawn subagents, or create panes yourself/);
   assert.match(prompt1, /Plan an architecture/);
-  for (const section of ["Problem", "Shapes", "Graph", "Cardinality", "Boundaries", "Behavior", "Scope", "Test Layers", "Critique"]) {
-    assert.match(prompt1, new RegExp(section));
-  }
-  assert.match(prompt1, /review semantically against the dimensions you planned with/);
+  assert.match(prompt1, /decision_graph \{problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique\}/);
+  assert.match(prompt1, /Report only reviewed results/);
 
   // Continuation (bootstrapped) carries the concise protocol reminder.
   const prompt2 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Next step" }] }, { bootstrapped: true, syncedMessageCount: 0 });
   assert.match(prompt2, /\[LEAD-MODE: active/);
-  assert.match(prompt2, /\[LEAD-PROTOCOL:.*medium\/high: full Design Graph/);
-  assert.match(prompt2, /escalate on discovered complexity, never downgrade in-flight/);
+  assert.match(prompt2, /\[LEAD-PROTOCOL:.*medium\/high=decision_graph with gates/);
+  assert.match(prompt2, /escalate, never downgrade/);
   assert.match(prompt2, /zai\/glm-5\.3/);
   assert.match(prompt2, /Next step/);
 
