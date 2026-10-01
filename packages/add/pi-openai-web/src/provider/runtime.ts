@@ -6,8 +6,8 @@ import type { OpenAIWebModelCatalog } from "./catalog.js";
 import { treeToMarkdown, type DomTreeNode } from "./answer.js";
 import {
   assistantRevisionRequiresSerialization, attach, captureAssistantTurn, currentUrl, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
-  readAssistantTurnRevision, readTurnState, serializeAssistantTurn, sleep, stopGeneration, submitPrompt,
-  waitForComposer, waitForConversationUrl, type AssistantTurnRevision, type CdpClient,
+  readAssistantTurnRevision, readTurnState, sleep, stopGeneration, submitPrompt,
+  waitForComposer, waitForConversationUrl, type AssistantTurnProbe, type CdpClient,
   type SerializedAssistantTurn, type TurnDomState
 } from "./page.js";
 import { selectEffortExact, selectionIsProvenExact, selectModelExact } from "./model-picker.js";
@@ -33,14 +33,15 @@ export const DEFAULT_WATCH_POLL_CADENCE = {
 } as const;
 
 const COMPLETION_SETTLE_MS = { semantic: 1_250, fallback: 2_500 } as const;
-const COMPLETION_SETTLE_CAPTURES = { semantic: 3, fallback: 4 } as const;
+const COMPLETION_SETTLE_OBSERVATIONS = { semantic: 3, fallback: 4 } as const;
 
 interface CompletionSettle {
   identity: string;
   markdown: string;
   kind: keyof typeof COMPLETION_SETTLE_MS;
   since: number;
-  captures: number;
+  /** Probe-confirmed stable observations of one revision; full captures happen only at open and final verify. */
+  observations: number;
 }
 
 export function resumeConversationMatches(expectedId: string | undefined, url: string): boolean {
@@ -734,21 +735,26 @@ export class OpenAIWebRuntime {
       // Bind response by stable logical data-turn-id. DOM display indexes can renumber or virtualize.
       const identity = state.responseIdentities.find(candidate => !initialResponseIdentities.has(candidate));
       let currentFullMarkdown = "";
+      let probe: AssistantTurnProbe | undefined;
       if (identity) {
-        // Serialize only when the binding identity or a cheap content revision
-        // requires it; an unchanged revision reuses the last snapshot. Shrinks
-        // and same-length rewrites change the checksum, so they always
-        // reserialize; an unreadable revision (message gone) never skips.
-        let revision: AssistantTurnRevision | undefined;
+        // Probe the cheap revision fingerprint first: an unchanged revision
+        // reuses the last snapshot. Shrinks and same-length rewrites change
+        // the checksum, so they always reserialize; an unreadable revision
+        // (message gone) never skips. The probe also carries the bound
+        // message's completion/busy flags so settle progression below needs
+        // no full serialization of a stable reply.
         try {
-          revision = await readAssistantTurnRevision(conversation.client, identity);
+          probe = await readAssistantTurnRevision(conversation.client, identity);
         } catch {
-          revision = undefined; // probe failure falls through to full serialization
+          probe = undefined; // probe failure falls through to full serialization
         }
-        if (assistantRevisionRequiresSerialization(lastSerialized, identity, revision)) {
-          const tree = await serializeAssistantTurn(conversation.client, identity);
+        if (assistantRevisionRequiresSerialization(lastSerialized, identity, probe)) {
+          // One atomic capture provides the streamed markdown and the exact
+          // revision it was serialized at — no second evaluation pass.
+          const capture = await captureAssistantTurn(conversation.client, identity).catch(() => undefined);
+          const tree = capture?.identity === identity ? capture.tree : undefined;
           currentFullMarkdown = tree ? treeToMarkdown(tree as DomTreeNode) : "";
-          lastSerialized = revision ? { identity, revision } : undefined;
+          if (capture?.identity === identity) lastSerialized = { identity, revision: capture.revision };
         } else {
           currentFullMarkdown = lastText;
         }
@@ -777,44 +783,44 @@ export class OpenAIWebRuntime {
           settle = undefined;
         }
 
-        // Completion state and content must come from one DOM revision. Copy
-        // action is the semantic signal; missing-copy fallback settles longer.
-        const capture = identity ? await captureAssistantTurn(conversation.client, identity).catch(() => undefined) : undefined;
-        if (!identity || !capture || capture.identity !== identity || capture.busy || capture.stopVisible) {
+        // Settle progression runs on the cheap probe: an unchanged revision
+        // plus its completion/busy flags proves the stable snapshot without
+        // serializing the reply again. Opening a window trusts the revision
+        // the markdown was serialized at (this poll's atomic capture on
+        // change, the probe-verified cache otherwise); completion itself is
+        // always verified by one final atomic full capture.
+        const kind: CompletionSettle["kind"] | undefined =
+          identity && probe && !probe.busy ? (probe.completionVisible ? "semantic" : "fallback") : undefined;
+        if (!kind || (settle && (settle.identity !== identity || settle.markdown !== turnMarkdown || settle.kind !== kind))) {
           settle = undefined;
-        } else {
-          const markdown = capture.tree ? treeToMarkdown(capture.tree as DomTreeNode) : "";
-          const kind: CompletionSettle["kind"] = capture.completionVisible ? "semantic" : "fallback";
-          lastSerialized = { identity, revision: capture.revision };
-          if (markdown && markdown !== lastText) {
-            handlers.onText?.(markdown);
-            lastText = markdown;
-            markdownChanged = true;
-            controller.touchProgress();
+        }
+        if (kind && identity && !settle) {
+          settle = { identity, markdown: turnMarkdown, kind, since: Date.now(), observations: 1 };
+        } else if (settle) {
+          settle.observations += 1;
+        }
+        if (settle) {
+          const now = Date.now();
+          if (harnessSettledGraceUntil <= now) controller.touchProgress();
+          if (settle.observations >= COMPLETION_SETTLE_OBSERVATIONS[settle.kind]
+            && now - settle.since >= COMPLETION_SETTLE_MS[settle.kind]) {
+            const finalCapture = identity
+              ? await captureAssistantTurn(conversation.client, identity).catch(() => undefined)
+              : undefined;
+            const finalMarkdown = finalCapture?.tree ? treeToMarkdown(finalCapture.tree as DomTreeNode) : "";
+            if (identity && finalCapture?.identity === identity && !finalCapture.busy && !finalCapture.stopVisible
+              && finalCapture.completionVisible === (settle.kind === "semantic") && finalMarkdown === settle.markdown) {
+              controller.transition("completed");
+              this.emit("provider_completed", { model: controller.descriptor.id, chars: finalMarkdown.length });
+              return { kind: "completed", markdown: finalMarkdown };
+            }
             settle = undefined;
           }
-          if (markdown) {
-            const now = Date.now();
-            if (!settle || settle.identity !== identity || settle.markdown !== markdown || settle.kind !== kind) {
-              settle = { identity, markdown, kind, since: now, captures: 1 };
-            } else {
-              settle.captures += 1;
-            }
-            if (harnessSettledGraceUntil <= Date.now()) controller.touchProgress();
-            if (settle.captures >= COMPLETION_SETTLE_CAPTURES[kind]
-              && now - settle.since >= COMPLETION_SETTLE_MS[kind]) {
-              const finalCapture = await captureAssistantTurn(conversation.client, identity).catch(() => undefined);
-              const finalMarkdown = finalCapture?.tree ? treeToMarkdown(finalCapture.tree as DomTreeNode) : "";
-              if (finalCapture?.identity === identity && !finalCapture.busy && !finalCapture.stopVisible
-                && finalCapture.completionVisible === capture.completionVisible && finalMarkdown === settle.markdown) {
-                controller.transition("completed");
-                this.emit("provider_completed", { model: controller.descriptor.id, chars: finalMarkdown.length });
-                return { kind: "completed", markdown: finalMarkdown };
-              }
-              settle = undefined;
-            }
-          }
         }
+      } else if (identity && !probe) {
+        // Bound message element vanished (remount in progress): a settle
+        // window opened against it must not survive the gap.
+        settle = undefined;
       }
 
       // Check stall after consuming this poll: new response text and busy state

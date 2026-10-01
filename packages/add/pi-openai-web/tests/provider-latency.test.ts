@@ -142,7 +142,10 @@ function watchClient(frames: Frame[]) {
           revisionProbes += 1;
           if (current.tree === undefined || current.tree === null) return { result: { value: null } };
           const json = JSON.stringify(current.tree);
-          return { result: { value: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" } } };
+          return { result: { value: {
+            textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "",
+            completionVisible: current.state.completionActionVisible, busy: current.state.busy
+          } } };
         }
         if (expression.includes("piAtomicTurnCapture")) {
           serializations += 1;
@@ -326,10 +329,148 @@ test("unchanged content revision reuses the snapshot; completion still fires", a
     assert.equal(outcome.markdown, "Stable answer");
     // Time-based quiescence needs four idle polls at the default cadence.
     assert.equal(h.pollCount(), 4);
-    // Cheap probes still gate streaming work; completion uses fresh atomic captures.
+    // Cheap probes gate streaming and drive settle progression; the stable
+    // reply is fully serialized exactly twice: once when first seen and once
+    // for the atomic final verification. Idle settle polls add probes only.
     assert.equal(h.revisionProbeCount(), 4);
-    assert.equal(h.serializeCount(), 6);
+    assert.equal(h.serializeCount(), 2);
     assert.deepEqual(emitted, ["Stable answer"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("long fallback settle window adds probes only, never full serializations", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-fallback-settle-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 });
+    // No copy action: fallback settle window (4 observations, 2500ms) spans
+    // ~6 idle polls — twice the semantic window — yet the reply is fully
+    // serialized only at first sight and at the final atomic verification.
+    const stable = (identity: string, text: string): Frame => ({
+      state: domState({ responseIdentities: [identity] }),
+      tree: { tag: "p", children: [{ tag: "#text", text }] }
+    });
+    const h = makeWatchHarness(
+      cfg,
+      [
+        stable("r1", "Slow but stable"),
+        stable("r1", "Slow but stable"),
+        stable("r1", "Slow but stable"),
+        stable("r1", "Slow but stable"),
+        stable("r1", "Slow but stable"),
+        stable("r1", "Slow but stable"),
+        stable("r1", "Slow but stable")
+      ]
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Slow but stable");
+    assert.ok(h.pollCount() >= 5, `expected a multi-poll fallback window, got ${h.pollCount()} polls`);
+    assert.equal(h.serializeCount(), 2, "fallback window must not fully serialize per idle poll");
+    assert.equal(h.revisionProbeCount(), h.pollCount(), "every poll must be probe-gated");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("text change mid-settle resets the window; completion carries the rewritten text", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-settle-rewrite-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 });
+    const emitted: string[] = [];
+    // The copy action is already visible, so a buggy settle loop could treat
+    // the first three polls as a quiescent window. The rewrite at poll four
+    // must reset settling, stream the new text, and complete on it — never
+    // return the stale "Alpha" snapshot.
+    const h = makeWatchHarness(
+      cfg,
+      [
+        completedFrame("r1", "Alpha"),
+        completedFrame("r1", "Alpha"),
+        completedFrame("r1", "Alpha"),
+        completedFrame("r1", "Beta"),
+        completedFrame("r1", "Beta"),
+        completedFrame("r1", "Beta"),
+        completedFrame("r1", "Beta")
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Beta");
+    assert.deepEqual(emitted, ["Alpha", "Beta"], "rewrite must reset settling and stream the new text");
+    // First sight, rewrite reserialization, and the final atomic verification.
+    assert.equal(h.serializeCount(), 3);
+    assert.ok(h.pollCount() >= 6, `settle window must restart after the rewrite, got ${h.pollCount()} polls`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("busy state mid-settle resets settling", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-settle-busy-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 });
+    const emitted: string[] = [];
+    // Stop button/busy reappears on poll three with unchanged text: no new
+    // emission, but the settle window must restart from scratch afterwards.
+    const h = makeWatchHarness(
+      cfg,
+      [
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        busyText("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer")
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Answer");
+    assert.deepEqual(emitted, ["Answer"]);
+    // Without the busy reset the window opened at poll one would complete by
+    // poll four; a restarted window needs the full observation span again.
+    assert.ok(h.pollCount() >= 6, `busy must restart the settle window, got ${h.pollCount()} polls`);
+    assert.equal(h.serializeCount(), 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("missing message mid-settle resets settling without a stale completion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-settle-missing-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 });
+    const emitted: string[] = [];
+    // Poll three keeps the response identity but drops the message element
+    // (remount): the settle window must not survive the gap and completion
+    // must be re-earned against the remounted message.
+    const vanished = (): Frame => ({ state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }) });
+    const h = makeWatchHarness(
+      cfg,
+      [
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        vanished(),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer")
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Answer");
+    assert.deepEqual(emitted, ["Answer"]);
+    assert.ok(h.pollCount() >= 6, `missing message must restart the settle window, got ${h.pollCount()} polls`);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -357,8 +498,9 @@ test("shrinks and same-length rewrites still reserialize and reach onText", asyn
     assert.equal(outcome.kind, "completed", outcome.error);
     assert.equal(outcome.markdown, "axc");
     assert.deepEqual(emitted, ["abcdef", "abc", "axc"]);
-    // Every content revision reserializes; completion adds fresh atomic captures.
-    assert.equal(h.serializeCount(), 8);
+    // Every content revision reserializes once (three streaming captures)
+    // plus the final atomic verification; idle polls add probes only.
+    assert.equal(h.serializeCount(), 4);
     assert.equal(h.revisionProbeCount(), 7);
   } finally {
     await rm(dir, { recursive: true, force: true });

@@ -138,9 +138,11 @@ export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
   const state = await evalJson<TurnDomState>(client, `() => {
     const containers = [...document.querySelectorAll('[data-turn-id-container]')].filter(el =>
       !el.parentElement?.closest('[data-turn-id-container]'));
-    const fallbackContainers = [...document.querySelectorAll('[data-content-search-unit-key$=":user"], [data-content-search-unit-key$=":assistant"]')];
-    const turnIdentities = (containers.length ? containers : fallbackContainers)
-      .map(el => el.getAttribute('data-turn-id-container') || el.getAttribute('data-content-search-unit-key')).filter(Boolean);
+    // Fallback containers are queried only when the primary binding is absent.
+    const turnIdentities = (containers.length
+      ? containers.map(el => el.getAttribute('data-turn-id-container'))
+      : [...document.querySelectorAll('[data-content-search-unit-key$=":user"], [data-content-search-unit-key$=":assistant"]')]
+        .map(el => el.getAttribute('data-content-search-unit-key'))).filter(Boolean);
     const identities = (selector) => [...document.querySelectorAll(selector)]
       .map(el => el.getAttribute('data-turn-id') || el.getAttribute('data-content-search-unit-key')).filter(Boolean);
     const userIdentities = identities('[data-turn-id][data-message-author-role="user"], [data-turn-id][data-turn="user"], [data-content-search-unit-key$=":user"]');
@@ -296,9 +298,20 @@ export interface SerializedAssistantTurn {
   revision: AssistantTurnRevision;
 }
 
-/** Read the cheap revision fingerprint of the assistant turn bound by identity. */
-export async function readAssistantTurnRevision(client: CdpClient, identity: string): Promise<AssistantTurnRevision | undefined> {
-  const revision = await evalJson<AssistantTurnRevision | null>(client, `/* piRevisionProbe */ (() => {
+/** Revision fingerprint plus the bound message's completion/busy flags; still no tree serialization. */
+export interface AssistantTurnProbe extends AssistantTurnRevision {
+  /** Copy/completion action visible inside the bound message (same binding as the atomic capture). */
+  completionVisible: boolean;
+  /** Busy shimmer inside the bound message (same binding as the atomic capture). */
+  busy: boolean;
+}
+
+/**
+ * Read the cheap revision fingerprint of the assistant turn bound by identity,
+ * plus its completion/busy flags, without serializing the message tree.
+ */
+export async function readAssistantTurnRevision(client: CdpClient, identity: string): Promise<AssistantTurnProbe | undefined> {
+  const revision = await evalJson<AssistantTurnProbe | null>(client, `/* piRevisionProbe */ (() => {
     const wanted = ${JSON.stringify(identity)};
     const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
       || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
@@ -316,7 +329,9 @@ export async function readAssistantTurnRevision(client: CdpClient, identity: str
       textChecksum: checksum(text),
       childCount: message.childElementCount,
       linkChecksum: checksum(links),
-      languageKey
+      languageKey,
+      completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
+      busy: Boolean(message.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') || message.getAttribute('aria-busy') === 'true')
     };
   })()`);
   return revision ?? undefined;
