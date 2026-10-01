@@ -144,13 +144,94 @@ test("handoff authorization is consumed even when a stop throws mid-flight", asy
 
   await manager.start();
   manager.preserveBrowserForHandoff();
-  await assert.rejects(manager.stopOwnedResources()); // dia skipped, tunnel throws, stop exits early
-  assert.deepEqual(stops, []);
+  await assert.rejects(manager.stopOwnedResources()); // dia skipped; MCP still stopped after tunnel fails
+  assert.deepEqual(stops, ["mcp"]);
 
+  stops.length = 0;
   tunnelStopFails = false;
   await manager.start();
   await manager.stopOwnedResources(); // intent was consumed by the failed stop: dia stops normally
   assert.deepEqual(stops.slice().sort(), ["dia", "mcp", "tunnel"]);
+});
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+for (const operation of ["start", "reload"] as const) {
+  test(`shutdown waits for pending ${operation} and reaps late owned resources`, async () => {
+    const gate = deferred();
+    const entered = deferred();
+    let delayed = operation === "start";
+    let alive = false;
+    let stops = 0;
+    const tunnel: InfrastructureDependency = {
+      probe: async () => alive ? "ready" : "stopped",
+      get managedByPi() { return alive; },
+      ensureStarted: async () => {
+        if (delayed) { entered.resolve(); await gate.promise; }
+        alive = true;
+        return "ready";
+      },
+      stop: async () => { alive = false; stops++; }
+    };
+    const manager = new HarnessInfrastructureManager(dependency(() => "ready"), tunnel, dependency(() => "ready"));
+    if (operation === "reload") { await manager.start(); delayed = true; }
+    const starting = operation === "start" ? manager.start() : manager.reloadMcpAndTunnel();
+    await entered.promise;
+    let stopped = false;
+    const stopping = manager.stopOwnedResources().then((result) => { stopped = true; return result; });
+    const repeatedStop = manager.stopOwnedResources();
+    await assert.rejects(manager.start(), /stopping/);
+    await assert.rejects(manager.reloadMcpAndTunnel(), /stopping/);
+    await new Promise((resolve) => setImmediate(resolve));
+    const stoppedEarly = stopped;
+    gate.resolve();
+    await starting;
+    await stopping;
+    await repeatedStop;
+    assert.equal(stoppedEarly, false);
+    assert.equal(alive, false);
+    assert.equal(stops, operation === "reload" ? 2 : 1);
+  });
+}
+
+for (const operation of ["start", "reload"] as const) {
+ test(`${operation} rejection waits for all pending starts before shutdown`, async () => {
+  const gate = deferred();
+  let alive = false;
+  const failure = new Error("MCP failed");
+  const mcp = dependency(() => "stopped");
+  mcp.ensureStarted = async () => { throw failure; };
+  const tunnel: InfrastructureDependency = {
+    probe: async () => alive ? "ready" : "stopped",
+    get managedByPi() { return alive; },
+    ensureStarted: async () => { await gate.promise; alive = true; return "ready"; },
+    stop: async () => { alive = false; }
+  };
+  const manager = new HarnessInfrastructureManager(mcp, tunnel, dependency(() => "ready"));
+  let rejected = false;
+  const starting = (operation === "start" ? manager.start() : manager.reloadMcpAndTunnel()).catch((error: unknown) => { rejected = true; assert.equal(error, failure); });
+  await new Promise((resolve) => setImmediate(resolve));
+  const rejectedEarly = rejected;
+  const stopping = manager.stopOwnedResources();
+  gate.resolve();
+  await starting;
+  await stopping;
+  assert.equal(rejectedEarly, false);
+  assert.equal(alive, false);
+ });
+}
+
+test("shutdown leaves external dependencies untouched", async () => {
+  const stops: string[] = [];
+  const external = () => dependency(() => "ready", { stopCalls: stops });
+  const manager = new HarnessInfrastructureManager(external(), external(), external());
+  await manager.start();
+  await manager.stopOwnedResources();
+  assert.deepEqual(stops, []);
 });
 
 test("start -> ready -> stop stops owned deps once; restart works; external untouched", async () => {

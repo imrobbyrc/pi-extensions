@@ -19,12 +19,30 @@ export interface InfrastructureDependency {
   stop(): Promise<void>;
 }
 
+async function settleStarts(starts: Promise<unknown>[]): Promise<void> {
+  const results = await Promise.allSettled(starts);
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
+async function stopOwned(dependencies: InfrastructureDependency[]): Promise<void> {
+  const errors: unknown[] = [];
+  for (const dependency of dependencies) {
+    try {
+      if (dependency.managedByPi) await dependency.stop();
+    } catch (error) { errors.push(error); }
+  }
+  if (errors.length) throw errors[0];
+}
+
 /** Owns only resources started by this Pi runtime. Stop path is shared by command and shutdown. */
 export class HarnessInfrastructureManager {
   private stopping = false;
   private started = false;
   private preserveDiaOnStop = false;
   private startInFlight: Promise<HarnessInfrastructureStatus> | undefined;
+  private reloadInFlight: Promise<HarnessInfrastructureStatus> | undefined;
+  private stopInFlight: Promise<HarnessInfrastructureStatus> | undefined;
 
   constructor(
     private readonly mcp: InfrastructureDependency,
@@ -41,7 +59,7 @@ export class HarnessInfrastructureManager {
     this.startInFlight = (async () => {
       this.started = true;
       const progress = (label: string) => (message: string) => onProgress?.(`${label}: ${message}`);
-      await Promise.all([
+      await settleStarts([
         this.mcp.ensureStarted().then(() => onProgress?.("MCP ready")),
         this.tunnel.ensureStarted(progress("Tunnel")),
         this.dia.ensureStarted().then(() => onProgress?.("Dia CDP ready"))
@@ -59,21 +77,21 @@ export class HarnessInfrastructureManager {
 
   async reloadMcpAndTunnel(onProgress?: (message: string) => void): Promise<HarnessInfrastructureStatus> {
     if (this.stopping) throw new Error("Harness infrastructure is stopping");
-    if (this.startInFlight) await this.startInFlight;
     this.stopping = true;
-    try {
-      for (const dependency of [this.tunnel, this.mcp]) {
-        if (dependency.managedByPi) await dependency.stop();
-      }
-      await Promise.all([
+    this.reloadInFlight = (async () => {
+      if (this.startInFlight) await this.startInFlight;
+      await stopOwned([this.tunnel, this.mcp]);
+      this.started = true;
+      await settleStarts([
         this.mcp.ensureStarted().then(() => onProgress?.("MCP ready")),
         this.tunnel.ensureStarted((message) => onProgress?.(`Tunnel: ${message}`))
       ]);
-      this.started = true;
       return this.snapshot();
-    } finally {
-      this.stopping = false;
-    }
+    })().finally(() => {
+      this.reloadInFlight = undefined;
+      this.stopping = !!this.stopInFlight;
+    });
+    return this.reloadInFlight;
   }
 
   /**
@@ -91,19 +109,22 @@ export class HarnessInfrastructureManager {
     // never leaks into a later normal shutdown.
     const preserveDia = this.preserveDiaOnStop;
     this.preserveDiaOnStop = false;
-    if (this.started && !this.stopping) {
-      this.stopping = true;
-      try {
-        for (const dependency of [this.dia, this.tunnel, this.mcp]) {
-          if (dependency === this.dia && preserveDia) continue;
-          if (dependency.managedByPi) await dependency.stop();
-        }
+    if (this.stopInFlight) return this.stopInFlight;
+    this.stopping = true;
+    this.stopInFlight = (async () => {
+      // Failed startup can still leave owned resources behind. Wait for all
+      // pending starts/reloads before inspecting ownership and tearing down.
+      await Promise.allSettled([this.startInFlight, this.reloadInFlight]);
+      if (this.started) {
+        await stopOwned(preserveDia ? [this.tunnel, this.mcp] : [this.dia, this.tunnel, this.mcp]);
         this.started = false;
-      } finally {
-        this.stopping = false;
       }
-    }
-    return this.snapshot();
+      return this.snapshot();
+    })().finally(() => {
+      this.stopInFlight = undefined;
+      this.stopping = false;
+    });
+    return this.stopInFlight;
   }
 }
 
