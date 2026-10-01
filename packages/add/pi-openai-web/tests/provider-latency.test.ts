@@ -102,6 +102,8 @@ interface Frame {
   tree?: unknown;
   /** Overrides the atomic capture's busy/stop flags to simulate probe/capture divergence. */
   captureState?: { busy?: boolean; stopVisible?: boolean };
+  /** Overrides the cheap probe's busy flag: a newer reading than readTurnState. */
+  probeState?: { busy?: boolean };
   /** Tree served to atomic captures while probes still see `tree` (final-capture drift). */
   captureTree?: unknown;
   /** Forced revision fields for probe AND capture; simulates a fingerprint blind to a markup swap. */
@@ -168,7 +170,7 @@ function watchClient(frames: Frame[]) {
             structureChecksum: checksum(tagPath(current.tree)),
             ...(current.probeRevision ?? {}),
             completionVisible: current.state.completionActionVisible,
-            busy: current.state.busy
+            busy: current.probeState?.busy ?? current.state.busy
           } } };
         }
         if (expression.includes("piAtomicTurnCapture")) {
@@ -309,6 +311,120 @@ test("watch polls fast while generating and slower during harness tool wait", as
     for (const gap of harnessGaps) assert.ok(gap >= 700, `harness-wait gap too fast: ${harnessGaps.join(",")}`);
     assert.equal(h.stopClickCount(), 0);
     assert.equal(h.controller.state, "completed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("harness-active calm DOM cannot complete; fresh settle window after activity ends", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-harness-gate-"));
+  try {
+    // Uniform ~700ms polls make activity boundaries and the settle window
+    // (3 observations, >=1250ms) clearly distinguishable. The harness (Herdr
+    // run / in-flight MCP tool call) stays active for the first four polls
+    // while the browser already shows a calm reply with visible completion
+    // controls — the exact shape that must NOT complete mid-harness-work.
+    const cfg = {
+      ...baseConfig(dir, { stallTimeoutMs: 10_000, turnTimeoutMs: 60_000, pollHarnessWaitMs: 700 }),
+      providerPollActiveMs: 700,
+      providerPollIdleMs: 700
+    };
+    let harnessCalls = 0;
+    let activePolls = 0;
+    let lastActiveAt = 0;
+    const emitted: string[] = [];
+    const frame = completedFrame("r1", "Partial but stable");
+    const h = makeWatchHarness(
+      cfg,
+      [frame, structuredClone(frame), structuredClone(frame), structuredClone(frame), structuredClone(frame), structuredClone(frame), structuredClone(frame)],
+      async () => {
+        harnessCalls += 1;
+        if (harnessCalls <= 4) {
+          activePolls += 1;
+          lastActiveAt = Date.now();
+          return true;
+        }
+        return false;
+      },
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.match(outcome.markdown ?? "", /Partial but stable/);
+    assert.equal(h.controller.state, "completed");
+    // Every harness-active poll must be consumed: a completion fired while
+    // the harness was still active would end the loop after three calls.
+    assert.equal(activePolls, 4, `harness activity must gate completion, got ${activePolls} active polls`);
+    // Completion must trail the last harness-active poll by a full fresh
+    // settle window — never inherit a window accumulated during the work.
+    const completionPoll = h.pollTimestamps[h.pollTimestamps.length - 1]!;
+    assert.ok(
+      completionPoll - lastActiveAt >= 1_250,
+      `completion must be earned from a fresh post-harness settle window, got ${completionPoll - lastActiveAt}ms`
+    );
+    assert.ok(h.pollCount() >= 6, `settle window must restart after harness activity, got ${h.pollCount()} polls`);
+    assert.deepEqual(emitted, ["Partial but stable"], "partial text may stream during harness work");
+    assert.equal(h.stopClickCount(), 0);
+    assert.equal(h.serializeCount(), 2); // first sight + final atomic verification
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("newer probe/capture busy readings refresh the heartbeat and select active cadence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-divergent-busy-"));
+  try {
+    // readTurnState reports a calm DOM on every poll, but the later cheap
+    // probe sees the bound message busy again (shimmer resumed after the
+    // state read), and the settle window's final atomic capture later sees
+    // the stop button on newer DOM. Those newer readings must drive the
+    // stall heartbeat and polling cadence: with a 400ms stall timeout,
+    // treating these polls as idle (600ms cadence, no heartbeat) fails the
+    // turn outright, and idle gaps would also double the settle span.
+    const cfg = {
+      ...baseConfig(dir, { stallTimeoutMs: 400, turnTimeoutMs: 60_000 }),
+      providerPollIdleMs: 700
+    };
+    const emitted: string[] = [];
+    const calm = (extra: Partial<Frame> = {}): Frame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
+      tree: { tag: "p", children: [{ tag: "#text", text: "Simmering answer" }] },
+      ...extra
+    });
+    const h = makeWatchHarness(
+      cfg,
+      [
+        calm({ probeState: { busy: true } }),
+        calm({ probeState: { busy: true } }),
+        calm({ probeState: { busy: true } }),
+        calm(),
+        calm(),
+        calm({ captureState: { stopVisible: true } }), // divergent final capture
+        calm(),
+        calm(),
+        calm() // last frame repeats; calm final capture completes
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Simmering answer");
+    assert.deepEqual(emitted, ["Simmering answer"]);
+    assert.equal(h.controller.state, "completed");
+    assert.equal(h.stopClickCount(), 0);
+    const gaps = (arr: number[]) => arr.slice(1).map((t, i) => t - arr[i]!);
+    // Effective busy polls (calm readTurnState, busy probe) must use the
+    // active cadence — idle polls would stall long before completion.
+    const busyGaps = gaps(h.pollTimestamps.slice(0, 4));
+    for (const gap of busyGaps) assert.ok(gap <= 480, `probe-busy polls must use the active cadence: ${busyGaps.join(",")}`);
+    // The divergent final capture (stop button on newer DOM) rejects the
+    // completion and must also refresh the heartbeat + active cadence.
+    const postDivergenceGap = h.pollTimestamps[6]! - h.pollTimestamps[5]!;
+    assert.ok(postDivergenceGap <= 480, `divergent final capture must select the active cadence, got ${postDivergenceGap}ms`);
+    assert.ok(h.pollCount() >= 9, `a rejected divergent capture must restart the settle window, got ${h.pollCount()} polls`);
+    // First sight + the divergent final capture + the completing final capture.
+    assert.equal(h.serializeCount(), 3);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

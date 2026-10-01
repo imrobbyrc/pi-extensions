@@ -698,6 +698,9 @@ export class OpenAIWebRuntime {
     let lastText = "";
     let lastSerialized: SerializedAssistantTurn | undefined;
     let settle: CompletionSettle | undefined;
+    // Last assistant identity that counted as progress while still empty; a
+    // persistent unchanged empty identity must not refresh progress per poll.
+    let emptyIdentityProgress: string | undefined;
     let harnessWasActive = false;
     let harnessSettledGraceUntil = 0;
     const stallGraceAfterHarnessMs = this.config.providerStallGraceMs ?? 30_000;
@@ -773,14 +776,35 @@ export class OpenAIWebRuntime {
       }
       const turnMarkdown = currentFullMarkdown;
       let markdownChanged = turnMarkdown !== lastText;
-      // Tool-call/reasoning turns can have a stable assistant identity but no
-      // text or busy marker yet. Identity proves provider turn is alive.
-      if (identity && turnMarkdown.length === 0) controller.touchProgress();
+      // The probe and, when one was taken, the atomic capture read the DOM
+      // after readTurnState; their busy/stop flags outrank that older reading
+      // whenever the two diverge, so effective busy state below — settle
+      // gating, stall heartbeat, and polling cadence — follows the newest
+      // observed activity, never a stale calm snapshot.
+      let busyNow = state.stopVisible || state.busy
+        || probe?.busy === true || capture?.busy === true || capture?.stopVisible === true;
+      // Tool-call/reasoning turns can mount a stable assistant identity with
+      // no text or busy marker yet. The identity's first appearance counts as
+      // initial progress once, but repeated polls of the same unchanged empty
+      // identity must not indefinitely suppress the stall watchdog — only
+      // genuine progress (a new identity, text, or busy activity) refreshes it.
+      if (identity && turnMarkdown.length === 0) {
+        if (emptyIdentityProgress !== identity) {
+          emptyIdentityProgress = identity;
+          controller.touchProgress();
+        }
+      } else if (turnMarkdown.length > 0) {
+        emptyIdentityProgress = undefined;
+      }
 
-      // Never complete while ChatGPT is busy (thinking/reasoning shimmer or stop button visible)
-      if (state.stopVisible || state.busy) {
-        // Busy state refreshes the browser-activity heartbeat above. Only new
-        // assistant text drives completion; hard timeout still bounds a spinner.
+      // Never complete while ChatGPT is busy (thinking/reasoning shimmer, stop
+      // button, or a newer busy/stop reading from the probe/capture) — and
+      // never while harness tool work (Herdr runs, in-flight MCP tool calls)
+      // is still active, even when the DOM looks calm and completion controls
+      // are visible. Each activity bout must be followed by a fresh settle
+      // window earned after it ends; only new assistant text drives
+      // completion, and the hard timeout still bounds a spinner.
+      if (busyNow || harnessActive) {
         settle = undefined;
         if (markdownChanged) {
           controller.touchProgress();
@@ -824,6 +848,10 @@ export class OpenAIWebRuntime {
               ? await captureAssistantTurn(conversation.client, identity).catch(() => undefined)
               : undefined;
             const finalMarkdown = finalCapture?.tree ? treeToMarkdown(finalCapture.tree as DomTreeNode) : "";
+            // The final capture reads the newest DOM of this poll: a busy/stop
+            // reading there feeds effective busy state exactly like a probe or
+            // mid-poll capture divergence (heartbeat + cadence below).
+            if (finalCapture?.busy === true || finalCapture?.stopVisible === true) busyNow = true;
             if (identity && finalCapture?.identity === identity && !finalCapture.busy && !finalCapture.stopVisible
               && finalCapture.completionVisible === (settle.kind === "semantic") && finalMarkdown === settle.markdown) {
               controller.transition("completed");
@@ -862,9 +890,10 @@ export class OpenAIWebRuntime {
         settle = undefined;
       }
 
-      // Check stall after consuming this poll: new response text and busy state
-      // are valid browser progress signals and must refresh the heartbeat first.
-      if (state.stopVisible || state.busy) {
+      // Check stall after consuming this poll: new response text and effective
+      // busy state (including newer probe/capture readings) are valid browser
+      // progress signals and must refresh the heartbeat first.
+      if (busyNow) {
         controller.touchProgress();
       } else if (controller.stalled()) {
         // Harness tool work (Herdr runs, in-flight MCP tool calls) legitimately
@@ -885,7 +914,7 @@ export class OpenAIWebRuntime {
         }
       }
       await sleepUntil(watchPollDelayMs(
-        { stopVisible: state.stopVisible, busy: state.busy, textChanged: markdownChanged, harnessActive },
+        { stopVisible: busyNow, busy: busyNow, textChanged: markdownChanged, harnessActive },
         this.config
       ), options.signal, controller.startedAtMs + controller.turnTimeoutMs);
     }
