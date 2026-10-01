@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { HarnessInfrastructureStatus } from "../../src/service/infrastructure.js";
 import { loadConfig } from "../../src/config.js";
 import type { HarnessConfig } from "../../src/types.js";
 import { HarnessRuntime } from "../../src/service/runtime.js";
@@ -40,11 +41,41 @@ interface SessionView {
   refreshRegistry: (signal: AbortSignal) => Promise<void>;
 }
 
+/** Structural slice of HarnessRuntime needed by the shared tunnel reload path. */
+export interface TunnelReloadHost {
+  reloadMcpAndTunnel(onProgress?: (message: string) => void): Promise<HarnessInfrastructureStatus>;
+  readonly tunnel: { readonly lastError: string | undefined };
+}
+
+/** Optional seams for command-level test harnesses (no production callers pass these). */
+export interface ProviderModuleDeps {
+  /** Replaces HarnessRuntime construction with a fake host for command tests. */
+  readonly infrastructureHost?: () => Promise<HarnessRuntime>;
+}
+
+/**
+ * Single shared recovery path behind `/openai-web reload` and `/reload-tunnel`:
+ * hard-reloads the Pi-owned local MCP server and Secure MCP Tunnel via
+ * HarnessRuntime.reloadMcpAndTunnel and waits for the authoritative readiness
+ * snapshot. Never restarts Dia/browser and never resets the provider
+ * conversation — that is the contract of reloadMcpAndTunnel itself.
+ */
+export async function runTunnelReload(host: TunnelReloadHost, ctx: ExtensionCommandContext): Promise<void> {
+  ctx.ui.setStatus("openai-web-start", "Reloading MCP and Secure MCP Tunnel…");
+  try {
+    const snapshot = await host.reloadMcpAndTunnel((message) => ctx.ui.setStatus("openai-web-start", message));
+    if (!snapshot.ready) throw new Error(host.tunnel.lastError ?? "openai-web infrastructure is not ready.");
+    ctx.ui.notify("openai-web MCP and tunnel reloaded; provider conversation preserved.", "info");
+  } finally {
+    ctx.ui.setStatus("openai-web-start", undefined);
+  }
+}
+
 /**
  * Harness composition: catalog, openai-web provider (always-on Lead Architect),
  * the strict MCP tool surface, and the Herdr-managed Pi worker controller.
  */
-export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentController): ProviderModule {
+export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentController, deps: ProviderModuleDeps = {}): ProviderModule {
   let configPromise: Promise<HarnessConfig> | undefined;
   const config = (): Promise<HarnessConfig> => { configPromise ??= loadConfig(); return configPromise; };
 
@@ -133,7 +164,7 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
     recordActivity("openai-web provider registered (Lead Architect always on)");
   }
 
-  async function ensureInfrastructure(): Promise<HarnessRuntime> {
+  const ensureInfrastructure: () => Promise<HarnessRuntime> = deps.infrastructureHost ?? async function (): Promise<HarnessRuntime> {
     await ensureServices();
     if (!infrastructure) {
       const cfg = await config();
@@ -258,14 +289,15 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
         }
         if (parts[0] === "start" || parts[0] === "reload") {
           const host = await ensureInfrastructure();
-          const reload = parts[0] === "reload";
-          ctx.ui.setStatus("openai-web-start", reload ? "Reloading MCP and Secure MCP Tunnel…" : "Starting ChatGPT Web infrastructure…");
+          if (parts[0] === "reload") {
+            await runTunnelReload(host, ctx);
+            return;
+          }
+          ctx.ui.setStatus("openai-web-start", "Starting ChatGPT Web infrastructure…");
           try {
-            const snapshot = reload
-              ? await host.reloadMcpAndTunnel((message) => ctx.ui.setStatus("openai-web-start", message))
-              : await host.startInfrastructure((message) => ctx.ui.setStatus("openai-web-start", message));
+            const snapshot = await host.startInfrastructure((message) => ctx.ui.setStatus("openai-web-start", message));
             if (!snapshot.ready) throw new Error(host.tunnel.lastError ?? "openai-web infrastructure is not ready.");
-            ctx.ui.notify(reload ? "openai-web MCP and tunnel reloaded; provider conversation preserved." : "openai-web infrastructure ready.", "info");
+            ctx.ui.notify("openai-web infrastructure ready.", "info");
           } finally {
             ctx.ui.setStatus("openai-web-start", undefined);
           }
@@ -330,6 +362,22 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
           return;
         }
         await showModels(ctx);
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    }
+  });
+
+  // Ergonomic top-level alias: the exact same shared recovery path as
+  // `/openai-web reload` (runTunnelReload → HarnessRuntime.reloadMcpAndTunnel).
+  // Does not restart Dia/browser and does not reset the provider conversation.
+  pi.registerCommand("reload-tunnel", {
+    description: "Recover Pi-owned local MCP and the Secure MCP Tunnel (same path as /openai-web reload; provider conversation preserved)",
+    handler: async (_args, ctx) => {
+      try {
+        await ensureServices();
+        captureSession(ctx);
+        await runTunnelReload(await ensureInfrastructure(), ctx);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
