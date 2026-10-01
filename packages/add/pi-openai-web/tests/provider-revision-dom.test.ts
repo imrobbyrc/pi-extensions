@@ -178,6 +178,72 @@ const inlineDom: DomSpec = contentSpec([{ tag: "p", children: [{ tag: "code", te
 /** Final shape: fenced `<pre><code>` with identical text and still no language class. */
 const fencedDom: DomSpec = contentSpec([{ tag: "pre", children: [{ tag: "code", text: CODE }] }]);
 
+// Real-browser final shape: ChatGPT keeps a persistent
+// DIV[data-markdown-copy="code-block"] whose header (language label + copy
+// buttons) is marked data-markdown-copy="exclude" and whose code lives in a
+// DIV>CODE.whitespace-pre.block of spans — no PRE anywhere. The capture
+// serializer must normalize it to fenced code, header-free, whitespace exact.
+const SMOKE_CODE = 'function smoke() {\n  const replySmoke = "ok";\n\n  return replySmoke;\n}\n';
+const expectedSmokeFence = "```typescript\n" + SMOKE_CODE.replace(/\n$/, "") + "\n```";
+const codeHeaderSpec = (label: string): DomSpec => ({
+  tag: "div",
+  attrs: { "data-markdown-copy": "exclude" },
+  children: [{ tag: "span", text: label }, { tag: "button", text: "Copy code" }, { tag: "svg" }]
+});
+const persistentBlockSpec: DomSpec = {
+  tag: "div",
+  attrs: { "data-markdown-copy": "code-block" },
+  children: [
+    codeHeaderSpec("typescript"),
+    {
+      tag: "div",
+      children: [{
+        tag: "code",
+        cls: "whitespace-pre block language-typescript",
+        children: [
+          { tag: "span", text: "function smoke() {" },
+          { tag: "span", text: '\n  const replySmoke = "ok";\n\n  return replySmoke;\n' },
+          { tag: "span", text: "}" },
+          { tag: "#text", text: "\n" }
+        ]
+      }]
+    }
+  ]
+};
+/** Persistent final shape: marked container, header UI, DIV>CODE (no PRE). */
+const persistentFencedDom: DomSpec = contentSpec([persistentBlockSpec]);
+/** Marked container that wraps a hydrated PRE>CODE — normalize either way. */
+const innerPreFencedDom: DomSpec = contentSpec([{
+  tag: "div",
+  attrs: { "data-markdown-copy": "code-block" },
+  children: [
+    codeHeaderSpec("typescript"),
+    { tag: "div", children: [{ tag: "pre", children: [{ tag: "code", cls: "language-typescript", text: SMOKE_CODE }] }] }
+  ]
+}]);
+/** Hydrated equivalent: plain PRE>CODE with the same text and language. */
+const hydratedFencedDom: DomSpec = contentSpec([{ tag: "pre", children: [{ tag: "code", cls: "language-typescript", text: SMOKE_CODE }] }]);
+/** Same persistent DOM without the code-block marker: must NOT normalize. */
+const unmarkedBlockDom: DomSpec = contentSpec([{
+  tag: "div",
+  children: [
+    codeHeaderSpec("typescript"),
+    {
+      tag: "div",
+      children: [{
+        tag: "code",
+        cls: "whitespace-pre block language-typescript",
+        children: [
+          { tag: "span", text: "function smoke() {" },
+          { tag: "span", text: '\n  const replySmoke = "ok";\n\n  return replySmoke;\n' },
+          { tag: "span", text: "}" },
+          { tag: "#text", text: "\n" }
+        ]
+      }]
+    }
+  ]
+}]);
+
 function staticDomClient(dom: DomSpec | undefined): CdpClient {
   const document = dom ? buildDocument("r1", dom) : new FakeDocument([]);
   return {
@@ -192,7 +258,7 @@ function staticDomClient(dom: DomSpec | undefined): CdpClient {
 // ---------------------------------------------------------------------------
 
 test("probe and capture compute identical revisions on the same DOM", async () => {
-  for (const dom of [inlineDom, fencedDom]) {
+  for (const dom of [inlineDom, fencedDom, persistentFencedDom]) {
     const client = staticDomClient(dom);
     const probe = await readAssistantTurnRevision(client, "r1");
     const capture = await captureAssistantTurn(client, "r1");
@@ -241,6 +307,65 @@ test("same-text inline→fenced markup swap changes only the structure fingerpri
   assert.equal(inlineMarkdown, "`" + CODE + "`");
   assert.ok(fencedMarkdown.startsWith("```"), `fenced block expected, got: ${fencedMarkdown}`);
   assert.ok(fencedMarkdown.includes(CODE));
+});
+
+test("persistent data-markdown-copy block serializes to fenced code sans header", async () => {
+  const capture = await captureAssistantTurn(staticDomClient(persistentFencedDom), "r1");
+  assert.ok(capture);
+  const markdown = treeToMarkdown(capture.tree as DomTreeNode);
+  // Exact fenced markdown: interior indentation and the blank line survive
+  // byte-for-byte, and the header UI (language label, copy button) never leaks.
+  assert.equal(markdown, expectedSmokeFence);
+  assert.ok(!markdown.includes("Copy"), `header UI leaked into: ${markdown}`);
+});
+
+test("persistent, inner-PRE, and hydrated fenced blocks serialize identically", async () => {
+  const persistent = await captureAssistantTurn(staticDomClient(persistentFencedDom), "r1");
+  const innerPre = await captureAssistantTurn(staticDomClient(innerPreFencedDom), "r1");
+  const hydrated = await captureAssistantTurn(staticDomClient(hydratedFencedDom), "r1");
+  assert.ok(persistent && innerPre && hydrated);
+  assert.equal(treeToMarkdown(persistent.tree as DomTreeNode), expectedSmokeFence);
+  assert.equal(treeToMarkdown(innerPre.tree as DomTreeNode), expectedSmokeFence);
+  assert.equal(treeToMarkdown(hydrated.tree as DomTreeNode), expectedSmokeFence);
+});
+
+test("ordinary inline code remains inline beside a normalized container", async () => {
+  const mixed: DomSpec = contentSpec([
+    { tag: "p", children: [{ tag: "#text", text: "run " }, { tag: "code", text: CODE }, { tag: "#text", text: " now" }] },
+    persistentBlockSpec
+  ]);
+  const capture = await captureAssistantTurn(staticDomClient(mixed), "r1");
+  assert.ok(capture);
+  assert.equal(
+    treeToMarkdown(capture.tree as DomTreeNode),
+    "run `" + CODE + "` now\n\n" + expectedSmokeFence,
+    "inline CODE outside a marked container must stay inline"
+  );
+});
+
+test("code-block marker flip and header churn stay revision-visible and invisible respectively", async () => {
+  const persistent = await captureAssistantTurn(staticDomClient(persistentFencedDom), "r1");
+  const unmarked = await captureAssistantTurn(staticDomClient(unmarkedBlockDom), "r1");
+  assert.ok(persistent && unmarked);
+  // Identical legacy fields; only the structure fingerprint sees the marker
+  // flip, so a snapshot can never go stale on the attribute alone.
+  assert.equal(unmarked.revision.textLength, persistent.revision.textLength);
+  assert.equal(unmarked.revision.textChecksum, persistent.revision.textChecksum);
+  assert.equal(unmarked.revision.languageKey, persistent.revision.languageKey);
+  assert.notEqual(unmarked.revision.structureChecksum, persistent.revision.structureChecksum);
+  assert.equal(assistantRevisionRequiresSerialization({ identity: "r1", revision: persistent.revision }, "r1", unmarked.revision), true);
+  assert.equal(assistantRevisionRequiresSerialization({ identity: "r1", revision: persistent.revision }, "r1", persistent.revision), false);
+  assert.notEqual(treeToMarkdown(unmarked.tree as DomTreeNode), expectedSmokeFence);
+  // Header text churn (label length changes) must not move the structure fold
+  // or the serialized tree: it is marked-exclude chrome in both expressions.
+  const shorterHeader: DomSpec = contentSpec([{
+    ...persistentBlockSpec,
+    children: [codeHeaderSpec("ts"), persistentBlockSpec.children![1]!]
+  }]);
+  const churned = await captureAssistantTurn(staticDomClient(shorterHeader), "r1");
+  assert.ok(churned);
+  assert.equal(churned.revision.structureChecksum, persistent.revision.structureChecksum);
+  assert.deepEqual(churned.tree, persistent.tree);
 });
 
 test("text redistribution across identical tags is caught by the structure fingerprint", async () => {
