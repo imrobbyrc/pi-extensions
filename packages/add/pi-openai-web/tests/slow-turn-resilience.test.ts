@@ -251,6 +251,55 @@ test("genuinely silent turn still fails with provider_turn_stalled", async () =>
   }
 });
 
+test("persistent unchanged empty assistant identity stalls instead of riding the hard timeout", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-grace-empty-identity-"));
+  try {
+    // The assistant message mounts (stable identity) but never renders text,
+    // busy shimmer, or stop button again. Its first appearance may count as
+    // progress, yet repeated polls of the same unchanged empty identity must
+    // not refresh the heartbeat forever: the turn must fail via the stall
+    // watchdog, not only via the much later hard timeout.
+    const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 8_000 });
+    const h = makeWatch(cfg, [{ state: domState({ responseIdentities: ["r1"] }) }]);
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "failed");
+    assert.match(outcome.error ?? "", /provider_turn_stalled after 200ms without progress/);
+    assert.equal(h.controller.state, "failed");
+    assert.equal(h.graceEvents.length, 0, "an empty identity is not harness activity");
+    assert.equal(h.stopClickCount(), 1, "stall failure must stop browser generation");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a newly appearing empty assistant identity counts as initial progress; text still completes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-grace-empty-progress-"));
+  try {
+    // Spinner for two polls, then the assistant message mounts empty (no
+    // text, no busy marker). Its appearance must refresh the heartbeat once
+    // so the turn survives the following quiet poll (600ms gap vs a 700ms
+    // stall timeout — without that single touch the turn stalls at 850ms
+    // since the last busy poll) and completes once the reply streams.
+    const cfg = baseConfig(dir, { stallTimeoutMs: 700, turnTimeoutMs: 20_000 });
+    const emptyShell = (): Frame => ({ state: domState({ responseIdentities: ["r1"] }) });
+    const emitted: string[] = [];
+    const h = makeWatch(
+      cfg,
+      [spinner(), spinner(), emptyShell(), emptyShell(), completedFrame("r1", "Slow start recovered"), completedFrame("r1", "Slow start recovered"), completedFrame("r1", "Slow start recovered"), completedFrame("r1", "Slow start recovered"), completedFrame("r1", "Slow start recovered"), completedFrame("r1", "Slow start recovered")],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.match(outcome.markdown ?? "", /Slow start recovered/);
+    assert.equal(h.controller.state, "completed");
+    assert.deepEqual(emitted, ["Slow start recovered"]);
+    assert.equal(h.stopClickCount(), 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("busy browser state does not falsely stall without harness activity", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-grace-browser-busy-"));
   try {
