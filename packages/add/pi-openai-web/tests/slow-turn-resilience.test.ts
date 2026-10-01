@@ -98,7 +98,7 @@ function checksum(text: string): number {
 /**
  * Fake CDP client serving one scripted DOM frame per watch poll. The last frame
  * repeats forever. Discriminates the evaluate sites used by watch():
- * readTurnState, the cheap revision probe, serializeAssistantTurn, stopGeneration.
+ * readTurnState, the cheap revision probe, the atomic turn capture, stopGeneration.
  */
 function fakeClient(frames: Frame[]) {
   if (frames.length === 0) throw new Error("script needs at least one frame");
@@ -114,7 +114,10 @@ function fakeClient(frames: Frame[]) {
         if (expression.includes("piRevisionProbe")) {
           if (current.tree === undefined || current.tree === null) return { result: { value: null } };
           const json = JSON.stringify(current.tree);
-          return { result: { value: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" } } };
+          return { result: { value: {
+            textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "",
+            completionVisible: current.state.completionActionVisible, busy: current.state.busy
+          } } };
         }
         if (expression.includes("piAtomicTurnCapture")) {
           if (current.tree === undefined || current.tree === null) return { result: { value: null } };
