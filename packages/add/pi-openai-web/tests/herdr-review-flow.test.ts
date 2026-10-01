@@ -336,6 +336,7 @@ test("herdr plan/run expose graph and compact planning authorities", async () =>
   assert.equal(shape.execution_spec, undefined);
   assert.ok(shape.decision_graph, "decision_graph must remain available");
   assert.ok(shape.compact_plan, "compact_plan must be available");
+  assert.ok(shape.standard_plan, "standard_plan must be available");
   await assert.rejects(
     herdr.handler({ action: "plan", goal: "ship", workers: [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }], gates: planGates }),
     /decision_graph/
@@ -766,7 +767,7 @@ async function planV2Envelope(herdr: RegisteredTool["handler"], workerId = "w1")
   return planned.handoff as string;
 }
 
-test("v2 low plans and runs without gates; graph and v1 still require gates", async () => {
+test("v2 low plans and runs without gates; v2 medium design-graph plans without gates too; v1 still requires gates", async () => {
   const harness = loopHarness(completedHerdrRun());
   const requests: any[] = [];
   const herdr = (await registeredHerdrToolsFor({ ...harness.mcpSubagent, run: async (request: any) => {
@@ -778,8 +779,20 @@ test("v2 low plans and runs without gates; graph and v1 still require gates", as
   const result = parseToolText(await herdr.handler({ action: "run", goal: "ship v2", workers, compact_plan: v2CompactPlan, risk: "low", planning_kind: "compact", handoff }));
   assert.equal(result.ok, true);
   assert.equal(requests[0].handoff, handoff);
-  await assert.rejects(herdr.handler({ action: "plan", goal: "ship", workers, risk: "medium", planning_kind: "design-graph", decision_graph: Object.fromEntries(["problem", "shapes", "graph", "cardinality", "boundaries", "behavior", "scope", "verification", "critique"].map((key) => [key, "required"])) }), /orchestration_gate_required/);
+  // Gates are optional at every v2 risk: medium design-graph plans cleanly without gates now.
+  const mediumGraph = parseToolText(await herdr.handler({
+    action: "plan",
+    goal: "ship medium",
+    workers,
+    risk: "medium",
+    planning_kind: "design-graph",
+    decision_graph: Object.fromEntries(["problem", "shapes", "graph", "cardinality", "boundaries", "behavior", "scope", "verification", "critique"].map((key) => [key, "required"]))
+  }));
+  assert.equal(mediumGraph.ok, true);
+  assert.equal(JSON.parse(mediumGraph.handoff).gates, undefined);
+  // v1 keeps requiring gates unconditionally.
   await assert.rejects(herdr.handler({ action: "plan", goal: "ship", workers, execution_spec: { suite: "focused" } }), /planning gates/);
+  // Supplied v2 gates must still validate when present.
   await assert.rejects(herdr.handler({ action: "plan", goal: "ship v2", workers, compact_plan: v2CompactPlan, risk: "low", planning_kind: "compact", gates: { graph: "", handoff: "brief", critique: "review" } }), /orchestration_gate_required/);
 });
 
@@ -808,16 +821,99 @@ test("v2 low cannot bypass binding when read-only inspection is unavailable", as
   assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
 });
 
-test("v2 medium/high still require fresh verification fingerprints", async () => {
+test("v2 medium/high design-graph still require fresh verification fingerprints", async () => {
   const graph = Object.fromEntries(["problem", "shapes", "graph", "cardinality", "boundaries", "behavior", "scope", "verification", "critique"].map((key) => [key, "reviewed"]));
   for (const risk of ["medium", "high"] as const) {
     const harness = loopHarness(completedHerdrRun());
     const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+    // Legacy medium (and current high) design-graph envelopes WITH gates stay strict.
     const envelope = issueHerdrHandoffV2("ship", [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }], { graph: "graph", handoff: "brief", critique: "reviewed" }, risk, "design-graph", { decisionGraph: graph });
     harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
     await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }), /verification_fingerprint/);
     assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+    // Gate-less high design-graph envelopes (the new shape) are equally strict.
+    const gateless = issueHerdrHandoffV2("ship", [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }], undefined, risk, "design-graph", { decisionGraph: graph });
+    harness.setRun(verifyRunFor(gateless, "w1", "ship", "src/**"));
+    await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: gateless }), /verification_fingerprint/);
+    assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
   }
+});
+
+// --- Medium-risk standard plans: bound-handoff accept without a fingerprint ---
+
+const v2StandardPlan = {
+  problem: "extend the provider turn lifecycle with a settle step",
+  scope: "src/provider/turn.ts and its focused test only",
+  boundaries: "turn.ts only; runtime and page modules stay untouched",
+  behavior: "settled turns finalize exactly once and late events are ignored",
+  verification: "focused turn tests stay green"
+};
+
+/** Plan a v2 medium standard envelope through the real herdr handler. */
+async function planV2StandardEnvelope(herdr: RegisteredTool["handler"], workerId = "w1"): Promise<string> {
+  const planned = parseToolText(await herdr({
+    action: "plan",
+    goal: "ship standard",
+    workers: [{ id: workerId, objective: "ship", owns: ["src/**"], depends_on: [] }],
+    standard_plan: v2StandardPlan,
+    risk: "medium",
+    planning_kind: "standard"
+  }));
+  assert.equal(planned.ok, true);
+  return planned.handoff as string;
+}
+
+test("v2 medium standard accepts with the bound handoff and no fingerprint", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planV2StandardEnvelope(herdr.handler);
+  assert.equal(JSON.parse(envelope).gates, undefined, "medium standard planning carries no gate strings");
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  // No handoff at all still fails closed.
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1" }), /exact Pi-issued handoff/);
+  // A handoff from a different plan cannot authorize this run's worker.
+  const other = await planV2StandardEnvelope(herdr.handler);
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: other }), /herdr_verify_prompt_mismatch/);
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "other", handoff: envelope }), /worker is not authorized/);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+  // Bound handoff + diff review: accept succeeds without any fingerprint.
+  const accepted = parseToolText(await herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }));
+  assert.equal(accepted.ok, true);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 1);
+});
+
+test("v2 medium standard cannot bypass binding when read-only inspection is unavailable", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const { inspect: _inspect, ...withoutInspect } = harness.mcpSubagent;
+  const herdr = (await registeredHerdrToolsFor(withoutInspect))[0]!;
+  const envelope = await planV2StandardEnvelope(herdr.handler);
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope }), /herdr_verify_unavailable/);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+});
+
+test("v2 medium standard checks explicitly supplied fingerprints instead of ignoring them", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.adapter))[0]!;
+  const envelope = await planV2StandardEnvelope(herdr.handler);
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  await assert.rejects(herdr.handler({ action: "accept", run_id: "run-1", worker_id: "w1", handoff: envelope, verification_fingerprint: "0".repeat(64) }), /fingerprint mismatch/);
+  assert.equal(harness.calls.filter((call) => call.method === "accept").length, 0);
+});
+
+test("v2 medium standard runs and verifies through the same deterministic binding as every plan", async () => {
+  const harness = loopHarness(completedHerdrRun());
+  const herdr = (await registeredHerdrToolsFor(harness.mcpSubagent))[0]!;
+  const envelope = await planV2StandardEnvelope(herdr.handler);
+  assert.equal(JSON.parse(envelope).protocol, "pi-provider-herdr-handoff-v2");
+  harness.setRun(verifyRunFor(envelope, "w1", "ship", "src/**"));
+  const result = parseToolText(await herdr.handler({ action: "verify", run_id: "run-1", handoff: envelope }));
+  assert.equal(result.action, "verify");
+  assert.deepEqual(Object.keys(result.report), ["spec", "design", "quality", "evidence"]);
+  assert.equal(result.report.spec.gates, undefined);
+  // The compiled standard authority is reported verbatim and never reaches the worker prompt.
+  const slice: WorkerSlice = { id: "w1", objective: "ship", owns: ["src/**"], dependsOn: [] };
+  const prompt = buildWorkerTask(slice, envelope);
+  assert.ok(!prompt.includes("extend the provider turn lifecycle"), "standard-plan content never reaches the worker");
 });
 
 test("v2 low checks explicitly supplied fingerprints instead of ignoring them", async () => {

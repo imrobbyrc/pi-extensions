@@ -8,9 +8,10 @@ One product, no planner:
 Pi user → /model openai-web/<id>  (always-on Lead Architect)
 Lead turn → strict MCP allowlist (7 read-only tools, including optional root `CONTEXT.md`, + `herdr`)
 Lead → MCP herdr → `@imrobbyrc/pi-core-subagent` API → Herdr run (1–4 Pi workers, DAG + owns scopes)
+Lead plans by risk: low=compact_plan, medium=standard_plan, high=design-graph; v2 gates optional
 Pi TUI → explicit confirmation → Herdr panes start (kind=pi)
 Lead → git_status/git_diff → herdr status / correct
-Low v2 → accept with bound handoff; medium/high/v1 → verify → accept with fresh fingerprint
+Low compact/medium standard v2 → accept with bound handoff; high & medium design-graph/v1 → verify → accept with fresh fingerprint
 Pi → package controller reaps panes on accept/stop; package state persists in its configured Pi agent state.
 ```
 
@@ -39,4 +40,4 @@ npm run typecheck
 npm test
 ```
 
-Use current package test counts from the commands, not historical totals. For live checks, run `npm run doctor`, then confirm low compact plan→run→diff→accept, medium graph→verify→accept, two independent workers with concurrency=1, and correction→fresh verify→accept. Live runs require browser login, tunnel, Herdr server, and user confirmation.
+Use current package test counts from the commands, not historical totals. For live checks, run `npm run doctor`, then confirm low compact plan→run→diff→accept, medium standard plan→run→diff→accept (no fingerprint), high graph→verify→accept, two independent workers with concurrency=1, and correction→fresh verify→accept. Live runs require browser login, tunnel, Herdr server, and user confirmation.

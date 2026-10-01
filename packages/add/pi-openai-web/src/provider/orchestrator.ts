@@ -25,9 +25,9 @@ export interface OrchestratorConfig {
 export type WorkflowToggleId = "adaptivePlanning" | "adaptiveWorkerEffort" | "verificationGate" | "reviewLoop";
 export const WORKFLOW_TOGGLE_IDS: readonly WorkflowToggleId[] = ["adaptivePlanning", "adaptiveWorkerEffort", "verificationGate", "reviewLoop"];
 export const WORKFLOW_TOGGLE_META: Record<WorkflowToggleId, { label: string; short: string; description: string }> = {
-  adaptivePlanning: { label: "Workflow: Adaptive Planning", short: "planning", description: "Risk-based planning depth: compact for low risk, full Design Graph otherwise." },
-  adaptiveWorkerEffort: { label: "Workflow: Adaptive Worker Effort", short: "effort", description: "Per-run worker_thinking follows assessed risk (low→low, medium/high→high)." },
-  verificationGate: { label: "Workflow: Verification Gate", short: "verification", description: "Accept requires a fresh verify fingerprint bound to the exact handoff." },
+  adaptivePlanning: { label: "Workflow: Adaptive Planning", short: "planning", description: "Risk-based planning depth: compact for low risk, standard for medium, full Design Graph for high risk." },
+  adaptiveWorkerEffort: { label: "Workflow: Adaptive Worker Effort", short: "effort", description: "Per-run worker_thinking follows assessed risk (low→low, medium→medium, high→high)." },
+  verificationGate: { label: "Workflow: Verification Gate", short: "verification", description: "Accept needs the exact handoff: low compact/medium standard accept on diff review, the rest need a fresh verify fingerprint." },
   reviewLoop: { label: "Workflow: Review Loop", short: "review", description: "Completed workers stay live in their panes for correct/accept review." }
 };
 
@@ -357,11 +357,11 @@ export interface DecisionGraph {
 /** Shared bound for every decision_graph axis; equal to the spec value bound so the compiled form is always a valid ExecutionSpec. */
 export const DECISION_GRAPH_VALUE_MAX = EXECUTION_SPEC_VALUE_MAX;
 
-/** decision_graph and direct execution_spec describe the same spec slot — supplying both is ambiguous and fails closed. P1: the compact plan is a third source of the same slot and joins the exclusivity check. */
-export function assertSpecSourceExclusive(executionSpec: unknown, decisionGraph: unknown, compactPlan?: unknown): void {
-  const sources = [executionSpec !== undefined, decisionGraph !== undefined, compactPlan !== undefined].filter(Boolean).length;
+/** decision_graph, execution_spec, compact_plan, and standard_plan describe the same spec slot — supplying more than one is ambiguous and fails closed. */
+export function assertSpecSourceExclusive(executionSpec: unknown, decisionGraph: unknown, compactPlan?: unknown, standardPlan?: unknown): void {
+  const sources = [executionSpec !== undefined, decisionGraph !== undefined, compactPlan !== undefined, standardPlan !== undefined].filter(Boolean).length;
   if (sources > 1) {
-    throw new Error("decision_graph_exclusive: provide only one of decision_graph, execution_spec, or compact_plan");
+    throw new Error("decision_graph_exclusive: provide only one of decision_graph, execution_spec, compact_plan, or standard_plan");
   }
 }
 
@@ -470,7 +470,8 @@ export function parseHerdrHandoff(text: string): ParsedHerdrHandoff {
       throw new Error("handoff_version_invalid: a v1 handoff envelope cannot carry risk-aware planning fields");
     }
     const gates = value.gates as OrchestrationGates | undefined;
-    if (!isV2 || risk !== "low" || gates !== undefined) assertOrchestrationGates(gates);
+    // v2 gates are optional at every risk (supplied gates still validate); v1 keeps requiring them.
+    if (!isV2 || gates !== undefined) assertOrchestrationGates(gates);
     const executionSpec = assertExecutionSpec(value.executionSpec);
     const workers = (value.workers as unknown[]).map((worker) => assertWorkerSlice(worker));
     // Fail closed at parse time: a tampered envelope whose workers no longer
@@ -488,22 +489,20 @@ export function parseHerdrHandoff(text: string): ParsedHerdrHandoff {
       ...(planningKind !== undefined ? { planningKind } : {})
     };
   } catch (error) {
-    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid") || error.message.startsWith("work_graph_invalid") || error.message.startsWith("risk_level_invalid") || error.message.startsWith("planning_kind_invalid") || error.message.startsWith("handoff_version_invalid") || error.message.startsWith("handoff_planning_mismatch"))) throw error;
+    if (error instanceof Error && (error.message.startsWith("orchestration_gate_required") || error.message.startsWith("execution_spec_invalid") || error.message.startsWith("worker_slice_invalid") || error.message.startsWith("work_graph_invalid") || error.message.startsWith("risk_level_invalid") || error.message.startsWith("planning_kind_invalid") || error.message.startsWith("handoff_version_invalid") || error.message.startsWith("handoff_planning_mismatch") || error.message.startsWith("compact_plan_invalid") || error.message.startsWith("standard_plan_invalid"))) throw error;
     throw new Error("orchestration_handoff_invalid: expected Pi-issued handoff envelope");
   }
 }
 
-// --- P1 planning foundation: bounded RiskLevel, CompactPlan authority, and risk-aware v2 handoffs ---
+// --- Risk-aware v2 planning: RiskLevel, compact/standard/design-graph authorities, and v2 handoffs ---
 //
-// Compatibility-only slice. CompactPlan is the explicit low-risk planning
-// authority: it compiles deterministically into the SAME ExecutionSpec path
-// decision graphs use (no fabricated shapes/graph/cardinality/boundaries or
-// critique axes — exactly four bounded fields). v2 handoffs bind risk +
-// planning kind into the immutable plan identity while v1 issuance, parsing,
-// and run validation stay byte-stable. Nothing here changes Lead runtime
-// behavior: buildLeadContract and the herdr tool description are untouched,
-// so compact planning is not yet activated — only issuable, parseable, and
-// validatable.
+// Planning authority slice. CompactPlan (low risk) and StandardPlan (medium
+// risk) compile deterministically into the SAME ExecutionSpec path decision
+// graphs use — no fabricated shapes/graph/cardinality or critique axes — while
+// the full nine-axis DecisionGraph remains the high-risk authority. v2 handoffs
+// bind risk + planning kind into the immutable plan identity; v1 issuance,
+// parsing, and run validation stay byte-stable. Gates are optional at every v2
+// risk (supplied gates still validate); v1 keeps requiring them.
 
 /** Bounded risk levels for planning depth; the v2 identity binds the assessed level verbatim. */
 export const RISK_LEVELS = ["low", "medium", "high"] as const;
@@ -516,8 +515,8 @@ export function assertRiskLevel(risk: unknown): RiskLevel {
   return risk as RiskLevel;
 }
 
-/** Bounded planning kinds: the compact low-risk plan or the full Design Graph. */
-export const PLANNING_KINDS = ["compact", "design-graph"] as const;
+/** Bounded planning kinds: the compact low-risk plan, the standard medium-risk plan, or the full Design Graph. */
+export const PLANNING_KINDS = ["compact", "standard", "design-graph"] as const;
 export type PlanningKind = (typeof PLANNING_KINDS)[number];
 
 export function assertPlanningKind(kind: unknown): PlanningKind {
@@ -527,10 +526,14 @@ export function assertPlanningKind(kind: unknown): PlanningKind {
   return kind as PlanningKind;
 }
 
-/** v2 planning depth is fixed by risk; no compact authority for medium/high risk. */
+/** v2 planning depth is fixed by risk: low→compact only, medium→standard (new guidance) or design-graph (legacy plans stay valid), high→design-graph only. */
 export function assertRiskPlanningPair(risk: RiskLevel, kind: PlanningKind): void {
-  if ((risk === "low") !== (kind === "compact")) {
-    throw new Error("handoff_planning_mismatch: low risk requires compact; medium/high risk require design-graph");
+  const pairValid =
+    (risk === "low" && kind === "compact")
+    || (risk === "medium" && (kind === "standard" || kind === "design-graph"))
+    || (risk === "high" && kind === "design-graph");
+  if (!pairValid) {
+    throw new Error("handoff_planning_mismatch: low risk requires compact; medium risk requires standard or design-graph; high risk requires design-graph");
   }
 }
 
@@ -585,6 +588,59 @@ export function compileCompactPlan(plan: CompactPlan): ExecutionSpec {
 }
 
 /**
+ * Medium-risk planning authority: exactly these five bounded non-blank fields,
+ * no more, no less. Extra keys are rejected so a standard plan can never
+ * silently grow Design Graph axes — escalation means re-planning with
+ * decision_graph. `boundaries` is the only axis beyond the compact four;
+ * trust/failure boundaries are the medium-risk addition, shapes/cardinality/
+ * graph/critique stay high-risk-only.
+ */
+export const STANDARD_PLAN_FIELDS = ["problem", "scope", "boundaries", "behavior", "verification"] as const;
+export type StandardPlanField = (typeof STANDARD_PLAN_FIELDS)[number];
+
+export interface StandardPlan {
+  problem: string;
+  scope: string;
+  boundaries: string;
+  behavior: string;
+  verification: string;
+}
+
+/** Shared bound for every standard_plan field; equal to the spec value bound so the compiled form is always a valid ExecutionSpec. */
+export const STANDARD_PLAN_VALUE_MAX = EXECUTION_SPEC_VALUE_MAX;
+
+/** Validate a standard plan: exactly five required, bounded, non-blank string fields; throws standard_plan_invalid on any shape drift. */
+export function assertStandardPlan(plan: unknown): StandardPlan {
+  if (typeof plan !== "object" || plan === null || Array.isArray(plan)) {
+    throw new Error(`standard_plan_invalid: expected an object with exactly five fields: ${STANDARD_PLAN_FIELDS.join(", ")}`);
+  }
+  const record = plan as Record<string, unknown>;
+  const extra = Object.keys(record).filter((key) => !(STANDARD_PLAN_FIELDS as readonly string[]).includes(key));
+  if (extra.length > 0) throw new Error(`standard_plan_invalid: unknown field ${JSON.stringify(extra[0])}; exactly five fields are allowed: ${STANDARD_PLAN_FIELDS.join(", ")}`);
+  const normalized = {} as StandardPlan;
+  for (const field of STANDARD_PLAN_FIELDS) {
+    const value = record[field];
+    if (typeof value !== "string" || !value.trim()) throw new Error(`standard_plan_invalid: ${field} is required and must be a non-blank string`);
+    if (value.length > STANDARD_PLAN_VALUE_MAX) throw new Error(`standard_plan_invalid: ${field} must be at most ${STANDARD_PLAN_VALUE_MAX} characters`);
+    normalized[field] = value;
+  }
+  return normalized;
+}
+
+/**
+ * Mechanical compile of the standard plan: the exact five fields map verbatim
+ * onto the existing ExecutionSpec authority path — one `standard.<field>` entry
+ * per field, fixed field order, values untouched. Same guarantees as the
+ * compact compile: no re-reasoning, no invented axes, field key order never
+ * matters, and the compiled spec is the single bound authority.
+ */
+export function compileStandardPlan(plan: StandardPlan): ExecutionSpec {
+  const spec: ExecutionSpec = {};
+  for (const field of STANDARD_PLAN_FIELDS) spec[`standard.${field}`] = plan[field];
+  return spec;
+}
+
+/**
  * Stable v2 fingerprint: the v1 goal + workers + spec identity extended with
  * the risk-aware planning kind and level. Changing any identity ingredient —
  * goal, workers, bound spec, compact-plan content, risk level, or planning
@@ -595,10 +651,10 @@ export function planFingerprintV2(goal: string, workers: unknown[], executionSpe
   return createHash("sha256").update(`${goal}\n${canonicalWorkers(workers)}\n${spec}\nv2\nrisk=${risk}\nplanningKind=${planningKind}`).digest("hex").slice(0, 32);
 }
 
-/** Build an explicit v2 (risk-aware) handoff envelope: the v1 shape plus risk and planningKind, both bound into the plan fingerprint. */
+/** Build an explicit v2 (risk-aware) handoff envelope: the v1 shape plus risk and planningKind, both bound into the plan fingerprint. Gates are optional at every risk; supplied gates must still validate. */
 export function buildHerdrHandoffV2(input: { taskId: string; planFingerprint: string; gates?: OrchestrationGates; workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>; executionSpec?: ExecutionSpec; risk: RiskLevel; planningKind: PlanningKind }): string {
   assertRiskPlanningPair(assertRiskLevel(input.risk), assertPlanningKind(input.planningKind));
-  if (input.risk !== "low" || input.gates !== undefined) assertOrchestrationGates(input.gates);
+  if (input.gates !== undefined) assertOrchestrationGates(input.gates);
   if (!input.taskId.trim() || !input.planFingerprint.trim() || !input.workers.length) throw new Error("orchestration_handoff_invalid: task, plan fingerprint, and workers are required");
   const executionSpec = assertExecutionSpec(input.executionSpec);
   const workers = input.workers.map((worker) => assertWorkerSlice(worker));
@@ -607,20 +663,21 @@ export function buildHerdrHandoffV2(input: { taskId: string; planFingerprint: st
 }
 
 /**
- * P1 issuance for risk-aware planning: the compact plan (or full decision
- * graph) compiles into the ExecutionSpec authority BEFORE planFingerprint and
- * handoff issuance, and risk + planning kind join the immutable plan identity.
+ * v2 issuance for risk-aware planning: the compact plan, standard plan, or full
+ * decision graph compiles into the ExecutionSpec authority BEFORE planFingerprint
+ * and handoff issuance, and risk + planning kind join the immutable plan identity.
  * The planning kind must structurally match the supplied authority; the whole
  * work-graph validation applies identically to v2.
  */
-export function issueHerdrHandoffV2(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>, gates: OrchestrationGates | undefined, risk: unknown, planningKind: unknown, planning: { compactPlan?: unknown; decisionGraph?: unknown } = {}): string {
+export function issueHerdrHandoffV2(goal: string, workers: Array<{ id: string; objective: string; owns: string[]; dependsOn?: string[]; depends_on?: string[]; requirements?: string[]; behaviors?: string[]; seams?: string[]; acceptance?: string[] }>, gates: OrchestrationGates | undefined, risk: unknown, planningKind: unknown, planning: { compactPlan?: unknown; standardPlan?: unknown; decisionGraph?: unknown } = {}): string {
   const level = assertRiskLevel(risk);
   const kind = assertPlanningKind(planningKind);
   assertRiskPlanningPair(level, kind);
-  assertSpecSourceExclusive(undefined, planning.decisionGraph, planning.compactPlan);
+  assertSpecSourceExclusive(undefined, planning.decisionGraph, planning.compactPlan, planning.standardPlan);
   if (kind === "compact" && planning.compactPlan === undefined) throw new Error("handoff_planning_mismatch: planning_kind=compact requires a compact_plan");
+  if (kind === "standard" && planning.standardPlan === undefined) throw new Error("handoff_planning_mismatch: planning_kind=standard requires a standard_plan");
   if (kind === "design-graph" && planning.decisionGraph === undefined) throw new Error("handoff_planning_mismatch: planning_kind=design-graph requires a decision_graph");
-  const spec = kind === "compact" ? compileCompactPlan(assertCompactPlan(planning.compactPlan)) : compileDecisionGraph(assertDecisionGraph(planning.decisionGraph));
+  const spec = kind === "compact" ? compileCompactPlan(assertCompactPlan(planning.compactPlan)) : kind === "standard" ? compileStandardPlan(assertStandardPlan(planning.standardPlan)) : compileDecisionGraph(assertDecisionGraph(planning.decisionGraph));
   const slices = workers.map((worker) => assertWorkerSlice(worker));
   // Whole-graph validation at the issuance boundary: identical to v1.
   assertWorkGraph(slices);
@@ -843,14 +900,14 @@ export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
 export function buildLeadProtocolReminder(config: OrchestratorConfig | undefined): string {
   const wf = resolveWorkflowToggles(config);
   const planning = wf.adaptivePlanning
-    ? "low=compact_plan without gates; medium/high=decision_graph with gates"
-    : "planning toggle off=decision_graph with gates for every risk";
+    ? "low=compact_plan, medium=standard_plan, high=decision_graph; no gates"
+    : "planning toggle off=decision_graph for every medium/high risk";
   const effort = wf.adaptiveWorkerEffort
-    ? "worker_thinking=low for low risk, high for medium/high"
+    ? "worker_thinking matches risk: low→low, medium→medium, high→high"
     : "worker_thinking=configured default";
   const review = wf.reviewLoop ? "review diff" : "review loop off=inspect diff before reporting";
   const accept = wf.verificationGate
-    ? "low=bound handoff then accept, medium/high/v1=verify then accept with fresh fingerprint"
+    ? "low compact/medium standard=bound handoff then accept; high/v1/medium design-graph=verify then accept with fresh fingerprint"
     : "verification gate off=accept with run_id+worker_id after diff review";
   return `[LEAD-PROTOCOL: ${planning}; one worker unless independent scopes justify more; ${effort}; only explicit user effort wins; escalate, never downgrade; ${review}; ${accept}]`;
 }
@@ -868,19 +925,19 @@ export function buildLeadContract(config: OrchestratorConfig | undefined, appNam
     "Use read_context once when project guidance is needed. Answer directly when no mutation or tool is needed.",
     "Default to one worker. Split only genuinely independent owned paths without duplicated discovery; aggressive favors useful splits, adaptive favors one. Never split to consume capacity.",
     wf.adaptivePlanning
-      ? "Plan at the lightest justified risk: Low risk (localized docs/config/single-file) uses risk=low, planning_kind=compact, compact_plan {problem, scope, behavior, verification} without gates. Medium risk (multi-surface behavior) and High risk (auth/security, migration, concurrency, data integrity, lifecycle) use risk=medium|high, planning_kind=design-graph, decision_graph {problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique} plus gates {graph, handoff, critique}. High risk needs wider tests and failure/boundary analysis."
-      : "Adaptive planning disabled: use risk=medium|high, planning_kind=design-graph, full decision_graph and gates {graph, handoff, critique} for every task.",
+      ? "Plan at the lightest justified risk: Low risk (localized docs/config/single-file) uses risk=low, planning_kind=compact, compact_plan {problem, scope, behavior, verification}. Medium risk (multi-surface behavior) uses risk=medium, planning_kind=standard, standard_plan {problem, scope, boundaries, behavior, verification}; a medium decision_graph plan already issued stays valid. High risk (auth/security, migration, concurrency, data integrity, lifecycle) uses risk=high, planning_kind=design-graph, decision_graph {problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique}. Never add separate graph/handoff/critique gates to v2 plans. High risk needs wider tests and failure/boundary analysis."
+      : "Adaptive planning disabled: use planning_kind=design-graph with the full decision_graph for medium/high risk (low stays compact); never add separate graph/handoff/critique gates to v2 plans.",
     "For plan, send goal and 1–4 worker slices (id, objective, owns, depends_on; optional requirements, behaviors, seams, acceptance). Worker slices must trace to the plan; workers cannot invent requirements. Pi enforces a legal work graph (unique ids, valid dependencies, no cycles or unordered overlapping ownership). Use the issued handoff verbatim; never create one yourself. For run, repeat exact goal, workers, planning authority, risk and planning_kind with handoff. Pi validates binding and requests user confirmation before workers start.",
     wf.adaptiveWorkerEffort
-      ? "For run, set worker_thinking=low for low risk, high for medium/high. The configured profile is only the default fallback, not a per-task override: only an explicit user effort request for the current task overrides this mapping; never rewrite the persisted thinking profile."
+      ? "For run, set worker_thinking to the assessed risk: low for low, medium for medium, high for high. The configured profile is only the default fallback, not a per-task override: only an explicit user effort request for the current task overrides this mapping; never rewrite the persisted thinking profile."
       : "Adaptive worker effort disabled: omit worker_thinking; use the configured default profile. Only an explicit user effort request for the current task overrides it; never rewrite the persisted thinking profile.",
     wf.reviewLoop
       ? "Use status to check workers; a pane marked idle or a notify_parent message does not prove the task is completed. If status still says running, report settlement pending and recheck rather than claiming the worker is actively working. Never stop a running worker solely because lastActivity is unchanged; wait for terminal status or an explicit error, user cancellation, or runtime timeout. Review completed workers in their panes; correct reuses the same worker session. Accept or stop each worker to release its pane."
       : "Review loop disabled: completed worker panes release automatically. Inspect status and diff before reporting.",
     wf.verificationGate
-      ? "Inspect git_status/git_diff and focused evidence before accepting v2 low risk with its bound handoff; no fingerprint needed. For medium/high and v1, use verify then accept with the fresh verification_fingerprint and exact handoff. Supplied low-risk fingerprints are checked too. Verify is observational, not a quality verdict."
+      ? "Inspect git_status/git_diff and focused evidence before accepting v2 low compact or v2 medium standard plans with their bound handoff; no fingerprint needed. For v2 high design-graph, medium design-graph (including already-issued plans), and v1, use verify then accept with the fresh verification_fingerprint and exact handoff. Supplied fingerprints are checked too. Verify is observational, not a quality verdict."
       : "Verification gate disabled: accept needs run_id and worker_id; still inspect the diff and review semantically.",
-    "Escalate and re-plan when new evidence increases risk; never downgrade an in-flight plan to bypass review. For medium/high, inspect failures, trust boundaries, and critique evidence. Report only reviewed results."
+    "Escalate and re-plan when new evidence increases risk; never downgrade an in-flight plan to bypass review. For high risk, inspect failures, trust boundaries, and failure/boundary analysis. Report only reviewed results."
   ].join("\n");
 }
 
@@ -997,7 +1054,7 @@ export function formatOrchestratorBox(state: OrchestratorState): string {
     `│ Scope             ${scopeStr.padEnd(37)}│`,
     ...(state.sourcePath ? [`│ Path              ${state.sourcePath.slice(-35).padStart(37)}│`] : []),
     ...formatOrchestratorBoxNote(
-      "Thinking profile is the default fallback, not the per-run effort: adaptive runs pick worker effort per run unless the user explicitly sets one."
+      "Thinking profile is the default fallback, not the per-run effort: adaptive runs set per-run effort to the assessed risk (low→low, medium→medium, high→high) unless the user explicitly sets one."
     ),
     "└────────────────────────────────────────────────────────┘"
   ];

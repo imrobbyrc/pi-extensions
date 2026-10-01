@@ -7,16 +7,51 @@
 > + Herdr-managed Pi workers only. ADR-004, ADR-006,
 > ADR-008, ADR-009, ADR-010, ADR-011, ADR-013, and ADR-015 describe that removed
 > architecture and are **superseded**; they are retained below, clearly labeled, as
-> decision history only. Current risk-aware policy lives in ADR-018; harness boundaries remain in ADR-016 and the still-valid ADRs
+> decision history only. Current risk-aware policy lives in ADR-019; harness boundaries remain in ADR-016 and the still-valid ADRs
 > (001, 002, 003, 005, 007, 012, 014, with their planner-era clauses void).
+
+## ADR-019 — Standard medium-risk planning and optional v2 gates
+
+Decision: medium-risk v2 work uses the new `planning_kind=standard` with a five-field
+`standard_plan` (problem, scope, boundaries, behavior, verification) compiled
+mechanically into the existing ExecutionSpec/fingerprint path (`standard.<field>`
+entries). Risk/planning compatibility is exact: low→compact only; medium→standard
+for new guidance while legacy medium→design-graph envelopes stay valid; high→
+design-graph only. Every planning authority (execution_spec, decision_graph,
+compact_plan, standard_plan) remains mutually exclusive — mixed sources fail closed.
+
+Gates become optional at every v2 risk. A v2 plan's authority (compact, standard, or
+graph) already binds the plan identity, so duplicate graph/handoff/critique gate
+strings add no enforcement; supplied gates still validate, and new v2 Lead guidance
+never asks for them. v1 envelopes keep requiring gates unchanged.
+
+With the verification gate on, v2 low compact and v2 medium standard accept after
+semantic diff review using the exact handoff bound to the observed run and worker
+prompts, without a fingerprint. v1, v2 high design-graph, and legacy/current v2
+medium design-graph keep requiring a fresh verify fingerprint; any supplied
+fingerprint remains freshness-checked. This avoids silently relaxing acceptance for
+already-issued strict medium plans.
+
+Adaptive worker effort maps risk to effort exactly: low→low, medium→medium, high→high.
+The configured `workerThinking` remains only the fallback; an explicit user effort
+request for the current task is the sole override. Human run confirmation, worker
+prompt projection, work-graph/ownership validation, correction semantics, review
+loop lifecycle, worker count limits, and the verification report structure are
+unchanged. ADR-018's compatibility facts survive; its medium/high gate requirement
+is superseded by this ADR.
 
 ## ADR-018 — Risk-aware planning and review
 
-Decision: v2 low-risk work uses `compact_plan` (problem, scope, behavior, verification) without planning gates. v2 medium/high uses the nine-axis `decision_graph` and gates. Risk and planning kind are fingerprint-bound, must match each other, and cannot change at run time. Existing v1 handoffs remain strict; existing v2 low handoffs with valid gates remain readable. The Lead assesses semantic risk; a fingerprint binds its choice but does not prove it correct.
+Decision (amended by ADR-019): v2 low-risk work uses `compact_plan` (problem, scope,
+behavior, verification) without planning gates. v2 medium/high uses the nine-axis
+`decision_graph` and gates. Risk and planning kind are fingerprint-bound, must match
+each other, and cannot change at run time. Existing v1 handoffs remain strict;
+existing v2 low handoffs with valid gates remain readable. The Lead assesses semantic
+risk; a fingerprint binds its choice but does not prove it correct.
 
 One worker is the default. `adaptive` prefers one; `aggressive` favors splits only when owned paths are independent and parallelism helps. Work graphs have 1–4 workers. The lead profile passes its effective 1–4 concurrency limit to the core scheduler; saved 5–8 values load capped at 4 without rewriting them.
 
-With the verification gate on, v2 low `accept` binds the handoff to the observed run and worker prompts without requiring a fingerprint. v1 and v2 medium/high still require `verify` and a fresh fingerprint. A supplied low-risk fingerprint is checked. The Lead reviews the diff in all cases; disabling the gate removes fingerprint enforcement, not semantic review. Worker prompt projection, human confirmation, ownership and core scheduler stay unchanged. The handoff fingerprint is unkeyed binding, not cryptographic proof of issuer identity.
+With the verification gate on, v2 low `accept` binds the handoff to the observed run and worker prompts without requiring a fingerprint. v1 and v2 medium/high still require `verify` and a fresh fingerprint. A supplied low-risk fingerprint is checked. The Lead reviews the diff in all cases; disabling the gate removes fingerprint enforcement, not semantic review. Worker prompt projection, human confirmation, ownership and core scheduler stay unchanged. The handoff fingerprint is unkeyed binding, not cryptographic proof of issuer identity. (ADR-019 extends the bound-handoff accept to v2 medium standard plans and makes v2 gates optional.)
 
 ## ADR-016 — V3: planner removed; one harness, Herdr workers only
 
