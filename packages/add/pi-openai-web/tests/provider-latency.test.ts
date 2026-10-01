@@ -12,6 +12,7 @@ import {
   assistantRevisionRequiresSerialization,
   type AssistantTurnRevision
 } from "../src/provider/page.js";
+import { treeToMarkdown } from "../src/provider/answer.js";
 import {
   pickerTriggerProvesExact,
   selectionIsProvenExact
@@ -101,6 +102,10 @@ interface Frame {
   tree?: unknown;
   /** Overrides the atomic capture's busy/stop flags to simulate probe/capture divergence. */
   captureState?: { busy?: boolean; stopVisible?: boolean };
+  /** Tree served to atomic captures while probes still see `tree` (final-capture drift). */
+  captureTree?: unknown;
+  /** Forced revision fields for probe AND capture; simulates a fingerprint blind to a markup swap. */
+  probeRevision?: Partial<AssistantTurnRevision>;
 }
 
 const spinner = (): Frame => ({ state: domState({ stopVisible: true, busy: true }) });
@@ -119,6 +124,13 @@ function checksum(text: string): number {
   let sum = 0;
   for (let index = 0; index < text.length; index += 1) sum = (Math.imul(31, sum) + text.charCodeAt(index)) | 0;
   return sum;
+}
+
+/** Tag/shape projection of a serialized tree, mirroring the nested structure fingerprint. */
+function tagPath(node: unknown): string {
+  if (typeof node !== "object" || node === null) return "";
+  const entry = node as { tag?: string; children?: unknown[] };
+  return (entry.tag ?? "") + (entry.children ?? []).map(tagPath).join(",");
 }
 
 /**
@@ -148,21 +160,37 @@ function watchClient(frames: Frame[]) {
           if (current.tree === undefined || current.tree === null) return { result: { value: null } };
           const json = JSON.stringify(current.tree);
           return { result: { value: {
-            textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "",
-            completionVisible: current.state.completionActionVisible, busy: current.state.busy
+            textLength: json.length,
+            textChecksum: checksum(json),
+            childCount: 0,
+            linkChecksum: 0,
+            languageKey: "",
+            structureChecksum: checksum(tagPath(current.tree)),
+            ...(current.probeRevision ?? {}),
+            completionVisible: current.state.completionActionVisible,
+            busy: current.state.busy
           } } };
         }
         if (expression.includes("piAtomicTurnCapture")) {
           serializations += 1;
-          if (current.tree === undefined || current.tree === null) return { result: { value: null } };
-          const json = JSON.stringify(current.tree);
+          const tree = current.captureTree ?? current.tree;
+          if (tree === undefined || tree === null) return { result: { value: null } };
+          const json = JSON.stringify(tree);
           return { result: { value: {
             identity: current.state.responseIdentities[0],
             busy: current.captureState?.busy ?? current.state.busy,
             stopVisible: current.captureState?.stopVisible ?? current.state.stopVisible,
             completionVisible: current.state.completionActionVisible,
-            revision: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" },
-            tree: current.tree
+            revision: {
+              textLength: json.length,
+              textChecksum: checksum(json),
+              childCount: 0,
+              linkChecksum: 0,
+              languageKey: "",
+              structureChecksum: checksum(tagPath(tree)),
+              ...(current.probeRevision ?? {})
+            },
+            tree
           } } };
         }
         if (expression.includes("stop-button")) {
@@ -296,6 +324,7 @@ const revision = (over: Partial<AssistantTurnRevision>): AssistantTurnRevision =
   childCount: 2,
   linkChecksum: 0,
   languageKey: "",
+  structureChecksum: 11,
   ...over
 });
 
@@ -311,6 +340,7 @@ test("assistantRevisionRequiresSerialization gates on identity and content revis
   assert.equal(assistantRevisionRequiresSerialization(seen, "r1", revision({ childCount: 5 })), true); // structural change
   assert.equal(assistantRevisionRequiresSerialization(seen, "r1", revision({ linkChecksum: 7 })), true); // link retargeted
   assert.equal(assistantRevisionRequiresSerialization(seen, "r1", revision({ languageKey: "language-ts" })), true); // code language
+  assert.equal(assistantRevisionRequiresSerialization(seen, "r1", revision({ structureChecksum: 99 })), true); // nested markup change, same text
 });
 
 test("unchanged content revision reuses the snapshot; completion still fires", async () => {
@@ -601,6 +631,112 @@ test("busy atomic capture overrides a calm probe: no settle window on divergent 
       `a divergent busy capture must not count toward settling, got ${h.pollCount()} polls`
     );
     assert.equal(h.serializeCount(), 2); // first sight + final atomic verification
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("final capture drift refreshes the cached markdown and restarts the full settle window", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-drift-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 });
+    const emitted: string[] = [];
+    // Same-text markup swap: ChatGPT re-rendered the streamed inline code into
+    // a fenced block between the last probe and the settle window's final
+    // atomic capture. The mismatch must refresh the cached markdown/revision
+    // from the newer capture (streaming it) and restart a full settle window —
+    // never keep comparing against the stale inline cache.
+    const code = 'const replySmoke = "ok";';
+    const inlineTree = { tag: "p", children: [{ tag: "code", text: code, children: [{ tag: "#text", text: code }] }] };
+    const fencedTree = { tag: "pre", children: [{ tag: "code", text: code, children: [{ tag: "#text", text: code }] }] };
+    const completed = (tree: unknown, extra: Partial<Frame> = {}): Frame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
+      tree,
+      ...extra
+    });
+    const h = makeWatchHarness(
+      cfg,
+      [
+        completed(inlineTree),
+        completed(inlineTree),
+        completed(inlineTree),
+        completed(inlineTree, { captureTree: fencedTree }), // drift lands in the final capture
+        completed(fencedTree),
+        completed(fencedTree),
+        completed(fencedTree),
+        completed(fencedTree)
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, treeToMarkdown(fencedTree as never), "completion must carry the fenced markdown");
+    assert.ok(outcome.markdown.includes("```"), "fenced code block expected");
+    assert.deepEqual(emitted, [
+      treeToMarkdown(inlineTree as never),
+      treeToMarkdown(fencedTree as never)
+    ], "drift must stream the refreshed markdown");
+    // First sight, the drifted final capture (whose revision refreshes the
+    // cache), and the final verification. The refreshed cache means the frame
+    // after drift needs NO redundant recapture — a stale cache would reserialize.
+    assert.equal(h.serializeCount(), 3);
+    assert.equal(h.pollCount(), 8);
+    // Completion must follow the drift poll by a full fresh semantic settle window.
+    const driftPoll = h.pollTimestamps[3]!;
+    const last = h.pollTimestamps[h.pollTimestamps.length - 1]!;
+    assert.ok(last - driftPoll >= 1_250, `post-drift settle must span the full window, got ${last - driftPoll}ms`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("drift with a blind fingerprint converges instead of looping on the stale cache", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-drift-blind-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 20_000 });
+    const emitted: string[] = [];
+    // Regression for the real smoke failure shape: the fingerprint (old or
+    // colliding) reports the inline and fenced DOM as the same revision, so
+    // probes keep "confirming" the stale inline cache. Without the drift
+    // refresh the loop reopens windows on stale inline text and mismatches
+    // every final capture forever (hard timeout). The refresh must converge.
+    const code = 'const replySmoke = "ok";';
+    const inlineTree = { tag: "p", children: [{ tag: "code", text: code, children: [{ tag: "#text", text: code }] }] };
+    const fencedTree = { tag: "pre", children: [{ tag: "code", text: code, children: [{ tag: "#text", text: code }] }] };
+    const blindRevision = { textLength: 23, textChecksum: 12345, childCount: 1, linkChecksum: 0, languageKey: "", structureChecksum: 77 };
+    const completed = (tree: unknown, extra: Partial<Frame> = {}): Frame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
+      tree,
+      probeRevision: blindRevision,
+      ...extra
+    });
+    const h = makeWatchHarness(
+      cfg,
+      [
+        completed(inlineTree),
+        completed(inlineTree),
+        completed(inlineTree),
+        completed(inlineTree, { captureTree: fencedTree }), // drift lands in the final capture
+        completed(fencedTree),
+        completed(fencedTree),
+        completed(fencedTree),
+        completed(fencedTree)
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, treeToMarkdown(fencedTree as never));
+    assert.deepEqual(emitted, [
+      treeToMarkdown(inlineTree as never),
+      treeToMarkdown(fencedTree as never)
+    ]);
+    // Even a lying probe cannot force unbounded re-captures: first sight, the
+    // drifted final capture, and the final verification.
+    assert.equal(h.serializeCount(), 3);
+    assert.equal(h.pollCount(), 8);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

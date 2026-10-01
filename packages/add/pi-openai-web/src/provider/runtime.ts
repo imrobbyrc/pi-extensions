@@ -830,6 +830,27 @@ export class OpenAIWebRuntime {
               this.emit("provider_completed", { model: controller.descriptor.id, chars: finalMarkdown.length });
               return { kind: "completed", markdown: finalMarkdown };
             }
+            if (finalCapture && finalCapture.identity === identity && finalMarkdown.length > 0) {
+              // The final capture read newer DOM than the settled snapshot:
+              // markup can re-render after the last probe (inline code swapped
+              // for a fenced block). Refresh the cache from the newer capture
+              // so the next settle compares against current markdown — a
+              // retained stale cache would keep re-matching its own revision,
+              // reopening windows on stale text, and timing out on repeated
+              // final-capture mismatches.
+              lastSerialized = { identity, revision: finalCapture.revision };
+              if (finalMarkdown !== lastText) {
+                controller.touchProgress();
+                handlers.onText?.(finalMarkdown);
+                lastText = finalMarkdown;
+              }
+            } else {
+              // Final capture failed or rebound elsewhere: the cached
+              // serialization no longer proves the DOM. Drop it so the next
+              // poll reserializes instead of replaying the stale snapshot.
+              lastSerialized = undefined;
+            }
+            // Any mismatch restarts the full settle window against the refreshed cache.
             settle = undefined;
           }
         }
