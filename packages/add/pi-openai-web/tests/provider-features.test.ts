@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { SessionStore } from "../src/provider/session-store.js";
 import { CHECKPOINT_END, CHECKPOINT_START, checkpointIsFrom, compactionBootstrapPrompt, compactionDecision, DEFAULT_COMPACTION_CONFIG, estimateTokens, parseCompactionCheckpoint } from "../src/provider/compaction.js";
@@ -27,7 +27,36 @@ test("provider resume metadata is durable, validated, and clearable", async () =
     const loadedWithConv = await store.load();
     assert.equal(loadedWithConv?.conversationId, "valid-conv-123");
     assert.equal(loadedWithConv?.targetId, "tab-1");
+    // The running context-token estimate round-trips through durable metadata.
+    const withTokens = { ...metadata, estimatedContextTokens: 123_456 };
+    await store.save(withTokens);
+    assert.equal((await store.load())?.estimatedContextTokens, 123_456);
+    // Older metadata written before the field existed still loads (absent reads as undefined).
+    await store.save(metadata);
+    const legacy = await store.load();
+    assert.equal(legacy?.estimatedContextTokens, undefined);
+    assert.equal(legacy?.targetId, "tab-1");
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("provider resume metadata rejects malformed context-token estimates and stays compatible when absent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-provider-resume-tokens-"));
+  try {
+    const path = join(dir, "provider", "resume.json");
+    const store = new FileProviderResumeStore(path);
+    const base = { schemaVersion: 1 as const, targetId: "tab-1", descriptorKey: "model-high", branchKey: "session-1", leaseKey: "lease", epoch: 2, updatedAt: new Date().toISOString() };
+    await mkdir(dirname(path), { recursive: true });
+    // Absent field: metadata from older versions remains valid.
+    await writeFile(path, `${JSON.stringify(base)}\n`, "utf8");
+    assert.equal((await store.load())?.estimatedContextTokens, undefined);
+    // Negative and non-number estimates fail closed.
+    for (const bad of [-1, "many", null]) {
+      await writeFile(path, `${JSON.stringify({ ...base, estimatedContextTokens: bad })}\n`, "utf8");
+      assert.equal(await store.load(), undefined, `estimate ${JSON.stringify(bad)} must be rejected`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("session store appends, searches, and filters bounded transcripts", async () => {

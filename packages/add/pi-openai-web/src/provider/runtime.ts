@@ -16,7 +16,7 @@ import { descriptorKey } from "./model-ids.js";
 import { canonicalHistoryFallback, checkpointIsFrom, compactionBootstrapPrompt, compactionDecision, DEFAULT_COMPACTION_CONFIG, estimateTokens, HANDOFF_BRIEF_PROMPT, parseCompactionCheckpoint, type CompactionConfig } from "./compaction.js";
 import { SessionStore } from "./session-store.js";
 import type { OpenAIWebModelDescriptor } from "./types.js";
-import { buildLeadContract, LEAD_PROTOCOL_REMINDER, type OrchestratorConfig } from "./orchestrator.js";
+import { buildLeadContract, buildLeadProtocolReminder, type OrchestratorConfig } from "./orchestrator.js";
 import type { ProviderResumeMetadata, ProviderResumeStore } from "./resume.js";
 
 /** Centralized limits for the deliberately lean provider bootstrap. */
@@ -264,6 +264,9 @@ export class OpenAIWebRuntime {
     // a later Pi session can reconnect via the persisted resume metadata. Explicit
     // resetConversation() remains the destructive target-close operation.
     const conversation = this.conversation;
+    // Clean detach: persist durable resume state (including the running
+    // context-token estimate) before the in-memory value is zeroed.
+    if (conversation) await this.persistResume(conversation).catch(() => { /* best effort */ });
     this.conversation = undefined;
     this.turn = undefined;
     this.contextTokens = 0;
@@ -322,6 +325,12 @@ export class OpenAIWebRuntime {
     return await detect();
   }
 
+  /** Restore provider token accounting from persisted resume metadata; older metadata without an estimate restarts at zero. */
+  private restoreAccounting(metadata: ProviderResumeMetadata): void {
+    const estimate = metadata.estimatedContextTokens;
+    this.contextTokens = typeof estimate === "number" && Number.isFinite(estimate) && estimate >= 0 ? estimate : 0;
+  }
+
   private async persistResume(conversation: ProviderConversation): Promise<void> {
     const store = this.deps.resumeStore;
     if (!store) return;
@@ -337,6 +346,7 @@ export class OpenAIWebRuntime {
       leaseKey: conversation.leaseKey,
       epoch: conversation.epoch,
       syncedMessageCount: conversation.syncedMessageCount,
+      estimatedContextTokens: this.contextTokens,
       updatedAt: new Date().toISOString()
     };
     await store.save(metadata);
@@ -371,6 +381,7 @@ export class OpenAIWebRuntime {
       }
 
       this.leaseEpoch = metadata.epoch;
+      this.restoreAccounting(metadata);
       const conversation: ProviderConversation = {
         targetId: metadata.targetId,
         ...(metadata.conversationId ? { conversationId: metadata.conversationId } : {}),
@@ -499,12 +510,20 @@ export class OpenAIWebRuntime {
 
     try {
       await this.supersedeStaleTurn();
-      const incomingTokens = estimateTokens(...context.messages.map(message => messageText((message as { content?: unknown }).content)));
-      if (this.conversation && compactionDecision(this.contextTokens + incomingTokens, this.compactionConfig) === "compact") {
-        // Preserve the actual sync boundary from the existing browser conversation.
-        // The current Pi batch has not been submitted yet and must be sent after
-        // compaction resumes; passing context.messages.length would swallow it.
-        await this.compactConversation(descriptor, this.conversation.syncedMessageCount, context);
+      const existing = this.conversation;
+      if (existing) {
+        // Preflight estimates only the pending prompt that would be submitted
+        // next: the new user batch plus its continuation wrapper. Canonical Pi
+        // history already synchronized into ChatGPT is already counted in
+        // contextTokens; recounting it here would trip compaction on every turn
+        // of a long conversation.
+        const pendingPrompt = this.buildPrompt(context, existing);
+        if (compactionDecision(this.contextTokens + estimateTokens(pendingPrompt), this.compactionConfig) === "compact") {
+          // Preserve the actual sync boundary from the existing browser conversation.
+          // The current Pi batch has not been submitted yet and must be sent after
+          // compaction resumes; passing context.messages.length would swallow it.
+          await this.compactConversation(descriptor, existing.syncedMessageCount, context);
+        }
       }
       const conversation = await this.ensureConversation(descriptor);
       const prompt = this.fitComposerPrompt(this.buildPrompt(context, conversation));
@@ -527,14 +546,15 @@ export class OpenAIWebRuntime {
       if (conversationId && isValidConversationId(conversationId)) conversation.conversationId = conversationId;
       conversation.bootstrapped = true;
       conversation.syncedMessageCount = context.messages.length;
-      await this.persistResume(conversation);
       this.contextTokens += estimateTokens(prompt);
+      await this.persistResume(conversation);
       await this.record(conversation, "user", prompt);
       this.emit("provider_submitted", { targetId: conversation.targetId, model: descriptor.id });
       const outcome = await this.watch(controller, handlers, options, submitBaseline);
       if (outcome.kind === "completed") {
         conversation.syncedMessageCount = context.messages.length;
         this.contextTokens += estimateTokens(outcome.markdown);
+        await this.persistResume(conversation);
         await this.record(conversation, "assistant", outcome.markdown);
       }
       return outcome;
@@ -563,10 +583,10 @@ export class OpenAIWebRuntime {
       ].join("\n");
     }
     const lead = this.deps.getOrchestratorConfig?.();
-    const leadReminder = `[LEAD-MODE: active (worker: ${lead?.workerModel ?? "default"}, thinking: ${lead?.workerThinking ?? "default"}, workers: ${lead?.maxParallelWorkers ?? 3}, strategy: ${lead?.delegationStrategy ?? "adaptive"})]`;
+    const leadReminder = `[LEAD-MODE: active (worker: ${lead?.workerModel ?? "default"}, default_thinking: ${lead?.workerThinking ?? "default"} (fallback; explicit user effort wins), workers: ${lead?.maxParallelWorkers ?? 3}, strategy: ${lead?.delegationStrategy ?? "adaptive"})]`;
     return [
       leadReminder,
-      LEAD_PROTOCOL_REMINDER,
+      buildLeadProtocolReminder(lead),
       "Continuing the same Pi conversation; only the new user message batch follows.",
       "",
       `<user>\n${truncate(userBatch, BOOTSTRAP_LIMITS.userBatchMax)}\n</user>`
@@ -671,9 +691,9 @@ export class OpenAIWebRuntime {
     if (conversationId && isValidConversationId(conversationId)) fresh.conversationId = conversationId;
     fresh.bootstrapped = true;
     fresh.syncedMessageCount = syncedMessageCount ?? previous.syncedMessageCount;
+    this.contextTokens = estimateTokens(bootstrap, bootstrapOutcome.markdown);
     this.conversation = fresh;
     await this.persistResume(fresh);
-    this.contextTokens = estimateTokens(bootstrap, bootstrapOutcome.markdown);
     await this.record(fresh, "user", bootstrap);
     await this.record(fresh, "assistant", bootstrapOutcome.markdown);
     this.turn = undefined;

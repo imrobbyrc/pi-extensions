@@ -12,6 +12,8 @@ export interface ProviderResumeMetadata {
   leaseKey: string;
   epoch: number;
   syncedMessageCount?: number;
+  /** Running provider context-token estimate at save time. Absent in older metadata: reconnect restarts the estimate at zero. */
+  estimatedContextTokens?: number;
   updatedAt: string;
 }
 
@@ -32,6 +34,10 @@ export class FileProviderResumeStore implements ProviderResumeStore {
         || typeof value.branchKey !== "string" || typeof value.leaseKey !== "string" || typeof value.epoch !== "number"
         ) return undefined;
       if (value.conversationId !== undefined && typeof value.conversationId !== "string") return undefined;
+      // Optional token estimate: absent (older metadata) stays valid; a present value must be a finite non-negative number.
+      if (value.estimatedContextTokens !== undefined
+        && (typeof value.estimatedContextTokens !== "number" || !Number.isFinite(value.estimatedContextTokens) || value.estimatedContextTokens < 0)
+      ) return undefined;
       return value as ProviderResumeMetadata;
     } catch {
       return undefined;
