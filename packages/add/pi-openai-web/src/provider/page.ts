@@ -317,6 +317,10 @@ export interface AssistantTurnProbe extends AssistantTurnRevision {
  * text lengths over exactly the nodes the capture serializer would keep (same
  * exclusions, same PRE handling) — a same-text markup swap (inline code
  * re-rendered into a fenced block) changes it without serializing the tree.
+ * data-markdown-copy semantics are shared with the capture serializer:
+ * `exclude`-marked UI is dropped unconditionally (it is explicit site chrome,
+ * never reply content), and `code-block` containers are folded exactly like a
+ * PRE so the two expressions can never disagree about kept nodes.
  */
 const TURN_REVISION_HELPERS = `
     const checksum = (text) => {
@@ -324,6 +328,9 @@ const TURN_REVISION_HELPERS = `
       for (let index = 0; index < text.length; index += 1) sum = (Math.imul(31, sum) + text.charCodeAt(index)) | 0;
       return sum;
     };
+    const markedCopy = (node) => (node.getAttribute && node.getAttribute('data-markdown-copy')) || undefined;
+    const isMarkedCodeBlock = (node) => markedCopy(node) === 'code-block';
+    const isMarkedExclude = (node) => markedCopy(node) === 'exclude';
     const isExcluded = (node) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return false;
       const tag = node.tagName;
@@ -342,10 +349,15 @@ const TURN_REVISION_HELPERS = `
       if (node.nodeType === Node.TEXT_NODE) return (Math.imul(31, (node.textContent || '').length) + depth + 1) | 0;
       // Skipped nodes contribute nothing at all — exactly like the capture
       // serializer drops them — so excluded chrome churn cannot perturb the fold.
-      if (node.nodeType !== Node.ELEMENT_NODE || (!inPre && isExcluded(node))) return null;
+      // Marked-exclude UI is dropped even inside PRE-like containers: the
+      // serializer's code-block normalization never emits it either way.
+      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node))) return null;
       let sum = (Math.imul(depth + 1, 1000003) + tagHash(node.tagName)) | 0;
+      // Fold the data-markdown-copy marker itself: flipping it on identical
+      // markup changes what the serializer would keep, so it must change the fold.
+      if (markedCopy(node)) sum = (Math.imul(31, sum) + tagHash(markedCopy(node))) | 0;
       for (let index = 0; index < node.childNodes.length; index += 1) {
-        const childSum = structureChecksum(node.childNodes[index], depth + 1, inPre || node.tagName === 'PRE');
+        const childSum = structureChecksum(node.childNodes[index], depth + 1, inPre || node.tagName === 'PRE' || isMarkedCodeBlock(node));
         if (childSum !== null) sum = (Math.imul(31, sum) + childSum) | 0;
       }
       return sum;
@@ -426,9 +438,23 @@ export async function captureAssistantTurn(client: CdpClient, identity: string):
       || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
     if (!message) return null;
     const languageOf = pre => { const code = pre.querySelector('code[class*="language-"]'); const match = code && (code.className.match(/language-([\\w+#-]+)/) || [])[1]; return match || undefined; };
+    const serializeCodeBlock = (node) => {
+      // Explicit data-markdown-copy="code-block" container: the DOM may hold a
+      // persistent DIV>CODE (no PRE anywhere) or a hydrated PRE>CODE inside.
+      // Either way normalize to a PRE>CODE node carrying the code element's
+      // exact text — the marked header/UI never reaches the tree.
+      const source = node.querySelector('pre') || node.querySelector('code');
+      if (!source) return null;
+      const text = source.textContent;
+      const entry = { tag: 'pre', children: [{ tag: 'code', text, children: [{ tag: '#text', text }] }] };
+      const language = languageOf(node);
+      if (language) entry.language = language;
+      return entry;
+    };
     const serialize = (node, inPre) => {
       if (node.nodeType === Node.TEXT_NODE) return { tag: '#text', text: node.textContent };
-      if (node.nodeType !== Node.ELEMENT_NODE || (!inPre && isExcluded(node))) return null;
+      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node))) return null;
+      if (isMarkedCodeBlock(node)) { const normalized = serializeCodeBlock(node); if (normalized) return normalized; }
       const tag = node.tagName.toLowerCase();
       const children = [...node.childNodes].map(child => serialize(child, inPre || node.tagName === 'PRE')).filter(Boolean);
       const entry = { tag, children };
@@ -463,6 +489,7 @@ export async function serializeAssistantMessage(client: CdpClient, index: number
     if (!message) return undefined;
     const isExcluded = (node) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return false;
+      if (node.getAttribute && node.getAttribute('data-markdown-copy') === 'exclude') return true;
       const tag = node.tagName;
       if (tag === 'BUTTON' || tag === 'SVG' || tag === 'STYLE' || tag === 'SCRIPT' || tag === 'NOSCRIPT') return true;
       if (node.getAttribute && (node.getAttribute('aria-busy') === 'true' || node.getAttribute('data-testid') === 'tool-call-status')) return true;
@@ -478,9 +505,26 @@ export async function serializeAssistantMessage(client: CdpClient, index: number
       const match = code && (code.className.match(/language-([\w+#-]+)/) || [])[1];
       return match || undefined;
     };
+    // Same data-markdown-copy semantics as the capture serializer: marked
+    // containers normalize to PRE>CODE from the code element's exact text and
+    // marked-exclude header/UI is never serialized.
+    const serializeCodeBlock = (node) => {
+      const source = node.querySelector('pre') || node.querySelector('code');
+      if (!source) return null;
+      const text = source.textContent;
+      const entry = { tag: 'pre', children: [{ tag: 'code', text, children: [{ tag: '#text', text }] }] };
+      const language = languageOf(node);
+      if (language) entry.language = language;
+      return entry;
+    };
     const serialize = (node, inPre) => {
       if (node.nodeType === Node.TEXT_NODE) return { tag: '#text', text: node.textContent };
       if (node.nodeType !== Node.ELEMENT_NODE) return null;
+      if (node.getAttribute && node.getAttribute('data-markdown-copy') === 'code-block') {
+        const normalized = serializeCodeBlock(node);
+        if (normalized) return normalized;
+      }
+      if (node.getAttribute && node.getAttribute('data-markdown-copy') === 'exclude') return null;
       if (!inPre && isExcluded(node)) return null;
       const tag = node.tagName.toLowerCase();
       const children = [...node.childNodes].map(child => serialize(child, inPre || node.tagName === 'PRE')).filter(Boolean);
