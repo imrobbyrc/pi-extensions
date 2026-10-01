@@ -116,6 +116,7 @@ function fakeClient(frames: Frame[]) {
           const json = JSON.stringify(current.tree);
           return { result: { value: {
             textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "",
+            structureChecksum: checksum(json),
             completionVisible: current.state.completionActionVisible, busy: current.state.busy
           } } };
         }
@@ -127,7 +128,7 @@ function fakeClient(frames: Frame[]) {
             busy: current.state.busy,
             stopVisible: current.state.stopVisible,
             completionVisible: current.state.completionActionVisible,
-            revision: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" },
+            revision: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "", structureChecksum: checksum(json) },
             tree: current.tree
           } } };
         }

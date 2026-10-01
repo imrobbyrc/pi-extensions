@@ -281,8 +281,10 @@ export async function clearComposer(client: CdpClient): Promise<void> {
 /**
  * Cheap revision fingerprint of one assistant turn. Far lighter than a full
  * DOM serialization: text length plus a rolling checksum catches growth, shrink,
- * and same-length rewrites; structural fingerprints catch child/link/code-language
- * changes that leave text identical. Contains no response bodies.
+ * and same-length rewrites; link/code-language fields and a nested structure
+ * fingerprint catch markup changes that leave text identical (inline code
+ * re-rendered into a fenced block, bold boundaries moved). Contains no
+ * response bodies.
  */
 export interface AssistantTurnRevision {
   textLength: number;
@@ -290,6 +292,8 @@ export interface AssistantTurnRevision {
   childCount: number;
   linkChecksum: number;
   languageKey: string;
+  /** Deterministic fold over the tag/depth/text-length shape the capture serializer keeps. */
+  structureChecksum: number;
 }
 
 /** Last serialized assistant turn with the revision it was serialized at. */
@@ -307,29 +311,74 @@ export interface AssistantTurnProbe extends AssistantTurnRevision {
 }
 
 /**
- * Read the cheap revision fingerprint of the assistant turn bound by identity,
- * plus its completion/busy flags, without serializing the message tree.
+ * Browser-side revision computation, interpolated verbatim into BOTH the cheap
+ * probe and the atomic capture expressions so the two revisions can never
+ * disagree. The nested structure fingerprint folds tag, depth, and per-node
+ * text lengths over exactly the nodes the capture serializer would keep (same
+ * exclusions, same PRE handling) — a same-text markup swap (inline code
+ * re-rendered into a fenced block) changes it without serializing the tree.
  */
-export async function readAssistantTurnRevision(client: CdpClient, identity: string): Promise<AssistantTurnProbe | undefined> {
-  const revision = await evalJson<AssistantTurnProbe | null>(client, `/* piRevisionProbe */ (() => {
-    const wanted = ${JSON.stringify(identity)};
-    const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
-      || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
-    if (!message) return null;
+const TURN_REVISION_HELPERS = `
     const checksum = (text) => {
       let sum = 0;
       for (let index = 0; index < text.length; index += 1) sum = (Math.imul(31, sum) + text.charCodeAt(index)) | 0;
       return sum;
     };
-    const text = message.textContent || '';
-    const links = [...message.querySelectorAll('a[href]')].map(link => link.getAttribute('href') || '').join('|');
-    const languageKey = [...message.querySelectorAll('code[class*="language-"]')].map(code => code.className).join('|');
+    const isExcluded = (node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) return false;
+      const tag = node.tagName;
+      if (tag === 'BUTTON' || tag === 'SVG' || tag === 'STYLE' || tag === 'SCRIPT' || tag === 'NOSCRIPT') return true;
+      if (node.getAttribute && (node.getAttribute('aria-busy') === 'true' || node.getAttribute('data-testid') === 'tool-call-status')) return true;
+      const cls = typeof node.className === 'string' ? node.className : '';
+      return cls.includes('tool-message') || cls.includes('loading-shimmer') || cls.includes('agent-turn-status') || cls.includes('sr-only');
+    };
+    const tagHash = (tag) => {
+      let sum = 7;
+      const name = String(tag).toLowerCase();
+      for (let index = 0; index < name.length; index += 1) sum = (Math.imul(31, sum) + name.charCodeAt(index)) | 0;
+      return sum;
+    };
+    const structureChecksum = (node, depth, inPre) => {
+      if (node.nodeType === Node.TEXT_NODE) return (Math.imul(31, (node.textContent || '').length) + depth + 1) | 0;
+      // Skipped nodes contribute nothing at all — exactly like the capture
+      // serializer drops them — so excluded chrome churn cannot perturb the fold.
+      if (node.nodeType !== Node.ELEMENT_NODE || (!inPre && isExcluded(node))) return null;
+      let sum = (Math.imul(depth + 1, 1000003) + tagHash(node.tagName)) | 0;
+      for (let index = 0; index < node.childNodes.length; index += 1) {
+        const childSum = structureChecksum(node.childNodes[index], depth + 1, inPre || node.tagName === 'PRE');
+        if (childSum !== null) sum = (Math.imul(31, sum) + childSum) | 0;
+      }
+      return sum;
+    };
+    const revisionOf = (message) => {
+      const text = message.textContent || '';
+      const links = [...message.querySelectorAll('a[href]')].map(link => link.getAttribute('href') || '').join('|');
+      const languageKey = [...message.querySelectorAll('code[class*="language-"]')].map(code => code.className).join('|');
+      return {
+        textLength: text.length,
+        textChecksum: checksum(text),
+        childCount: message.childElementCount,
+        linkChecksum: checksum(links),
+        languageKey,
+        structureChecksum: structureChecksum(message, 0, false)
+      };
+    };
+`;
+
+/**
+ * Read the cheap revision fingerprint of the assistant turn bound by identity,
+ * plus its completion/busy flags, without serializing the message tree. The
+ * revision is computed by the exact shared snippet the atomic capture uses.
+ */
+export async function readAssistantTurnRevision(client: CdpClient, identity: string): Promise<AssistantTurnProbe | undefined> {
+  const revision = await evalJson<AssistantTurnProbe | null>(client, `/* piRevisionProbe */ (() => {
+    ${TURN_REVISION_HELPERS}
+    const wanted = ${JSON.stringify(identity)};
+    const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
+      || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
+    if (!message) return null;
     return {
-      textLength: text.length,
-      textChecksum: checksum(text),
-      childCount: message.childElementCount,
-      linkChecksum: checksum(links),
-      languageKey,
+      ...revisionOf(message),
       completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
       busy: Boolean(message.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') || message.getAttribute('aria-busy') === 'true')
     };
@@ -355,7 +404,8 @@ export function assistantRevisionRequiresSerialization(
     || prior.textChecksum !== revision.textChecksum
     || prior.childCount !== revision.childCount
     || prior.linkChecksum !== revision.linkChecksum
-    || prior.languageKey !== revision.languageKey;
+    || prior.languageKey !== revision.languageKey
+    || prior.structureChecksum !== revision.structureChecksum;
 }
 
 export interface AssistantTurnCapture {
@@ -370,23 +420,11 @@ export interface AssistantTurnCapture {
 /** Atomically capture completion state and content from one DOM revision. */
 export async function captureAssistantTurn(client: CdpClient, identity: string): Promise<AssistantTurnCapture | undefined> {
   const capture = await evalJson<AssistantTurnCapture | null>(client, `/* piAtomicTurnCapture */ () => {
+    ${TURN_REVISION_HELPERS}
     const wanted = ${JSON.stringify(identity)};
     const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
       || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
     if (!message) return null;
-    const checksum = (text) => {
-      let sum = 0;
-      for (let index = 0; index < text.length; index += 1) sum = (Math.imul(31, sum) + text.charCodeAt(index)) | 0;
-      return sum;
-    };
-    const isExcluded = (node) => {
-      if (node.nodeType !== Node.ELEMENT_NODE) return false;
-      const tag = node.tagName;
-      if (tag === 'BUTTON' || tag === 'SVG' || tag === 'STYLE' || tag === 'SCRIPT' || tag === 'NOSCRIPT') return true;
-      if (node.getAttribute && (node.getAttribute('aria-busy') === 'true' || node.getAttribute('data-testid') === 'tool-call-status')) return true;
-      const cls = typeof node.className === 'string' ? node.className : '';
-      return cls.includes('tool-message') || cls.includes('loading-shimmer') || cls.includes('agent-turn-status') || cls.includes('sr-only');
-    };
     const languageOf = pre => { const code = pre.querySelector('code[class*="language-"]'); const match = code && (code.className.match(/language-([\\w+#-]+)/) || [])[1]; return match || undefined; };
     const serialize = (node, inPre) => {
       if (node.nodeType === Node.TEXT_NODE) return { tag: '#text', text: node.textContent };
@@ -399,15 +437,12 @@ export async function captureAssistantTurn(client: CdpClient, identity: string):
       if (node.tagName === 'CODE' && !node.querySelector('code')) entry.text = node.textContent;
       return entry;
     };
-    const text = message.textContent || '';
-    const links = [...message.querySelectorAll('a[href]')].map(link => link.getAttribute('href') || '').join('|');
-    const languageKey = [...message.querySelectorAll('code[class*="language-"]')].map(code => code.className).join('|');
     return {
       identity: message.getAttribute('data-turn-id') || wanted,
       busy: Boolean(message.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') || message.getAttribute('aria-busy') === 'true'),
       stopVisible: Boolean([...document.querySelectorAll('${STOP_BUTTON_SELECTOR}')].find(el => el.offsetParent !== null)),
       completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
-      revision: { textLength: text.length, textChecksum: checksum(text), childCount: message.childElementCount, linkChecksum: checksum(links), languageKey },
+      revision: revisionOf(message),
       tree: serialize(message, false)
     };
   }`);
