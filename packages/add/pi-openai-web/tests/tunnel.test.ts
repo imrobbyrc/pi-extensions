@@ -1,4 +1,7 @@
-import test from "node:test";
+import test, { mock } from "node:test";
+
+// No test in this file may signal an OS process, including synthetic child PIDs.
+const signalProcess = mock.method(process, "kill", () => true);
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { resolveTunnelBinary, SecureTunnel } from "../src/service/tunnel.js";
@@ -101,9 +104,26 @@ test("timeout with alive child -> connecting; repeated start shares child; stop 
   assert.equal(await t.ensureStarted(), "connecting");
   assert.equal(await Promise.all([t.ensureStarted(), t.ensureStarted()]).then((r) => r[0]), "connecting");
   assert.equal(spawnedCount, 1); // no duplicate child
+  signalProcess.mock.mockImplementation((): true => { child.emit("exit", null, "SIGTERM"); return true; });
   await t.stop();
+  assert.equal(t.processState, "stopped");
+  assert.equal(t.connectionState, "disconnected");
   assert.equal(t.managedByPi, false);
   assert.equal(await t.probe(), "stopped");
+});
+
+test("repeated healthy start retains ownership and shutdown reaps the child", async () => {
+  const child = fakeChild();
+  let spawned = 0;
+  const t = tunnel({}, () => { spawned++; return child; }, async () => ({ stdout: spawned ? passJson : failJson, stderr: "" }));
+  assert.equal(await t.ensureStarted(), "ready");
+  assert.equal(await t.ensureStarted(), "ready");
+  assert.equal(t.managedByPi, true);
+  assert.equal(spawned, 1);
+  signalProcess.mock.mockImplementation((): true => { child.emit("exit", null, "SIGTERM"); return true; });
+  await t.stop();
+  assert.equal(t.processState, "stopped");
+  assert.equal(t.lastError, undefined);
 });
 
 test("resolveTunnelBinary prefers explicit override and PATH candidates", () => {

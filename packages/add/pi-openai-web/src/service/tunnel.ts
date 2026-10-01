@@ -149,7 +149,7 @@ export class SecureTunnel {
     const external = await this.health();
     if (external.kind === "pass") {
       this.connectionState = "ready";
-      this.managedByPi = false;
+      this.managedByPi = !!this.child && this.child.exitCode === null && !this.child.killed;
       return "ready";
     }
     if (!this.resolvedBinary) {
@@ -181,11 +181,13 @@ export class SecureTunnel {
         if (this.recentStderr.length > 20) this.recentStderr.splice(0, this.recentStderr.length - 20); // bounded ring, no secrets by default
       });
       child.once("error", ((error: Error) => {
+        if (this.child !== child) return;
         this.processState = "failed";
         this.connectionState = "failed";
         this.lastError = `spawn failed: ${error.message}`;
       }) as never);
       child.once("exit", ((code: number | null, signal: NodeJS.Signals | null) => {
+        if (this.child !== child) return;
         this.processState = (this.processState as string) === "failed" ? "failed" : "exited";
         this.connectionState = "failed";
         this.lastError = `tunnel-client exited (code=${code ?? "null"} signal=${signal ?? "none"})${this.recentStderr.length ? `: ${this.recentStderr.slice(-3).join(" | ").slice(0, 300)}` : ""}`;
