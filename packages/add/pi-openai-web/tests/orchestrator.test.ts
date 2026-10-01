@@ -15,6 +15,7 @@ import {
   formatOrchestratorBox,
   resolveWorkflowToggles,
   buildLeadContract,
+  buildLeadProtocolReminder,
   LEAD_PROTOCOL_REMINDER,
   handleOrchestratorCli,
   configureOrchestratorUI,
@@ -909,9 +910,27 @@ test("Lead contract maps risk to per-run worker effort", () => {
 
 test("explicit effort overrides adaptive guidance without rewriting profile", () => {
   const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /Explicit user effort overrides this guidance; never rewrite the persisted thinking profile/);
+  assert.match(prompt, /only an explicit user effort request for the current task overrides this mapping; never rewrite the persisted thinking profile/);
   const custom = buildLeadContract({ workerModel: "m/x", workerThinking: "max", maxParallelWorkers: 2, delegationStrategy: "adaptive" });
-  assert.match(custom, /thinking profile: max/);
+  assert.match(custom, /default thinking profile: max/);
+});
+
+test("configured workerThinking is the default fallback; adaptive low-risk effort stays low", () => {
+  const prompt = buildLeadContract({ ...DEFAULT_ORCHESTRATOR_CONFIG, workerThinking: "high" });
+  // The configured high profile is labeled a default/fallback, never a per-task override.
+  assert.match(prompt, /default thinking profile: high \(fallback, not a per-task override\)/);
+  assert.match(prompt, /The configured profile is only the default fallback, not a per-task override/);
+  // A low-risk task under the default high profile is still guided to low effort.
+  assert.match(prompt, /set worker_thinking=low for low risk, high for medium\/high/);
+  // Explicit user-requested effort for the current task is the only described override.
+  assert.match(prompt, /only an explicit user effort request for the current task overrides this mapping/);
+});
+
+test("adaptive worker effort disabled keeps the configured default with explicit-user override only", () => {
+  const prompt = buildLeadContract({ ...DEFAULT_ORCHESTRATOR_CONFIG, adaptiveWorkerEffort: false });
+  assert.match(prompt, /Adaptive worker effort disabled: omit worker_thinking; use the configured default profile/);
+  assert.doesNotMatch(prompt, /set worker_thinking=low for low risk/);
+  assert.match(prompt, /Only an explicit user effort request for the current task overrides it; never rewrite the persisted thinking profile/);
 });
 
 test("DEFAULT_ORCHESTRATOR_CONFIG keeps the configurable workerThinking setting", () => {
@@ -920,8 +939,41 @@ test("DEFAULT_ORCHESTRATOR_CONFIG keeps the configurable workerThinking setting"
 });
 
 test("LEAD_PROTOCOL_REMINDER keeps explicit effort and escalation", () => {
-  assert.match(LEAD_PROTOCOL_REMINDER, /explicit worker effort wins/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /only explicit user effort wins/);
   assert.match(LEAD_PROTOCOL_REMINDER, /escalate, never downgrade/);
+});
+
+test("buildLeadProtocolReminder derives each clause from the effective workflow toggles", () => {
+  // All workflows on: identical to the exported compatibility default.
+  assert.equal(buildLeadProtocolReminder(undefined), LEAD_PROTOCOL_REMINDER);
+  assert.equal(buildLeadProtocolReminder({ ...DEFAULT_ORCHESTRATOR_CONFIG }), LEAD_PROTOCOL_REMINDER);
+
+  // verificationGate off: no verify-fingerprint acceptance policy.
+  const noVerify = buildLeadProtocolReminder({ ...DEFAULT_ORCHESTRATOR_CONFIG, verificationGate: false });
+  assert.doesNotMatch(noVerify, /verify then accept with fresh fingerprint/);
+  assert.match(noVerify, /verification gate off=accept with run_id\+worker_id after diff review/);
+
+  // reviewLoop off: no pane review policy.
+  const noReview = buildLeadProtocolReminder({ ...DEFAULT_ORCHESTRATOR_CONFIG, reviewLoop: false });
+  assert.doesNotMatch(noReview, /; review diff;/);
+  assert.match(noReview, /review loop off=inspect diff before reporting/);
+
+  // adaptiveWorkerEffort off: no risk-to-effort mapping.
+  const noEffort = buildLeadProtocolReminder({ ...DEFAULT_ORCHESTRATOR_CONFIG, adaptiveWorkerEffort: false });
+  assert.doesNotMatch(noEffort, /worker_thinking=low for low risk/);
+  assert.match(noEffort, /worker_thinking=configured default/);
+
+  // adaptivePlanning off: no compact-plan shortcut.
+  const noPlanning = buildLeadProtocolReminder({ ...DEFAULT_ORCHESTRATOR_CONFIG, adaptivePlanning: false });
+  assert.doesNotMatch(noPlanning, /compact_plan/);
+  assert.match(noPlanning, /planning toggle off=decision_graph with gates for every risk/);
+
+  // Escalation and explicit-effort policy stay on in every configuration.
+  for (const reminder of [noVerify, noReview, noEffort, noPlanning]) {
+    assert.match(reminder, /^\[LEAD-PROTOCOL: /);
+    assert.match(reminder, /only explicit user effort wins/);
+    assert.match(reminder, /escalate, never downgrade/);
+  }
 });
 
 // --- VerificationReport (Phase 5: post-implementation evidence artifact) ---
@@ -1325,4 +1377,45 @@ test("OpenAIWebRuntime injects the always-on Lead contract into buildPrompt", ()
   orchConfig = undefined;
   const prompt3 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Plan" }] }, { bootstrapped: false, syncedMessageCount: 0 });
   assert.match(prompt3, /LEAD ARCHITECT MODE/);
+});
+
+test("runtime continuation reminder follows the effective workflow toggles and labels default_thinking", () => {
+  const orchConfig: OrchestratorConfig = {
+    workerModel: "zai/glm-5.3",
+    workerThinking: "high",
+    maxParallelWorkers: 3,
+    delegationStrategy: "adaptive",
+    verificationGate: false,
+    reviewLoop: false,
+    adaptivePlanning: false,
+    adaptiveWorkerEffort: false
+  };
+
+  const runtime = new OpenAIWebRuntime({
+    config: {
+      stateDir: "/tmp/fake",
+      chatgptAppName: "Pi Workspace"
+    } as unknown as HarnessConfig,
+    catalog: {} as unknown as OpenAIWebModelCatalog,
+    ensureBrowser: async () => {},
+    getBranchKey: () => "branch-1",
+    getOrchestratorConfig: () => orchConfig
+  });
+
+  const runtimeAny = runtime as unknown as {
+    buildPrompt: (context: { messages: unknown[] }, conv: { bootstrapped: boolean; syncedMessageCount: number }) => string;
+  };
+
+  const prompt = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Next step" }] }, { bootstrapped: true, syncedMessageCount: 1 });
+  // LEAD-MODE labels the configured profile as the default, not an override.
+  assert.match(prompt, /default_thinking: high \(fallback; explicit user effort wins\)/);
+  assert.doesNotMatch(prompt, /\[LEAD-MODE: active \(worker: [^)]*, thinking:/);
+  // The protocol reminder matches the disabled toggles instead of the static all-gates policy.
+  assert.match(prompt, /planning toggle off=decision_graph with gates for every risk/);
+  assert.match(prompt, /worker_thinking=configured default/);
+  assert.match(prompt, /verification gate off=accept with run_id\+worker_id after diff review/);
+  assert.match(prompt, /review loop off=inspect diff before reporting/);
+  assert.doesNotMatch(prompt, /compact_plan/);
+  assert.doesNotMatch(prompt, /verify then accept with fresh fingerprint/);
+  assert.doesNotMatch(prompt, /worker_thinking=low for low risk/);
 });

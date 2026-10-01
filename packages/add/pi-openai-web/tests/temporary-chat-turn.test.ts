@@ -294,3 +294,153 @@ test("resetConversation clears resume store atomically", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("compaction preflight estimates only the pending batch, not synchronized history", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-compaction-preflight-"));
+  try {
+    const runtime = new OpenAIWebRuntime({
+      config: { ...baseConfig(dir), providerCompactionMaxTokens: 500, providerContextLimitTokens: 500 },
+      catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+      ensureBrowser: async () => {},
+      getBranchKey: () => "branch-1"
+    });
+    const runtimeAny = runtime as any;
+    const huge = "already synchronized ".repeat(4_000); // ~8k tokens: far above the compaction threshold
+    runtimeAny.conversation = {
+      targetId: "tab-preflight",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "lease",
+      epoch: 0,
+      bootstrapped: true,
+      syncedMessageCount: 2,
+      client: {} as any
+    };
+    runtimeAny.contextTokens = 10;
+    let compactions = 0;
+    let boundary: number | undefined;
+    runtimeAny.compactConversation = async (_descriptor: unknown, synced: number) => {
+      compactions += 1;
+      boundary = synced;
+      throw new Error("stop_after_compaction");
+    };
+    runtimeAny.ensureConversation = async () => {
+      throw new Error("stop_after_ensure");
+    };
+
+    // Long canonical history is already synchronized into ChatGPT; only a tiny
+    // new batch is pending. The old whole-history estimate compacted here.
+    const outcome = await runtime.runTurn(descriptor, {
+      messages: [
+        { role: "user", content: huge },
+        { role: "assistant", content: huge },
+        { role: "user", content: "tiny follow-up" }
+      ]
+    }, {});
+    assert.deepEqual(outcome, { kind: "failed", error: "stop_after_ensure" });
+    assert.equal(compactions, 0);
+
+    // A pending batch that alone crosses the threshold still triggers compaction,
+    // and the sync boundary keeps the triggering batch unsynced for resume.
+    const outcome2 = await runtime.runTurn(descriptor, {
+      messages: [
+        { role: "user", content: "small earlier turn" },
+        { role: "assistant", content: "small earlier answer" },
+        { role: "user", content: huge }
+      ]
+    }, {});
+    assert.deepEqual(outcome2, { kind: "failed", error: "stop_after_compaction" });
+    assert.equal(compactions, 1);
+    assert.equal(boundary, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("resume metadata round-trips the running context-token estimate and restores it on reconnect", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-resume-tokens-"));
+  try {
+    const resumeStore = new MemoryProviderResumeStore();
+    const runtime = new OpenAIWebRuntime({
+      config: baseConfig(dir),
+      catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+      ensureBrowser: async () => {},
+      getBranchKey: () => "branch-1",
+      resumeStore
+    });
+    const runtimeAny = runtime as any;
+    const conversation = {
+      targetId: "tab-restore",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "lease",
+      epoch: 3,
+      bootstrapped: true,
+      syncedMessageCount: 7,
+      client: {} as any
+    };
+    runtimeAny.conversation = conversation;
+    runtimeAny.contextTokens = 123_456;
+
+    // persistResume binds the running estimate into durable metadata.
+    await runtimeAny.persistResume(conversation);
+    assert.equal((await resumeStore.load())?.estimatedContextTokens, 123_456);
+
+    // Reconnect restoration resumes the prior estimate instead of restarting at zero.
+    runtimeAny.contextTokens = 0;
+    runtimeAny.restoreAccounting(await resumeStore.load());
+    assert.equal(runtime.estimatedContextTokens, 123_456);
+
+    // Older metadata written before the field existed restores compatibly from zero.
+    await resumeStore.save({
+      schemaVersion: 1,
+      targetId: "tab-restore",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "lease",
+      epoch: 3,
+      syncedMessageCount: 7,
+      updatedAt: new Date().toISOString()
+    });
+    runtimeAny.contextTokens = 99;
+    runtimeAny.restoreAccounting(await resumeStore.load());
+    assert.equal(runtime.estimatedContextTokens, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("shutdown saves the token estimate durably before the clean detach zeroes it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-shutdown-tokens-"));
+  try {
+    const resumeStore = new MemoryProviderResumeStore();
+    const runtime = new OpenAIWebRuntime({
+      config: baseConfig(dir),
+      catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+      ensureBrowser: async () => {},
+      getBranchKey: () => "branch-1",
+      resumeStore
+    });
+    const runtimeAny = runtime as any;
+    runtimeAny.conversation = {
+      targetId: "tab-shutdown",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "lease",
+      epoch: 0,
+      bootstrapped: true,
+      syncedMessageCount: 1,
+      client: { close: async () => {} } as any
+    };
+    runtimeAny.contextTokens = 42;
+
+    await runtime.shutdown();
+    // Clean detach: durable state carries the estimate; the in-memory value is zeroed.
+    assert.equal(runtime.estimatedContextTokens, 0);
+    const metadata = await resumeStore.load();
+    assert.equal(metadata?.targetId, "tab-shutdown");
+    assert.equal(metadata?.estimatedContextTokens, 42);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
