@@ -251,7 +251,6 @@ For a low-risk change, use `risk=low`, `planning_kind=compact` and `compact_plan
 | `/openai-web start` | Start browser/CDP, local MCP, and the tunnel |
 | `/openai-web reload` | Hard-reload Pi-owned MCP and tunnel; preserves provider conversation |
 | `/reload-tunnel` | Top-level shortcut for `/openai-web reload`: recovers Pi-owned local MCP and the Secure MCP Tunnel through the same shared recovery path (identical progress/errors; browser and provider conversation untouched) |
-| `/openai-web handoff` | Reload Pi extensions in place while preserving the browser conversation (preservation is one-shot: only that reload's shutdown keeps the browser; later stops are normal). Rejected when no provider conversation is active or Herdr/MCP work is in flight |
 | `/openai-web models [refresh]` | Show (or re-discover) the model catalog |
 | `/openai-web reset` | Reset the provider conversation (next turn opens a fresh Temporary Chat) |
 | `/openai-web compact` | Compact the conversation via validated checkpoint |
