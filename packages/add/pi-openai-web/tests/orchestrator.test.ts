@@ -35,10 +35,13 @@ import {
   assertWorkerSlice,
   assertRiskLevel,
   assertPlanningKind,
+  assertRiskPlanningPair,
   assertCompactPlan,
+  assertStandardPlan,
   WORKER_COUNT_MAX,
   compileDecisionGraph,
   compileCompactPlan,
+  compileStandardPlan,
   canonicalExecutionSpec,
   DECISION_GRAPH_AXES,
   DECISION_GRAPH_VALUE_MAX,
@@ -47,6 +50,8 @@ import {
   EXECUTION_SPEC_VALUE_MAX,
   COMPACT_PLAN_FIELDS,
   COMPACT_PLAN_VALUE_MAX,
+  STANDARD_PLAN_FIELDS,
+  STANDARD_PLAN_VALUE_MAX,
   RISK_LEVELS,
   PLANNING_KINDS,
   WORKER_METADATA_ITEM_MAX,
@@ -54,6 +59,7 @@ import {
   type RiskLevel,
   type PlanningKind,
   type CompactPlan,
+  type StandardPlan,
   type ParsedHerdrHandoff,
   buildVerificationReport,
   verificationFingerprint,
@@ -452,6 +458,13 @@ const compactPlan: CompactPlan = {
   behavior: "documentation text changes only",
   verification: "reread the rendered section"
 };
+const standardPlan: StandardPlan = {
+  problem: "extend the provider turn lifecycle with a settle step",
+  scope: "src/provider/turn.ts and its focused test",
+  boundaries: "turn.ts only; runtime and page modules are out of scope",
+  behavior: "settled turns finalize exactly once and late events are ignored",
+  verification: "focused turn tests pass"
+};
 
 function level(value: unknown): RiskLevel { return assertRiskLevel(value); }
 function kind(value: unknown): PlanningKind { return assertPlanningKind(value); }
@@ -464,11 +477,25 @@ test("RiskLevel is bounded to exactly low, medium, high", () => {
   }
 });
 
-test("PlanningKind is bounded to exactly compact and design-graph", () => {
-  assert.deepEqual(PLANNING_KINDS, ["compact", "design-graph"]);
+test("PlanningKind is bounded to exactly compact, standard, and design-graph", () => {
+  assert.deepEqual(PLANNING_KINDS, ["compact", "standard", "design-graph"]);
   for (const planningKind of PLANNING_KINDS) assert.equal(kind(planningKind), planningKind);
   for (const bad of [undefined, null, "full", "COMPACT", "", "compact ", 42]) {
     assert.throws(() => kind(bad), /planning_kind_invalid/, `kind ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("risk/planning pairs: low→compact only, medium→standard or design-graph, high→design-graph only", () => {
+  // The compatibility matrix is exact — every valid pair passes, every invalid pair fails closed.
+  for (const [risk, planningKind] of [["low", "compact"], ["medium", "standard"], ["medium", "design-graph"], ["high", "design-graph"]] as Array<[RiskLevel, PlanningKind]>) {
+    assert.doesNotThrow(() => assertRiskPlanningPair(risk, planningKind), `${risk}/${planningKind} is a valid pair`);
+  }
+  for (const [risk, planningKind] of [
+    ["low", "standard"], ["low", "design-graph"],
+    ["medium", "compact"],
+    ["high", "compact"], ["high", "standard"]
+  ] as Array<[RiskLevel, PlanningKind]>) {
+    assert.throws(() => assertRiskPlanningPair(risk, planningKind), /handoff_planning_mismatch/, `${risk}/${planningKind} must be rejected`);
   }
 });
 
@@ -501,7 +528,7 @@ test("compileCompactPlan deterministically compiles into the ExecutionSpec autho
   });
   // Exactly four entries in fixed field order — no invented axes.
   assert.deepEqual(Object.keys(compiled), ["compact.problem", "compact.scope", "compact.behavior", "compact.verification"]);
-  for (const fabricated of ["decision.problem", "decision.shapes", "decision.graph", "decision.cardinality", "decision.boundaries", "decision.critique"]) {
+  for (const fabricated of ["decision.problem", "decision.shapes", "decision.graph", "decision.cardinality", "decision.boundaries", "decision.critique", "standard.problem"]) {
     assert.equal(fabricated in compiled, false, `compact compilation must not fabricate ${fabricated}`);
   }
   // Deterministic: field key order never matters, repeated compiles are identical.
@@ -509,6 +536,53 @@ test("compileCompactPlan deterministically compiles into the ExecutionSpec autho
   // The compiled form is a valid ExecutionSpec (shared bound coherence).
   assert.deepEqual(assertExecutionSpec(compiled), compiled);
   assert.equal(COMPACT_PLAN_VALUE_MAX, EXECUTION_SPEC_VALUE_MAX);
+});
+
+test("assertStandardPlan accepts exactly problem, scope, boundaries, behavior, and verification", () => {
+  assert.deepEqual(STANDARD_PLAN_FIELDS, ["problem", "scope", "boundaries", "behavior", "verification"]);
+  assert.deepEqual(assertStandardPlan(standardPlan), standardPlan);
+  // Missing field.
+  const { verification: _verification, ...missing } = standardPlan;
+  assert.throws(() => assertStandardPlan(missing), /standard_plan_invalid: verification is required/);
+  // Blank field.
+  assert.throws(() => assertStandardPlan({ ...standardPlan, boundaries: "   " }), /standard_plan_invalid: boundaries/);
+  // Extra field: a standard plan can never grow Design Graph axes.
+  assert.throws(() => assertStandardPlan({ ...standardPlan, shapes: "no shapes in a standard plan" }), /standard_plan_invalid: unknown field "shapes"/);
+  assert.throws(() => assertStandardPlan({ ...standardPlan, critique: "no critique either" }), /standard_plan_invalid: unknown field "critique"/);
+  // Oversized field.
+  assert.throws(() => assertStandardPlan({ ...standardPlan, problem: "x".repeat(STANDARD_PLAN_VALUE_MAX + 1) }), /standard_plan_invalid: problem/);
+  // Non-string field values and non-object shapes.
+  for (const bad of [null, undefined, "plan", 42, [], { ...standardPlan, scope: 7 }]) {
+    assert.throws(() => assertStandardPlan(bad), /standard_plan_invalid/, `plan ${JSON.stringify(bad)} must be rejected`);
+  }
+});
+
+test("compileStandardPlan deterministically compiles into the ExecutionSpec authority path without fabricating axes", () => {
+  const compiled = compileStandardPlan(assertStandardPlan(standardPlan));
+  assert.deepEqual(compiled, {
+    "standard.problem": standardPlan.problem,
+    "standard.scope": standardPlan.scope,
+    "standard.boundaries": standardPlan.boundaries,
+    "standard.behavior": standardPlan.behavior,
+    "standard.verification": standardPlan.verification
+  });
+  // Exactly five entries in fixed field order — the only axis beyond compact is boundaries.
+  assert.deepEqual(Object.keys(compiled), ["standard.problem", "standard.scope", "standard.boundaries", "standard.behavior", "standard.verification"]);
+  for (const fabricated of ["decision.problem", "decision.shapes", "decision.graph", "decision.cardinality", "decision.critique", "compact.problem", "standard.critique"]) {
+    assert.equal(fabricated in compiled, false, `standard compilation must not fabricate ${fabricated}`);
+  }
+  // Deterministic: field key order never matters, repeated compiles are identical.
+  assert.deepEqual(compileStandardPlan({ verification: standardPlan.verification, behavior: standardPlan.behavior, boundaries: standardPlan.boundaries, scope: standardPlan.scope, problem: standardPlan.problem }), compiled);
+  // The compiled form is a valid ExecutionSpec (shared bound coherence).
+  assert.deepEqual(assertExecutionSpec(compiled), compiled);
+  assert.equal(STANDARD_PLAN_VALUE_MAX, EXECUTION_SPEC_VALUE_MAX);
+  // The standard fingerprint is bound to the compiled authority like every other kind.
+  const workers = [{ id: "w1", objective: "ship", owns: ["src/**"], depends_on: [] }];
+  assert.notEqual(
+    planFingerprintV2("goal", workers, compiled, "medium", "standard"),
+    planFingerprintV2("goal", workers, { ...compiled, "standard.scope": "elsewhere" }, "medium", "standard"),
+    "standard-plan content drift invalidates the fingerprint"
+  );
 });
 
 test("v2 handoff issuance round-trips the compact plan with risk and planning kind", () => {
@@ -530,14 +604,50 @@ test("v2 handoff issuance round-trips the compact plan with risk and planning ki
   assert.equal(parsed.planFingerprint, planFingerprintV2("fix docs", workers, compiled, "low", "compact"));
 });
 
-test("v2 low compact omits gates; medium/high and v1 still require them", () => {
+test("v2 gates are optional at every risk; supplied gates still validate; v1 still requires them", () => {
   const workers = [{ id: "w1", objective: "fix docs", owns: ["docs/**"], depends_on: [] }];
+  // Gate-less v2 issuance is legal at every risk/kind pair.
   const low = issueHerdrHandoffV2("fix docs", workers, undefined, "low", "compact", { compactPlan });
   assert.equal(JSON.parse(low).gates, undefined);
   assert.equal(parseHerdrHandoff(low).gates, undefined);
-  assert.throws(() => issueHerdrHandoffV2("goal", workers, undefined, "medium", "design-graph", { decisionGraph }), /orchestration_gate_required/);
-  assert.throws(() => issueHerdrHandoffV2("goal", workers, undefined, "high", "design-graph", { decisionGraph }), /orchestration_gate_required/);
+  const mediumStandard = issueHerdrHandoffV2("ship", workers, undefined, "medium", "standard", { standardPlan });
+  assert.equal(JSON.parse(mediumStandard).gates, undefined);
+  const mediumGraph = issueHerdrHandoffV2("ship", workers, undefined, "medium", "design-graph", { decisionGraph });
+  assert.equal(JSON.parse(mediumGraph).gates, undefined, "medium design-graph plans no longer need gates");
+  const highGraph = issueHerdrHandoffV2("ship", workers, undefined, "high", "design-graph", { decisionGraph });
+  assert.equal(JSON.parse(highGraph).gates, undefined, "high design-graph plans no longer need duplicate gate strings");
+  assert.equal(parseHerdrHandoff(highGraph).risk, "high");
+  // Legacy envelopes that DO carry gates stay parseable at every risk.
+  for (const gated of [
+    issueHerdrHandoffV2("ship", workers, p1Gates, "medium", "design-graph", { decisionGraph }),
+    issueHerdrHandoffV2("ship", workers, p1Gates, "high", "design-graph", { decisionGraph }),
+    issueHerdrHandoffV2("ship", workers, p1Gates, "low", "compact", { compactPlan })
+  ]) {
+    assert.deepEqual(parseHerdrHandoff(gated).gates, p1Gates);
+  }
+  // Supplied gates must still validate: blank evidence fails closed.
+  assert.throws(() => issueHerdrHandoffV2("ship", workers, { graph: " ", handoff: "brief", critique: "reviewed" }, "medium", "standard", { standardPlan }), /orchestration_gate_required/);
+  assert.throws(() => parseHerdrHandoff(highGraph.replace('"risk":"high"', '"risk":"critical"')), /risk_level_invalid/);
+  // v1 keeps requiring gates unconditionally (blank evidence fails closed at issuance).
+  assert.throws(() => issueHerdrHandoff("goal", workers, { graph: "", handoff: "brief", critique: "reviewed" }, { suite: "focused" }), /orchestration_gate_required/);
   assert.throws(() => parseHerdrHandoff(low.replace('"risk":"low"', '"risk":"medium"')), /handoff_planning_mismatch/);
+});
+
+test("v2 medium standard issuance round-trips the compiled authority with risk and planning kind", () => {
+  const workers = [{ id: "w1", objective: "extend turns", owns: ["src/provider/**"], depends_on: [] }];
+  const envelope = issueHerdrHandoffV2("extend turns", workers, undefined, "medium", "standard", { standardPlan });
+  const raw = JSON.parse(envelope);
+  assert.equal(raw.protocol, "pi-provider-herdr-handoff-v2");
+  assert.equal(raw.risk, "medium");
+  assert.equal(raw.planningKind, "standard");
+  assert.equal(raw.gates, undefined, "standard planning needs no duplicate gates");
+  const parsed = parseHerdrHandoff(envelope);
+  assert.equal(parsed.version, "v2");
+  assert.equal(parsed.risk, "medium");
+  assert.equal(parsed.planningKind, "standard");
+  const compiled = compileStandardPlan(assertStandardPlan(standardPlan));
+  assert.deepEqual(parsed.executionSpec, compiled, "the envelope carries the compiled standard authority as its single spec");
+  assert.equal(parsed.planFingerprint, planFingerprintV2("extend turns", workers, compiled, "medium", "standard"));
 });
 
 test("v2 handoffs round-trip deterministically through build and parse", () => {
@@ -563,22 +673,32 @@ test("v2 design-graph issuance compiles through the same authority path", () => 
 
 test("v2 issuance fails closed on kind/authority mismatch and invalid risk/kind/plan shapes", () => {
   const workers = [{ id: "w1", objective: "fix", owns: ["src/**"], depends_on: [] }];
-  // planning_kind=compact requires a compact_plan; design-graph requires a decision_graph.
+  // planning_kind=compact requires a compact_plan; standard requires a standard_plan; design-graph requires a decision_graph.
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", {}), /handoff_planning_mismatch: planning_kind=compact requires a compact_plan/);
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { decisionGraph }), /handoff_planning_mismatch/);
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "design-graph", { compactPlan }), /handoff_planning_mismatch/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "standard", {}), /handoff_planning_mismatch: planning_kind=standard requires a standard_plan/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "standard", { compactPlan }), /handoff_planning_mismatch/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "high", "standard", { standardPlan }), /handoff_planning_mismatch/);
   for (const risk of ["medium", "high"] as const) {
     assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, risk, "compact", { compactPlan }), /handoff_planning_mismatch/);
   }
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "design-graph", { decisionGraph }), /handoff_planning_mismatch/);
-  // Both authorities at once is the existing exclusivity failure.
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "standard", { standardPlan }), /handoff_planning_mismatch/);
+  // More than one authority at once is the existing exclusivity failure.
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { compactPlan, decisionGraph }), /decision_graph_exclusive/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "standard", { compactPlan, standardPlan }), /decision_graph_exclusive/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "standard", { standardPlan, decisionGraph }), /decision_graph_exclusive/);
   assert.throws(() => assertSpecSourceExclusive(undefined, decisionGraph, compactPlan), /decision_graph_exclusive/);
+  assert.throws(() => assertSpecSourceExclusive(undefined, undefined, compactPlan, standardPlan), /decision_graph_exclusive/);
+  assert.throws(() => assertSpecSourceExclusive({ suite: "focused" }, undefined, undefined, standardPlan), /decision_graph_exclusive/);
+  assert.doesNotThrow(() => assertSpecSourceExclusive(undefined, undefined, undefined, standardPlan));
   // Bounded identity fields.
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "critical", "compact", { compactPlan }), /risk_level_invalid/);
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "full", { compactPlan }), /planning_kind_invalid/);
-  // Structurally invalid compact plan.
+  // Structurally invalid compact/standard plans.
   assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "low", "compact", { compactPlan: { ...compactPlan, extra: "x" } }), /compact_plan_invalid/);
+  assert.throws(() => issueHerdrHandoffV2("goal", workers, p1Gates, "medium", "standard", { standardPlan: { ...standardPlan, boundaries: "" } }), /standard_plan_invalid/);
   // Work-graph validation applies identically to v2 issuance.
   assert.throws(() => issueHerdrHandoffV2("goal", [], p1Gates, "low", "compact", { compactPlan }), /work_graph_invalid/);
 });
@@ -854,21 +974,22 @@ test("Lead contract keeps work-graph and ownership constraints", () => {
   assert.match(prompt, /unique ids, valid dependencies, no cycles or unordered overlapping ownership/);
 });
 
-test("Lead contract names both planning authorities and exact run binding", () => {
+test("Lead contract names all three planning authorities and exact run binding", () => {
   const prompt = buildLeadContract(undefined);
-  assert.match(prompt, /risk=low, planning_kind=compact, compact_plan \{problem, scope, behavior, verification\} without gates/);
-  assert.match(prompt, /risk=medium\|high, planning_kind=design-graph, decision_graph \{problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique\} plus gates/);
+  assert.match(prompt, /risk=low, planning_kind=compact, compact_plan \{problem, scope, behavior, verification\}/);
+  assert.match(prompt, /risk=medium, planning_kind=standard, standard_plan \{problem, scope, boundaries, behavior, verification\}/);
+  assert.match(prompt, /risk=high, planning_kind=design-graph, decision_graph \{problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique\}/);
+  assert.match(prompt, /Never add separate graph\/handoff\/critique gates to v2 plans/);
   assert.match(prompt, /repeat exact goal, workers, planning authority, risk and planning_kind with handoff/);
 });
 
-// --- Adaptive planning policy (V5 Phase 1: planning depth follows assessed risk) ---
+// --- Adaptive planning policy (planning depth follows assessed risk) ---
 
 test("Lead contract keeps three risk levels and compact low-risk planning", () => {
   const prompt = buildLeadContract(undefined);
   assert.match(prompt, /Low risk \(localized docs\/config\/single-file\)/);
   assert.match(prompt, /Medium risk \(multi-surface behavior\)/);
   assert.match(prompt, /High risk \(auth\/security, migration, concurrency, data integrity, lifecycle\)/);
-  assert.match(prompt, /without gates/);
 });
 
 test("Lead contract keeps full graph and stronger high-risk evidence", () => {
@@ -884,8 +1005,8 @@ test("Lead contract requires re-planning on escalation", () => {
 test("Lead contract keeps review and risk-bound acceptance", () => {
   const prompt = buildLeadContract(undefined);
   assert.match(prompt, /Plan at the lightest justified risk/);
-  assert.match(prompt, /Inspect git_status\/git_diff and focused evidence before accepting v2 low risk with its bound handoff/);
-  assert.match(prompt, /For medium\/high and v1, use verify then accept with the fresh verification_fingerprint/);
+  assert.match(prompt, /Inspect git_status\/git_diff and focused evidence before accepting v2 low compact or v2 medium standard plans with their bound handoff/);
+  assert.match(prompt, /For v2 high design-graph, medium design-graph \(including already-issued plans\), and v1, use verify then accept with the fresh verification_fingerprint and exact handoff/);
   assert.match(prompt, /pane marked idle or a notify_parent message does not prove the task is completed/);
   assert.match(prompt, /report settlement pending and recheck/);
   assert.match(prompt, /Never stop a running worker solely because lastActivity is unchanged/);
@@ -896,16 +1017,16 @@ test("Lead contract keeps review and risk-bound acceptance", () => {
 
 test("LEAD_PROTOCOL_REMINDER keeps risk, cardinality, and review policy", () => {
   assert.match(LEAD_PROTOCOL_REMINDER, /^\[LEAD-PROTOCOL:/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /low=compact_plan without gates; medium\/high=decision_graph with gates/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /low=compact_plan, medium=standard_plan, high=decision_graph; no gates/);
   assert.match(LEAD_PROTOCOL_REMINDER, /one worker unless independent scopes justify more/);
   assert.match(LEAD_PROTOCOL_REMINDER, /escalate, never downgrade/);
-  assert.match(LEAD_PROTOCOL_REMINDER, /medium\/high\/v1=verify then accept with fresh fingerprint/);
+  assert.match(LEAD_PROTOCOL_REMINDER, /high\/v1\/medium design-graph=verify then accept with fresh fingerprint/);
 });
 
-// --- Adaptive worker effort (V5 Phase 2: per-run thinking follows assessed risk) ---
+// --- Adaptive worker effort (per-run thinking follows assessed risk) ---
 
 test("Lead contract maps risk to per-run worker effort", () => {
-  assert.match(buildLeadContract(undefined), /For run, set worker_thinking=low for low risk, high for medium\/high/);
+  assert.match(buildLeadContract(undefined), /For run, set worker_thinking to the assessed risk: low for low, medium for medium, high for high/);
 });
 
 test("explicit effort overrides adaptive guidance without rewriting profile", () => {
@@ -915,13 +1036,13 @@ test("explicit effort overrides adaptive guidance without rewriting profile", ()
   assert.match(custom, /default thinking profile: max/);
 });
 
-test("configured workerThinking is the default fallback; adaptive low-risk effort stays low", () => {
+test("configured workerThinking is the default fallback; the adaptive effort mapping stays risk-exact", () => {
   const prompt = buildLeadContract({ ...DEFAULT_ORCHESTRATOR_CONFIG, workerThinking: "high" });
   // The configured high profile is labeled a default/fallback, never a per-task override.
   assert.match(prompt, /default thinking profile: high \(fallback, not a per-task override\)/);
   assert.match(prompt, /The configured profile is only the default fallback, not a per-task override/);
-  // A low-risk task under the default high profile is still guided to low effort.
-  assert.match(prompt, /set worker_thinking=low for low risk, high for medium\/high/);
+  // Every risk keeps its own effort level: low→low, medium→medium, high→high.
+  assert.match(prompt, /set worker_thinking to the assessed risk: low for low, medium for medium, high for high/);
   // Explicit user-requested effort for the current task is the only described override.
   assert.match(prompt, /only an explicit user effort request for the current task overrides this mapping/);
 });
@@ -929,7 +1050,7 @@ test("configured workerThinking is the default fallback; adaptive low-risk effor
 test("adaptive worker effort disabled keeps the configured default with explicit-user override only", () => {
   const prompt = buildLeadContract({ ...DEFAULT_ORCHESTRATOR_CONFIG, adaptiveWorkerEffort: false });
   assert.match(prompt, /Adaptive worker effort disabled: omit worker_thinking; use the configured default profile/);
-  assert.doesNotMatch(prompt, /set worker_thinking=low for low risk/);
+  assert.doesNotMatch(prompt, /set worker_thinking to the assessed risk/);
   assert.match(prompt, /Only an explicit user effort request for the current task overrides it; never rewrite the persisted thinking profile/);
 });
 
@@ -960,13 +1081,14 @@ test("buildLeadProtocolReminder derives each clause from the effective workflow 
 
   // adaptiveWorkerEffort off: no risk-to-effort mapping.
   const noEffort = buildLeadProtocolReminder({ ...DEFAULT_ORCHESTRATOR_CONFIG, adaptiveWorkerEffort: false });
-  assert.doesNotMatch(noEffort, /worker_thinking=low for low risk/);
+  assert.doesNotMatch(noEffort, /worker_thinking matches risk/);
   assert.match(noEffort, /worker_thinking=configured default/);
 
-  // adaptivePlanning off: no compact-plan shortcut.
+  // adaptivePlanning off: no risk-tiered planning shortcut.
   const noPlanning = buildLeadProtocolReminder({ ...DEFAULT_ORCHESTRATOR_CONFIG, adaptivePlanning: false });
   assert.doesNotMatch(noPlanning, /compact_plan/);
-  assert.match(noPlanning, /planning toggle off=decision_graph with gates for every risk/);
+  assert.doesNotMatch(noPlanning, /standard_plan/);
+  assert.match(noPlanning, /planning toggle off=decision_graph for every medium\/high risk/);
 
   // Escalation and explicit-effort policy stay on in every configuration.
   for (const reminder of [noVerify, noReview, noEffort, noPlanning]) {
@@ -1368,7 +1490,7 @@ test("OpenAIWebRuntime injects the always-on Lead contract into buildPrompt", ()
   // Continuation (bootstrapped) carries the concise protocol reminder.
   const prompt2 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Next step" }] }, { bootstrapped: true, syncedMessageCount: 0 });
   assert.match(prompt2, /\[LEAD-MODE: active/);
-  assert.match(prompt2, /\[LEAD-PROTOCOL:.*medium\/high=decision_graph with gates/);
+  assert.match(prompt2, /\[LEAD-PROTOCOL:.*medium=standard_plan, high=decision_graph/);
   assert.match(prompt2, /escalate, never downgrade/);
   assert.match(prompt2, /zai\/glm-5\.3/);
   assert.match(prompt2, /Next step/);
@@ -1411,11 +1533,12 @@ test("runtime continuation reminder follows the effective workflow toggles and l
   assert.match(prompt, /default_thinking: high \(fallback; explicit user effort wins\)/);
   assert.doesNotMatch(prompt, /\[LEAD-MODE: active \(worker: [^)]*, thinking:/);
   // The protocol reminder matches the disabled toggles instead of the static all-gates policy.
-  assert.match(prompt, /planning toggle off=decision_graph with gates for every risk/);
+  assert.match(prompt, /planning toggle off=decision_graph for every medium\/high risk/);
   assert.match(prompt, /worker_thinking=configured default/);
   assert.match(prompt, /verification gate off=accept with run_id\+worker_id after diff review/);
   assert.match(prompt, /review loop off=inspect diff before reporting/);
   assert.doesNotMatch(prompt, /compact_plan/);
+  assert.doesNotMatch(prompt, /standard_plan/);
   assert.doesNotMatch(prompt, /verify then accept with fresh fingerprint/);
-  assert.doesNotMatch(prompt, /worker_thinking=low for low risk/);
+  assert.doesNotMatch(prompt, /worker_thinking matches risk/);
 });

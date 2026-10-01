@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph, herdrCompactPlan, herdrRiskLevel, herdrPlanningKind, createHarnessMcpFactory } from "../src/mcp/server.js";
-import { issueHerdrHandoff, issueHerdrHandoffV2, parseHerdrHandoff, planFingerprint, planFingerprintV2, assertDecisionGraph, assertRiskLevel, assertPlanningKind, compileDecisionGraph, compileCompactPlan, resolveWorkflowToggles, COMPACT_PLAN_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, DEFAULT_ORCHESTRATOR_CONFIG } from "../src/provider/orchestrator.js";
+import { validateHerdrRunInput, herdrExecutionSpec, herdrWorkers, herdrDecisionGraph, herdrCompactPlan, herdrStandardPlan, herdrRiskLevel, herdrPlanningKind, createHarnessMcpFactory } from "../src/mcp/server.js";
+import { issueHerdrHandoff, issueHerdrHandoffV2, parseHerdrHandoff, planFingerprint, planFingerprintV2, assertDecisionGraph, assertRiskLevel, assertPlanningKind, compileDecisionGraph, compileCompactPlan, compileStandardPlan, resolveWorkflowToggles, COMPACT_PLAN_VALUE_MAX, STANDARD_PLAN_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, DECISION_GRAPH_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, DEFAULT_ORCHESTRATOR_CONFIG } from "../src/provider/orchestrator.js";
 import { SubagentMcpAdapter, type AdapterRunSnapshot } from "../src/mcp/subagent-adapter.js";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -598,10 +598,11 @@ test("compact plan schema bounds at the MCP boundary", () => {
 
 test("risk and planning_kind schemas are bounded enums at the MCP boundary", () => {
   assert.deepEqual(herdrRiskLevel.options, ["low", "medium", "high"]);
-  assert.deepEqual(herdrPlanningKind.options, ["compact", "design-graph"]);
+  assert.deepEqual(herdrPlanningKind.options, ["compact", "standard", "design-graph"]);
   assert.ok(herdrRiskLevel.safeParse("low").success);
   assert.equal(herdrRiskLevel.safeParse("critical").success, false);
   assert.ok(herdrPlanningKind.safeParse("compact").success);
+  assert.ok(herdrPlanningKind.safeParse("standard").success);
   assert.equal(herdrPlanningKind.safeParse("full").success, false);
 });
 
@@ -629,5 +630,135 @@ test("herdr plan issues v2 envelopes for compact planning and run accepts them t
   // The v1 plan path is untouched: no v2 field → v1 envelope, unchanged behavior.
   const v1Planned = parseText(await sharedHerdrHandler!({ action: "plan", goal: "v1 ship", workers: toggleWorkers, gates: toggleGates, decision_graph: decisionGraph })) as { handoff: string };
   assert.equal(JSON.parse(v1Planned.handoff).protocol, "pi-provider-herdr-handoff-v1");
+});
+
+// --- Medium-risk standard plans: gate-less v2 plan/run and legacy medium design-graph compatibility ---
+
+const stdPlan = {
+  problem: "extend the provider turn lifecycle with a settle step",
+  scope: "src/provider/turn.ts and its focused test only",
+  boundaries: "turn.ts only; runtime and page modules are out of scope",
+  behavior: "settled turns finalize exactly once and late events are ignored",
+  verification: "focused turn tests pass"
+};
+
+function standardHandoff(overrides: { risk?: string; kind?: string; plan?: Record<string, string> } = {}): string {
+  return issueHerdrHandoffV2(
+    p1Goal,
+    p1Workers,
+    undefined,
+    overrides.risk ?? "medium",
+    overrides.kind ?? "standard",
+    { standardPlan: overrides.plan ?? stdPlan }
+  );
+}
+
+function stdRun(overrides: { goal?: string; plan?: Record<string, string>; risk?: string; kind?: string; handoff?: string } = {}) {
+  return {
+    goal: overrides.goal ?? p1Goal,
+    workers: p1Workers,
+    standard_plan: overrides.plan ?? stdPlan,
+    risk: overrides.risk ?? "medium",
+    planning_kind: overrides.kind ?? "standard",
+    handoff: overrides.handoff ?? standardHandoff()
+  };
+}
+
+test("standard plan schema bounds at the MCP boundary", () => {
+  assert.ok(herdrStandardPlan.safeParse(stdPlan).success);
+  const { boundaries: _boundaries, ...missing } = stdPlan;
+  assert.equal(herdrStandardPlan.safeParse(missing).success, false, "missing field rejected");
+  assert.equal(herdrStandardPlan.safeParse({ ...stdPlan, extra: "x" }).success, false, "extra field rejected");
+  assert.equal(herdrStandardPlan.safeParse({ ...stdPlan, scope: " " }).success, false, "blank field rejected");
+  assert.equal(herdrStandardPlan.safeParse({ ...stdPlan, behavior: 42 }).success, false, "non-string field rejected");
+  assert.equal(herdrStandardPlan.safeParse({ ...stdPlan, problem: "x".repeat(STANDARD_PLAN_VALUE_MAX + 1) }).success, false, "oversized field rejected");
+  assert.equal(herdrStandardPlan.safeParse("plan").success, false, "non-object rejected");
+});
+
+test("v2 medium standard plan/run round-trips without gates and binds the compiled fingerprint", () => {
+  const handoff = standardHandoff();
+  assert.equal(JSON.parse(handoff).gates, undefined, "medium standard planning carries no gate strings");
+  const authorized = validateHerdrRunInput(stdRun({ handoff }));
+  assert.deepEqual(authorized.workers, [{ id: "w1", objective: "fix import", owns: ["src/provider/token-estimate.ts"], dependsOn: [] }]);
+  assert.deepEqual(authorized.order, ["w1"]);
+  const parsed = parseHerdrHandoff(handoff);
+  assert.equal(parsed.planFingerprint, planFingerprintV2(p1Goal, p1Workers, compileStandardPlan(stdPlan), "medium", "standard"));
+  assert.deepEqual(parsed.executionSpec, compileStandardPlan(stdPlan));
+});
+
+test("v2 medium standard run fails closed on authority drift, identity drift, and mixed sources", () => {
+  const handoff = standardHandoff();
+  // Content drift: the compiled authority no longer matches the envelope's spec.
+  assert.throws(() => validateHerdrRunInput(stdRun({ handoff, plan: { ...stdPlan, scope: "everything" } })), /standard_plan differs/);
+  // Structural drift: removing a field at run time is invalid, not a value drift.
+  const { verification: _verification, ...partial } = stdPlan;
+  assert.throws(() => validateHerdrRunInput(stdRun({ handoff, plan: partial })), /standard_plan_invalid/);
+  // Identity drift: invalid pairs fail the pair check; a valid-but-different pair fails the envelope binding.
+  assert.throws(() => validateHerdrRunInput(stdRun({ handoff, risk: "high" })), /handoff_planning_mismatch/);
+  assert.throws(() => validateHerdrRunInput(stdRun({ handoff, kind: "design-graph" })), /differs from the plan/);
+  assert.throws(() => validateHerdrRunInput(stdRun({ handoff, kind: "compact" })), /handoff_planning_mismatch/);
+  assert.throws(() => validateHerdrRunInput(stdRun({ handoff, goal: "other goal" })), /fingerprint/);
+  // Structural fidelity: kind=standard must restate standard_plan, never a graph or a bare spec.
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, decision_graph: decisionGraph, risk: "medium", planning_kind: "standard", handoff }), /planning_kind=standard requires the plan's standard_plan/);
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, execution_spec: compileStandardPlan(stdPlan), risk: "medium", planning_kind: "standard", handoff }), /planning_kind=standard requires the plan's standard_plan/);
+  // Mixed authority sources stay exclusive: standard_plan + any other source fails closed.
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, standard_plan: stdPlan, compact_plan: p1CompactPlan, risk: "medium", planning_kind: "standard", handoff }), /decision_graph_exclusive/);
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, standard_plan: stdPlan, execution_spec: spec, risk: "medium", planning_kind: "standard", handoff }), /decision_graph_exclusive/);
+  assert.throws(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, standard_plan: stdPlan, decision_graph: decisionGraph, risk: "medium", planning_kind: "standard", handoff }), /decision_graph_exclusive/);
+  // v1 envelopes reject standard_plan like every other v2 field.
+  assert.throws(() => validateHerdrRunInput({ goal: base.goal, workers: base.workers, standard_plan: stdPlan, handoff: validHandoff }), /v1 envelope and does not carry risk-aware planning fields/);
+});
+
+test("v2 gates are optional at every risk: high and medium design-graph plan/run without gates", () => {
+  // High design-graph, no gates: plan, parse, and run validation all accept.
+  const highHandoff = issueHerdrHandoffV2(p1Goal, p1Workers, undefined, "high", "design-graph", { decisionGraph });
+  assert.equal(JSON.parse(highHandoff).gates, undefined);
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, decision_graph: decisionGraph, risk: "high", planning_kind: "design-graph", handoff: highHandoff }));
+  // Medium design-graph, no gates: same acceptance for the current medium graph spelling.
+  const mediumHandoff = issueHerdrHandoffV2(p1Goal, p1Workers, undefined, "medium", "design-graph", { decisionGraph });
+  assert.equal(JSON.parse(mediumHandoff).gates, undefined);
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, decision_graph: decisionGraph, risk: "medium", planning_kind: "design-graph", handoff: mediumHandoff }));
+  // Supplied gates must still validate.
+  assert.throws(() => issueHerdrHandoffV2(p1Goal, p1Workers, { graph: "graph", handoff: " ", critique: "critique" }, "high", "design-graph", { decisionGraph }), /orchestration_gate_required/);
+});
+
+test("legacy medium design-graph envelopes with gates stay parseable and runnable", () => {
+  // Envelopes issued before gates became optional (medium design-graph WITH gates) keep working.
+  const legacy = issueHerdrHandoffV2(p1Goal, p1Workers, p1Gates, "medium", "design-graph", { decisionGraph });
+  const parsed = parseHerdrHandoff(legacy);
+  assert.equal(parsed.version, "v2");
+  assert.equal(parsed.risk, "medium");
+  assert.equal(parsed.planningKind, "design-graph");
+  assert.deepEqual(parsed.gates, p1Gates);
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, decision_graph: decisionGraph, risk: "medium", planning_kind: "design-graph", handoff: legacy }));
+  // The same holds for gated high design-graph and gated low compact envelopes.
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, decision_graph: decisionGraph, risk: "high", planning_kind: "design-graph", handoff: issueHerdrHandoffV2(p1Goal, p1Workers, p1Gates, "high", "design-graph", { decisionGraph }) }));
+  assert.doesNotThrow(() => validateHerdrRunInput({ goal: p1Goal, workers: p1Workers, compact_plan: p1CompactPlan, risk: "low", planning_kind: "compact", handoff: issueHerdrHandoffV2(p1Goal, p1Workers, p1Gates, "low", "compact", { compactPlan: p1CompactPlan }) }));
+});
+
+test("herdr plan issues v2 standard envelopes and run accepts them through validation", async () => {
+  workflowsRef = resolveWorkflowToggles(DEFAULT_ORCHESTRATOR_CONFIG);
+  const planned = parseText(await sharedHerdrHandler!({ action: "plan", goal: "standard ship", workers: toggleWorkers, standard_plan: stdPlan, risk: "medium", planning_kind: "standard" })) as { ok: boolean; handoff: string };
+  assert.equal(planned.ok, true);
+  const raw = JSON.parse(planned.handoff);
+  assert.equal(raw.protocol, "pi-provider-herdr-handoff-v2");
+  assert.equal(raw.planningKind, "standard");
+  assert.equal(raw.risk, "medium");
+  assert.equal(raw.gates, undefined, "medium standard planning needs no gates");
+  // Run with the same authority passes validation and reaches the adapter (no session in unit tests).
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "run", goal: "standard ship", workers: toggleWorkers, standard_plan: stdPlan, risk: "medium", planning_kind: "standard", handoff: planned.handoff }),
+    /subagent_context_unavailable/,
+    "v2 standard run must pass validation and reach the adapter"
+  );
+  // Drifted authority fails closed before any worker starts.
+  await assert.rejects(
+    sharedHerdrHandler!({ action: "run", goal: "standard ship", workers: toggleWorkers, standard_plan: { ...stdPlan, boundaries: "everything" }, risk: "medium", planning_kind: "standard", handoff: planned.handoff }),
+    /standard_plan differs/
+  );
+  // Medium design-graph without gates also plans cleanly now (gates optional at every v2 risk).
+  const graphPlanned = parseText(await sharedHerdrHandler!({ action: "plan", goal: "graph ship", workers: toggleWorkers, decision_graph: decisionGraph, risk: "medium", planning_kind: "design-graph" })) as { ok: boolean; handoff: string };
+  assert.equal(graphPlanned.ok, true);
+  assert.equal(JSON.parse(graphPlanned.handoff).gates, undefined);
 });
 

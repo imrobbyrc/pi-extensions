@@ -10,10 +10,10 @@ npm test
 ## Unit coverage by suite
 
 - `@imrobbyrc/pi-core-subagent` — package API, scheduler/DAG, Herdr runtime, steering, resume and cancellation; run its separate `bun test` suite.
-- `herdr-gate.test.ts` — plan/run binding, gates, work-graph limits, confirmation and toggle enforcement.
+- `herdr-gate.test.ts` — plan/run binding, gates, standard/compact/graph authorities, work-graph limits, confirmation and toggle enforcement.
 - `herdr-review-flow.test.ts` — same-pane correction, observational verification, risk-bound accept and freshness checks.
 - `subagent-adapter.test.ts` — minimal worker prompt projection, replay protection and concurrency plumbing.
-- `orchestrator.test.ts` — profile persistence, v1/v2 plan shapes, risk–planning pairing, optional v2-low gates, fingerprint binding, prompt budget and 1–4 CLI limits.
+- `orchestrator.test.ts` — profile persistence, v1/v2 plan shapes, risk–planning pairing (low compact / medium standard or design-graph / high design-graph), optional v2 gates at every risk, fingerprint binding, prompt budget and 1–4 CLI limits.
 - `orchestrator-gui.test.ts` — TUI settings (model picker, 1–4 concurrency, toggles, save/apply).
 - `provider-catalog.test.ts` — deterministic model ids, cache TTLs, last-known-good cache behavior, schema versioning.
 - `provider-features.test.ts` — session store, resume metadata, picker state freshness, compaction checkpoints.
@@ -39,7 +39,8 @@ Use the current output of `npm test` for test counts; do not rely on historical 
 - `scripts/live-discovery-probe.ts` — real model discovery against configured CDP.
 - `npm run doctor` — host prerequisites (Node, Git, Pi, CDP reachability).
 - Low v2: compact plan without gates → run with identical authority → inspect diff → accept with bound handoff and no fingerprint. Check wrong handoff fails.
-- Medium/high and v1: full graph/gates or legacy handoff → run → verify → fresh-fingerprint accept. Change the workspace or correct the worker before accept; stale fingerprints must fail.
+- Medium v2 standard: standard_plan without gates → run with identical authority → inspect diff → accept with bound handoff and no fingerprint. Check medium design-graph (legacy, gated or not) still demands a fresh fingerprint.
+- High v2 and v1: full graph (gates optional for v2) or legacy handoff → run → verify → fresh-fingerprint accept. Change the workspace or correct the worker before accept; stale fingerprints must fail.
 - Concurrency: two independent workers at configured limit 1 run serially; raising the limit permits concurrent ready workers. Verify ownership and DAG checks remain active.
 - Correction: reuse the same pane, re-review, then verify and accept strict work. Confirm TUI approval and pane cleanup.
-- Adaptive effort: low uses `worker_thinking=low`, medium/high uses `high`; an explicit user setting wins without rewriting persisted config. `adaptivePlanning=false` retains full-graph guidance. `verificationGate=false` does not remove semantic diff review.
+- Adaptive effort: low uses `worker_thinking=low`, medium uses `medium`, high uses `high`; an explicit user setting wins without rewriting persisted config. `adaptivePlanning=false` retains full-graph guidance. `verificationGate=false` does not remove semantic diff review.
