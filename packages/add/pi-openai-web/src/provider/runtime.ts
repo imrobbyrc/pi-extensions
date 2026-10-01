@@ -7,7 +7,7 @@ import { treeToMarkdown, type DomTreeNode } from "./answer.js";
 import {
   assistantRevisionRequiresSerialization, attach, captureAssistantTurn, currentUrl, enablePage, ensureTemporaryChat, evalJson, isTemporaryChat,
   readAssistantTurnRevision, readTurnState, sleep, stopGeneration, submitPrompt,
-  waitForComposer, waitForConversationUrl, type AssistantTurnProbe, type CdpClient,
+  waitForComposer, waitForConversationUrl, type AssistantTurnCapture, type AssistantTurnProbe, type CdpClient,
   type SerializedAssistantTurn, type TurnDomState
 } from "./page.js";
 import { selectEffortExact, selectionIsProvenExact, selectModelExact } from "./model-picker.js";
@@ -736,6 +736,10 @@ export class OpenAIWebRuntime {
       const identity = state.responseIdentities.find(candidate => !initialResponseIdentities.has(candidate));
       let currentFullMarkdown = "";
       let probe: AssistantTurnProbe | undefined;
+      // This poll's atomic capture, when one was taken. The capture reads a
+      // later DOM revision than the probe, so its busy/stop flags outrank the
+      // probe's whenever the two diverge.
+      let capture: AssistantTurnCapture | undefined;
       if (identity) {
         // Probe the cheap revision fingerprint first: an unchanged revision
         // reuses the last snapshot. Shrinks and same-length rewrites change
@@ -751,10 +755,18 @@ export class OpenAIWebRuntime {
         if (assistantRevisionRequiresSerialization(lastSerialized, identity, probe)) {
           // One atomic capture provides the streamed markdown and the exact
           // revision it was serialized at — no second evaluation pass.
-          const capture = await captureAssistantTurn(conversation.client, identity).catch(() => undefined);
+          capture = await captureAssistantTurn(conversation.client, identity).catch(() => undefined);
           const tree = capture?.identity === identity ? capture.tree : undefined;
           currentFullMarkdown = tree ? treeToMarkdown(tree as DomTreeNode) : "";
-          if (capture?.identity === identity) lastSerialized = { identity, revision: capture.revision };
+          if (capture?.identity === identity) {
+            lastSerialized = { identity, revision: capture.revision };
+          } else {
+            // Capture missing or rebound elsewhere (remount in progress): the
+            // cached serialization no longer proves the DOM. Drop it so the
+            // message cannot reappear with the same revision and replay the
+            // stale — possibly emptied — snapshot instead of reserializing.
+            lastSerialized = undefined;
+          }
         } else {
           currentFullMarkdown = lastText;
         }
@@ -787,10 +799,14 @@ export class OpenAIWebRuntime {
         // plus its completion/busy flags proves the stable snapshot without
         // serializing the reply again. Opening a window trusts the revision
         // the markdown was serialized at (this poll's atomic capture on
-        // change, the probe-verified cache otherwise); completion itself is
-        // always verified by one final atomic full capture.
+        // change, the probe-verified cache otherwise) and requires that
+        // capture to have been calm when probe and capture diverge — the
+        // capture saw the newer DOM. Completion itself is always verified by
+        // one final atomic full capture.
         const kind: CompletionSettle["kind"] | undefined =
-          identity && probe && !probe.busy ? (probe.completionVisible ? "semantic" : "fallback") : undefined;
+          identity && probe && !probe.busy && !(capture?.busy || capture?.stopVisible)
+            ? (probe.completionVisible ? "semantic" : "fallback")
+            : undefined;
         if (!kind || (settle && (settle.identity !== identity || settle.markdown !== turnMarkdown || settle.kind !== kind))) {
           settle = undefined;
         }
@@ -817,9 +833,11 @@ export class OpenAIWebRuntime {
             settle = undefined;
           }
         }
-      } else if (identity && !probe) {
-        // Bound message element vanished (remount in progress): a settle
-        // window opened against it must not survive the gap.
+      } else {
+        // Not busy and no bound text: the response or its message element is
+        // gone, or the capture failed (remount gap / pre-text shell). A settle
+        // window opened against earlier text must not survive the gap — the
+        // remounted message earns a fresh full settle window, never the old one.
         settle = undefined;
       }
 

@@ -96,7 +96,12 @@ function domState(overrides: Partial<TurnDomState>): TurnDomState {
   };
 }
 
-interface Frame { state: TurnDomState; tree?: unknown }
+interface Frame {
+  state: TurnDomState;
+  tree?: unknown;
+  /** Overrides the atomic capture's busy/stop flags to simulate probe/capture divergence. */
+  captureState?: { busy?: boolean; stopVisible?: boolean };
+}
 
 const spinner = (): Frame => ({ state: domState({ stopVisible: true, busy: true }) });
 const domQuiet = (): Frame => ({ state: domState({}) });
@@ -153,8 +158,8 @@ function watchClient(frames: Frame[]) {
           const json = JSON.stringify(current.tree);
           return { result: { value: {
             identity: current.state.responseIdentities[0],
-            busy: current.state.busy,
-            stopVisible: current.state.stopVisible,
+            busy: current.captureState?.busy ?? current.state.busy,
+            stopVisible: current.captureState?.stopVisible ?? current.state.stopVisible,
             completionVisible: current.state.completionActionVisible,
             revision: { textLength: json.length, textChecksum: checksum(json), childCount: 0, linkChecksum: 0, languageKey: "" },
             tree: current.tree
@@ -471,6 +476,131 @@ test("missing message mid-settle resets settling without a stale completion", as
     assert.equal(outcome.markdown, "Answer");
     assert.deepEqual(emitted, ["Answer"]);
     assert.ok(h.pollCount() >= 6, `missing message must restart the settle window, got ${h.pollCount()} polls`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("remount gap during busy capture invalidates the cache; same revision reserializes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-remount-recover-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 });
+    const emitted: string[] = [];
+    // Poll two drops the bound element while ChatGPT is busy: probe and
+    // capture both fail, and the busy branch streams an empty snapshot,
+    // emptying lastText. When the same message remounts with the SAME
+    // revision, a retained cache would replay that empty snapshot forever
+    // (the revision matches, so it is never reserialized). The failed
+    // capture must invalidate the cache so the remounted reply reserializes
+    // and the turn completes with the final nonempty reply.
+    const h = makeWatchHarness(
+      cfg,
+      [
+        completedFrame("r1", "Final reply"),
+        { state: domState({ stopVisible: true, busy: true, responseIdentities: ["r1"] }) }, // element gone mid-remount
+        completedFrame("r1", "Final reply"),
+        completedFrame("r1", "Final reply"),
+        completedFrame("r1", "Final reply"),
+        completedFrame("r1", "Final reply"),
+        completedFrame("r1", "Final reply")
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Final reply");
+    // The empty gap emission is recovered by a fresh serialization.
+    assert.deepEqual(emitted, ["Final reply", "", "Final reply"]);
+    // Four capture attempts: first sight, the failed gap capture, the
+    // post-gap reserialization of the same revision, and the final verify.
+    // (A retained cache would attempt only two and then serve empty forever.)
+    assert.equal(h.serializeCount(), 4);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("no-identity gap resets the settle window: remount earns a full settle duration", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-settle-identity-gap-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 });
+    const emitted: string[] = [];
+    // Poll three loses the response identity entirely (whole turn remounts).
+    // A settle window opened before the gap must not survive it: when the
+    // same message remounts with identical content, completion must be
+    // re-earned over a full settle duration measured from the reappearance —
+    // never resumed from the pre-gap window's elapsed time and observations.
+    const h = makeWatchHarness(
+      cfg,
+      [
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        domQuiet(), // identity gone: not busy, no response identities
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer"),
+        completedFrame("r1", "Answer")
+      ],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Answer");
+    // The quiet gap poll must not stream an empty snapshot.
+    assert.deepEqual(emitted, ["Answer"]);
+    assert.ok(h.pollCount() >= 6, `remount must earn a fresh full settle window, got ${h.pollCount()} polls`);
+    const timestamps = h.pollTimestamps;
+    const last = timestamps[timestamps.length - 1]!;
+    const reappeared = timestamps[3]!;
+    assert.ok(
+      last - reappeared >= 1_250,
+      `completion after remount must span the full semantic settle duration, got ${last - reappeared}ms`
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("busy atomic capture overrides a calm probe: no settle window on divergent polls", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-capture-divergence-"));
+  try {
+    const cfg = {
+      ...baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 60_000 }),
+      providerPollActiveMs: 700,
+      providerPollIdleMs: 700
+    };
+    const emitted: string[] = [];
+    // Poll one: the probe reads a calm DOM, but the later atomic capture sees
+    // the message busy again (shimmer resumed between the two reads). The
+    // capture read the newer DOM, so no settle window may open on that poll;
+    // completion is re-earned over a full calm window and still gated by the
+    // final atomic verification.
+    const divergent: Frame = {
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
+      tree: { tag: "p", children: [{ tag: "#text", text: "Alpha" }] },
+      captureState: { busy: true }
+    };
+    const h = makeWatchHarness(
+      cfg,
+      [divergent, completedFrame("r1", "Alpha"), completedFrame("r1", "Alpha"), completedFrame("r1", "Alpha"), completedFrame("r1", "Alpha")],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Alpha");
+    assert.deepEqual(emitted, ["Alpha"]);
+    // With 700ms polls the semantic window (3 observations, >=1250ms) ends on
+    // poll three when a stale calm probe opens it on the divergent poll one,
+    // but no earlier than poll four when the window only opens on poll two.
+    assert.ok(
+      h.pollCount() >= 4,
+      `a divergent busy capture must not count toward settling, got ${h.pollCount()} polls`
+    );
+    assert.equal(h.serializeCount(), 2); // first sight + final atomic verification
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
