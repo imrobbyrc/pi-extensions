@@ -39,6 +39,19 @@ function readSkillBody(filePath: string): string {
 	}
 }
 
+function stripSkillsCatalog(systemPrompt: string): string | undefined {
+	const openTag = "<available_skills>";
+	const closeTag = "</available_skills>";
+	const start = systemPrompt.indexOf(openTag);
+	const close = systemPrompt.indexOf(closeTag, start);
+	if (start < 0 || close < 0) return undefined;
+
+	// Remove heading/instructions immediately before catalog, without relying on their wording.
+	const sectionStart = systemPrompt.lastIndexOf("\n\n", start);
+	const end = close + closeTag.length;
+	return systemPrompt.slice(0, sectionStart < 0 ? start : sectionStart) + systemPrompt.slice(end);
+}
+
 export default async function (pi: ExtensionAPI) {
 	let catalog: SkillEntry[] = [];
 	let toolRegistered = false;
@@ -54,12 +67,9 @@ export default async function (pi: ExtensionAPI) {
 			baseDir: s.baseDir,
 			disableModelInvocation: s.disableModelInvocation,
 		}));
-		const stripped = event.systemPrompt.replace(
-			/\n\nThe following skills provide specialized instructions for specific tasks\.\nUse the read tool to load a skill's file[\s\S]*<\/available_skills>\n?/,
-			"",
-		);
-		if (stripped === event.systemPrompt) {
-			console.warn("[pi-core-skill-tool] strip failed — pi's skills prompt format changed; catalog left intact");
+		const stripped = stripSkillsCatalog(event.systemPrompt);
+		if (stripped === undefined) {
+			console.warn("[pi-core-skill-tool] strip failed — skill catalog markers not found; catalog left intact");
 		}
 		// H1: the tool's description must carry the populated catalog, so register
 		// lazily on the FIRST agent start (registration snapshots the description).
