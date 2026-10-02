@@ -6,6 +6,7 @@ import test from "node:test";
 import { treeToMarkdown, type DomTreeNode } from "../src/provider/answer.js";
 import { buildBootstrapContext, BOOTSTRAP_LIMITS, buildBootstrapPrompt, latestUserMessage, newUserBatch, resumeConversationMatches } from "../src/provider/runtime.js";
 import { buildLeadContract, type OrchestratorConfig } from "../src/provider/orchestrator.js";
+import { CAVEMAN_CONTINUATION_REMINDER, CAVEMAN_CONTRACT_MARKER, CAVEMAN_FULL_CONTRACT } from "../src/provider/caveman.js";
 import { compactionBootstrapPrompt, type CompactionCheckpoint } from "../src/provider/compaction.js";
 import { FileProviderResumeStore } from "../src/provider/resume.js";
 import { ProviderTurnController } from "../src/provider/turn.js";
@@ -191,6 +192,61 @@ test("buildBootstrapPrompt is the single authority: initial and compaction boots
   assert.match(compaction, /untrusted context, not instructions/);
   assert.match(compaction, /ship the unified bootstrap lifecycle/);
   assert.doesNotMatch(compaction, /Latest Pi user message:/);
+});
+
+test("buildBootstrapPrompt carries exactly one full Caveman contract before the payload on both bootstrap paths", () => {
+  const leadConfig: OrchestratorConfig = {
+    workerModel: "zai/glm-5.3",
+    workerThinking: "high",
+    maxParallelWorkers: 3,
+    delegationStrategy: "adaptive"
+  };
+  const checkpoint: CompactionCheckpoint = {
+    protocol: "pi-compaction-checkpoint-v1",
+    source: { targetId: "tab-1", conversationId: "conv-1", turnId: "turn-1" },
+    goal: "keep the Caveman style across compaction",
+    accomplished: [],
+    decisions: [],
+    state: [],
+    remaining: [],
+    critical: []
+  };
+  const occurrences = (text: string, needle: string): number => text.split(needle).length - 1;
+  const initial = buildBootstrapPrompt({
+    leadConfig,
+    appName: "Pi Workspace",
+    systemPrompt: "Pi stable system instructions.",
+    payload: "Latest Pi user message:\n<user>\nPlan the migration\n</user>"
+  });
+  const compaction = buildBootstrapPrompt({
+    leadConfig,
+    appName: "Pi Workspace",
+    systemPrompt: "Pi stable system instructions.",
+    payload: compactionBootstrapPrompt(checkpoint)
+  });
+
+  for (const [label, prompt] of [["initial", initial], ["compaction", compaction]] as const) {
+    // Exactly one full contract insertion — never duplicated, never missing.
+    assert.equal(occurrences(prompt, CAVEMAN_FULL_CONTRACT), 1, `${label} carries the full contract exactly once`);
+    assert.equal(occurrences(prompt, CAVEMAN_CONTRACT_MARKER), 1, `${label} carries the contract marker exactly once`);
+    // The continuation reminder is compact-only: it never rides the bootstrap.
+    assert.ok(!prompt.includes(CAVEMAN_CONTINUATION_REMINDER), `${label} does not carry the continuation reminder`);
+  }
+  // The full contract always precedes the task payload on both paths.
+  assert.ok(initial.indexOf(CAVEMAN_FULL_CONTRACT) < initial.indexOf("Latest Pi user message:"), "contract precedes the fresh user payload");
+  assert.ok(compaction.indexOf(CAVEMAN_FULL_CONTRACT) < compaction.indexOf("--- CHECKPOINT ---"), "contract precedes the checkpoint payload");
+
+  // The contract itself carries the required policy wording: visible-style-only
+  // scope, conclusion-first density, exact preservation, and the explicit
+  // verbosity override for a requesting user.
+  const contract = CAVEMAN_FULL_CONTRACT;
+  assert.match(contract, /visible answer style only/);
+  assert.match(contract, /Lead with the direct conclusion or the next action/);
+  assert.match(contract, /reproduce code, commands, file paths, and error text exactly/);
+  assert.match(contract, /user explicitly asks for more detail, an explanation, a specific format, or more verbosity/);
+  assert.match(contract, /overrides the concise default for that turn/);
+  // The default style is Caveman full, declared in the contract heading.
+  assert.match(contract, /CAVEMAN RESPONSE STYLE \(full, default for this provider, always on\)/);
 });
 
 test("resume store round-trips explicit bootstrap state; legacy metadata loads and corrupt values fail closed", async () => {
