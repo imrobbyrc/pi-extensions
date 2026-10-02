@@ -176,10 +176,12 @@ export async function submitPrompt(client: CdpClient, text: string, options: { s
 const TURN_BUSY_HELPERS = `
     const busyMarkerRendered = (el) => el.offsetParent !== null
       || (typeof el.getClientRects === 'function' && el.getClientRects().length > 0);
-    // Root-flag staleness rule shared by busy semantics and the revision/
-    // serialization fold below (revisionOf runs after this block in the probe
-    // and capture expressions): the bound message's own aria-busy is residue
-    // once the same turn exposes its completion action.
+    // Root-flag staleness rule for BUSY SEMANTICS only (messageBusy below):
+    // the bound message's own aria-busy is residue once the same turn exposes
+    // its completion action. The revision/serialization fold does NOT use this
+    // rule — it always exempts the bound message root from its own flag so a
+    // streaming reply (root aria-busy, no completion action yet) still folds
+    // and serializes its partial text instead of an empty tree.
     const rootBusyResidue = (message) => message.getAttribute('aria-busy') === 'true'
       && Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}'));
     const messageBusy = (message) => {
@@ -403,22 +405,25 @@ const TURN_REVISION_HELPERS = `
       for (let index = 0; index < name.length; index += 1) sum = (Math.imul(31, sum) + name.charCodeAt(index)) | 0;
       return sum;
     };
-    const structureChecksum = (node, depth, inPre, busyResidueRoot) => {
+    const structureChecksum = (node, depth, inPre, busyExemptRoot) => {
       if (node.nodeType === Node.TEXT_NODE) return (Math.imul(31, (node.textContent || '').length) + depth + 1) | 0;
       // Skipped nodes contribute nothing at all — exactly like the capture
       // serializer drops them — so excluded chrome churn cannot perturb the fold.
       // Marked-exclude UI is dropped even inside PRE-like containers: the
       // serializer's code-block normalization never emits it either way. The
-      // bound message's own stale root aria-busy (rootBusyResidue, defined by
-      // TURN_BUSY_HELPERS which runs before revisionOf is invoked) does not
-      // exclude the message: a completed reply still folds and serializes.
-      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node, node === busyResidueRoot))) return null;
+      // bound message root (busyExemptRoot, always the message itself) never
+      // excludes itself via its own aria-busy: while ChatGPT streams, that
+      // root flag is LIVE (messageBusy reports busy), yet the partial reply
+      // under it must still fold — otherwise the revision fingerprint stays
+      // null for the whole generation and no delta ever streams. Rendered
+      // busy DESCENDANTS stay excluded exactly like the serializer keeps them.
+      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node, node === busyExemptRoot))) return null;
       let sum = (Math.imul(depth + 1, 1000003) + tagHash(node.tagName)) | 0;
       // Fold the data-markdown-copy marker itself: flipping it on identical
       // markup changes what the serializer would keep, so it must change the fold.
       if (markedCopy(node)) sum = (Math.imul(31, sum) + tagHash(markedCopy(node))) | 0;
       for (let index = 0; index < node.childNodes.length; index += 1) {
-        const childSum = structureChecksum(node.childNodes[index], depth + 1, inPre || node.tagName === 'PRE' || isMarkedCodeBlock(node), busyResidueRoot);
+        const childSum = structureChecksum(node.childNodes[index], depth + 1, inPre || node.tagName === 'PRE' || isMarkedCodeBlock(node), busyExemptRoot);
         if (childSum !== null) sum = (Math.imul(31, sum) + childSum) | 0;
       }
       return sum;
@@ -433,7 +438,7 @@ const TURN_REVISION_HELPERS = `
         childCount: message.childElementCount,
         linkChecksum: checksum(links),
         languageKey,
-        structureChecksum: structureChecksum(message, 0, false, rootBusyResidue(message) ? message : null)
+        structureChecksum: structureChecksum(message, 0, false, message)
       };
     };
 `;
@@ -512,12 +517,12 @@ export async function captureAssistantTurn(client: CdpClient, identity: string):
       if (language) entry.language = language;
       return entry;
     };
-    const serialize = (node, inPre, busyResidueRoot) => {
+    const serialize = (node, inPre, busyExemptRoot) => {
       if (node.nodeType === Node.TEXT_NODE) return { tag: '#text', text: node.textContent };
-      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node, node === busyResidueRoot))) return null;
+      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node, node === busyExemptRoot))) return null;
       if (isMarkedCodeBlock(node)) { const normalized = serializeCodeBlock(node); if (normalized) return normalized; }
       const tag = node.tagName.toLowerCase();
-      const children = [...node.childNodes].map(child => serialize(child, inPre || node.tagName === 'PRE', busyResidueRoot)).filter(Boolean);
+      const children = [...node.childNodes].map(child => serialize(child, inPre || node.tagName === 'PRE', busyExemptRoot)).filter(Boolean);
       const entry = { tag, children };
       if (node.tagName === 'A' && node.getAttribute('href')) entry.href = node.getAttribute('href');
       if (node.tagName === 'PRE') entry.language = languageOf(node);
@@ -530,7 +535,11 @@ export async function captureAssistantTurn(client: CdpClient, identity: string):
       stopVisible: Boolean([...document.querySelectorAll('${STOP_BUTTON_SELECTOR}')].find(el => el.offsetParent !== null)),
       completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
       revision: revisionOf(message),
-      tree: serialize(message, false, rootBusyResidue(message) ? message : null)
+      // The bound message root is always exempt from its own aria-busy so a
+      // streaming reply serializes its partial text (live deltas) instead of
+      // an empty tree; busy evidence still lives in messageBusy above, which
+      // gates settle/completion exactly as before.
+      tree: serialize(message, false, message)
     };
   }`);
   return capture ?? undefined;
