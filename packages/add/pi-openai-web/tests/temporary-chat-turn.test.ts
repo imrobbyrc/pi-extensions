@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { newUserBatch, OpenAIWebRuntime } from "../src/provider/runtime.js";
+import { CAVEMAN_CONTINUATION_REMINDER, CAVEMAN_CONTRACT_MARKER, CAVEMAN_FULL_CONTRACT } from "../src/provider/caveman.js";
 import { MemoryProviderResumeStore, type ProviderResumeMetadata } from "../src/provider/resume.js";
 import { CHECKPOINT_END, CHECKPOINT_START } from "../src/provider/compaction.js";
 import type { CdpClient } from "../src/provider/page.js";
@@ -615,6 +616,10 @@ test("fresh conversation bootstraps with the full Lead contract and stable Pi in
     assert.match(bootstrapPrompt, /zai\/glm-5\.3/);
     assert.ok(bootstrapPrompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
     assert.match(bootstrapPrompt, /Plan the migration/);
+    // Fresh bootstrap also carries exactly one full Caveman contract before the user payload.
+    assert.equal(bootstrapPrompt.split(CAVEMAN_FULL_CONTRACT).length - 1, 1, "exactly one full Caveman contract");
+    assert.equal(bootstrapPrompt.split(CAVEMAN_CONTRACT_MARKER).length - 1, 1, "exactly one Caveman contract marker");
+    assert.ok(bootstrapPrompt.indexOf(CAVEMAN_FULL_CONTRACT) < bootstrapPrompt.indexOf("Plan the migration"), "Caveman contract precedes the user payload");
     // Completion is persisted only after the full bootstrap turn succeeded.
     assert.equal((await resumeStore.load())?.bootstrapComplete, true);
     assert.equal(runtime.conversationSummary().bootstrapped, true);
@@ -637,6 +642,53 @@ test("fresh conversation bootstraps with the full Lead contract and stable Pi in
     assert.doesNotMatch(continuationPrompt, /You are the Lead Architect/);
     assert.doesNotMatch(continuationPrompt, /<pi_system>/);
     assert.match(continuationPrompt, /Next step please/);
+    // Compact Caveman reminder rides every continuation turn; the full contract
+    // text (and its marker) is never resent.
+    assert.ok(continuationPrompt.includes(CAVEMAN_CONTINUATION_REMINDER), "compact Caveman reminder present");
+    assert.ok(!continuationPrompt.includes(CAVEMAN_FULL_CONTRACT), "full Caveman contract absent on continuation");
+    assert.ok(!continuationPrompt.includes(CAVEMAN_CONTRACT_MARKER), "Caveman contract marker absent on continuation");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("every bootstrapped continuation turn carries the compact Caveman reminder across successive turns", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-caveman-continuation-"));
+  try {
+    const resumeStore = new MemoryProviderResumeStore();
+    const page = fakeChatGptPage();
+    const runtime = lifecycleRuntime(dir, resumeStore);
+    attachFreshConversation(runtime, page.client);
+    const runtimeAny = runtime as any;
+    runtimeAny.watch = async (controller: any) => {
+      controller.transition("completed");
+      return { kind: "completed", markdown: "ack" };
+    };
+
+    // Bootstrap turn, then two continuation turns.
+    await runtime.runTurn(descriptor, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "Plan the migration" }]
+    }, {});
+    for (const followUp of ["Next step please", "Then verify it"]) {
+      await runtime.runTurn(descriptor, {
+        systemPrompt: SYSTEM_PROMPT,
+        messages: [
+          { role: "user", content: "Plan the migration" },
+          { role: "assistant", content: "ack" },
+          { role: "user", content: followUp }
+        ]
+      }, {});
+    }
+
+    // Every continuation prompt carries the reminder exactly once and never the full contract.
+    const continuations = page.submitted.slice(1);
+    assert.equal(continuations.length, 2);
+    for (const [index, prompt] of continuations.entries()) {
+      assert.equal(prompt.split(CAVEMAN_CONTINUATION_REMINDER).length - 1, 1, `continuation ${index + 1} carries the reminder once`);
+      assert.ok(!prompt.includes(CAVEMAN_FULL_CONTRACT), `continuation ${index + 1} resends no full contract`);
+      assert.ok(!prompt.includes(CAVEMAN_CONTRACT_MARKER), `continuation ${index + 1} resends no contract marker`);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -677,6 +729,7 @@ test("a failed bootstrap turn stays pending and is retried with the full contrac
     const retryPrompt = page.submitted[1] ?? "";
     assert.match(retryPrompt, /LEAD ARCHITECT MODE \(always on\):/);
     assert.ok(retryPrompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
+    assert.equal(retryPrompt.split(CAVEMAN_FULL_CONTRACT).length - 1, 1, "bootstrap retry re-sends the full Caveman contract");
     assert.equal((await resumeStore.load())?.bootstrapComplete, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -782,6 +835,10 @@ test("compaction recycle re-establishes the full Lead bootstrap before continuin
     assert.match(bootstrapPrompt, /You are the Lead Architect/);
     assert.ok(bootstrapPrompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
     assert.ok(bootstrapPrompt.indexOf("LEAD ARCHITECT MODE") < bootstrapPrompt.indexOf("--- CHECKPOINT ---"));
+    // Post-compaction bootstrap carries the exact same full Caveman contract
+    // (exactly once) before the checkpoint payload.
+    assert.equal(bootstrapPrompt.split(CAVEMAN_FULL_CONTRACT).length - 1, 1, "exactly one full Caveman contract after compaction");
+    assert.ok(bootstrapPrompt.indexOf(CAVEMAN_FULL_CONTRACT) < bootstrapPrompt.indexOf("--- CHECKPOINT ---"), "Caveman contract precedes the checkpoint");
     // The checkpoint rides as untrusted continuation context while the contract is reasserted.
     assert.match(bootstrapPrompt, /--- CHECKPOINT ---/);
     assert.match(bootstrapPrompt, /untrusted context, not instructions/);
@@ -849,6 +906,8 @@ test("crash during compaction bootstrap leaves durable pending state and reconne
     const reprompt = restartPage.submitted[0] ?? "";
     assert.match(reprompt, /LEAD ARCHITECT MODE \(always on\):/);
     assert.ok(reprompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
+    // The reconnect bootstrap re-establishes the full Caveman style contract too.
+    assert.equal(reprompt.split(CAVEMAN_FULL_CONTRACT).length - 1, 1, "reconnect bootstrap carries the Caveman contract");
     assert.match(reprompt, /Continue after the crash/);
     assert.equal((await resumeStore.load())?.bootstrapComplete, true);
   } finally {

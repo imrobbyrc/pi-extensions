@@ -17,6 +17,7 @@ import { canonicalHistoryFallback, checkpointIsFrom, compactionBootstrapPrompt, 
 import { SessionStore } from "./session-store.js";
 import type { OpenAIWebModelDescriptor } from "./types.js";
 import { buildLeadContract, buildLeadProtocolReminder, type OrchestratorConfig } from "./orchestrator.js";
+import { CAVEMAN_CONTINUATION_REMINDER, CAVEMAN_FULL_CONTRACT } from "./caveman.js";
 import type { ProviderResumeMetadata, ProviderResumeStore } from "./resume.js";
 
 /** Centralized limits for the deliberately lean provider bootstrap. */
@@ -185,14 +186,16 @@ export interface BootstrapPromptInput {
  * The single authoritative full-bootstrap turn text. Initial conversation
  * creation and post-compaction Temporary Chat recycle both build their
  * bootstrap prompts through this one function — only the trailing payload
- * differs — so the full Lead contract and the stable Pi instructions can
- * never drift semantically between the two bootstrap paths.
+ * differs — so the full Lead contract, the Caveman full response-style
+ * contract, and the stable Pi instructions can never drift semantically
+ * between the two bootstrap paths.
  */
 export function buildBootstrapPrompt(input: BootstrapPromptInput): string {
   const stableContext = buildBootstrapContext(input);
   return [
     "You are the selected ChatGPT model inside Pi. Pi executes workspace tools.",
     buildLeadContract(input.leadConfig, input.appName),
+    CAVEMAN_FULL_CONTRACT,
     ...(stableContext ? ["", "Stable Pi instructions:", stableContext] : []),
     "",
     input.payload
@@ -664,6 +667,7 @@ export class OpenAIWebRuntime {
     return [
       leadReminder,
       buildLeadProtocolReminder(lead),
+      CAVEMAN_CONTINUATION_REMINDER,
       "Continuing the same Pi conversation; only the new user message batch follows.",
       "",
       `<user>\n${truncate(userBatch, BOOTSTRAP_LIMITS.userBatchMax)}\n</user>`
