@@ -139,10 +139,15 @@ export class OpenAIWebModelCatalog {
   }
 
   shouldRefresh(): boolean {
+    // A failed attempt (including a failed first attempt that left the catalog
+    // empty) backs off from the attempt itself, not from the last success —
+    // otherwise a stale or empty catalog would retrigger discovery on every call.
+    if (this.lastDiscoveryError !== undefined && this.lastAttemptAt !== undefined) {
+      return (this.deps.now ?? Date.now)() - this.lastAttemptAt >= this.deps.limits.failureRetryMs;
+    }
     if (!this.descriptors.length) return true;
     const age = this.ageMs ?? Number.POSITIVE_INFINITY;
-    const ttl = this.lastDiscoveryError ? this.deps.limits.failureRetryMs : this.deps.limits.successTtlMs;
-    return age >= ttl;
+    return age >= this.deps.limits.successTtlMs;
   }
 
   /** Fresh discovery; cache is replaced only on a complete valid catalog. Single-flight. */
