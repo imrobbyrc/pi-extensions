@@ -78,6 +78,59 @@ test("completed turn returns final text with stop reason", async () => {
 
 ;
 
+test("text_delta is observable on the stream before the runtime turn resolves", async () => {
+  // Live streaming seam: while ChatGPT Web is still generating, the runtime
+  // invokes handlers.onText with partial text long before runTurn resolves.
+  // The provider must push those snapshots onto the AssistantMessageEventStream
+  // immediately (pi-ai delivers pushed events to a waiting consumer), so a
+  // text_delta must be observable BEFORE the runtime promise settles.
+  let release!: (value: void) => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let onTextAt = 0;
+  const runtime = {
+    resolveDescriptor: () => descriptor(),
+    runTurn: async (
+      _d: OpenAIWebModelDescriptor,
+      _c: { messages: unknown[] },
+      handlers: FakeTurnCall["handlers"]
+    ) => {
+      handlers.onText?.("Live partial answer");
+      onTextAt = Date.now();
+      await blocked; // still generating: Pi must already see the delta
+      return { kind: "completed" as const, markdown: "Live partial answer, finalized." };
+    }
+  } as unknown as OpenAIWebRuntime;
+  const stream = streamTurn(model, { messages: [] }, undefined, { runtime, catalog: {} as never });
+  const observed: Array<{ type: string; delta?: string; at: number }> = [];
+  const draining = (async () => {
+    try {
+      for await (const event of stream) {
+        observed.push({ ...(event as { type: string; delta?: string }), at: Date.now() });
+      }
+    } catch { /* error terminal surfaces as events */ }
+  })();
+  // The turn is still blocked here. Poll the observed log (bounded) until the
+  // mid-generation delta shows up — it must arrive without the runtime promise
+  // resolving (nothing else can un-block the loop).
+  const deadline = Date.now() + 2_000;
+  while (!observed.some(event => event.type === "text_delta") && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const midStreamDelta = observed.find(event => event.type === "text_delta");
+  assert.ok(midStreamDelta, "a text_delta must be observable while the runtime turn is still running");
+  assert.equal(midStreamDelta!.delta, "Live partial answer");
+  assert.ok(onTextAt > 0 && midStreamDelta!.at >= onTextAt, "the delta follows the runtime onText call");
+  assert.deepEqual(observed.map(event => event.type), ["start", "text_start", "text_delta"],
+    "no done/text_end may precede the runtime resolution");
+  // Release the runtime; the terminal events follow with the final text.
+  release();
+  await draining;
+  assert.deepEqual(observed.map(event => event.type),
+    ["start", "text_start", "text_delta", "text_delta", "text_end", "done"]);
+  const done = observed.at(-1) as unknown as { message: { content: Array<{ type: string; text?: string }> } };
+  assert.equal(done.message.content[0]?.text, "Live partial answer, finalized.");
+});
+
 test("unknown model id fails explicitly and never routes to a default", async () => {
   const calls: FakeTurnCall[] = [];
   const runtime = fakeRuntime([], calls, []);

@@ -10,7 +10,10 @@ import {
 } from "../src/provider/runtime.js";
 import {
   assistantRevisionRequiresSerialization,
-  type AssistantTurnRevision
+  captureAssistantTurn,
+  readAssistantTurnRevision,
+  type AssistantTurnRevision,
+  type CdpClient
 } from "../src/provider/page.js";
 import { treeToMarkdown } from "../src/provider/answer.js";
 import {
@@ -887,6 +890,174 @@ test("shrinks and same-length rewrites still reserialize and reach onText", asyn
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// 2b. Live streaming serialization: the real expressions against the real
+//     streaming DOM shape (message root aria-busy, no completion action yet)
+// ---------------------------------------------------------------------------
+
+/** Minimal fake DOM: just enough selector/attribute surface for the REAL
+ * probe/capture expressions shipped in page.ts (same technique as the
+ * revision-DOM suite, trimmed to the streaming regression). */
+const FAKE_NODE = { ELEMENT_NODE: 1, TEXT_NODE: 3 } as const;
+
+class ScratchText {
+  readonly nodeType = 3;
+  readonly childNodes: never[] = [];
+  constructor(public textContent: string) {}
+}
+
+function fakeAttrSelectors(selector: string): Array<{ tag?: string; attrs: Array<{ name: string; op?: string; value?: string }> }> {
+  return selector.split(",").map(part => part.trim()).filter(Boolean).map(part => {
+    const compound = part.match(/^([a-zA-Z][\w-]*)?((?:\[[^\]]*\])*)$/);
+    if (!compound) throw new Error(`fixture DOM selector unsupported: ${part}`);
+    const attrs: Array<{ name: string; op?: string; value?: string }> = [];
+    const attrPattern = /\[([^\]~=^$*|]+)(?:([*^$]?=)("[^"]*"|'[^']*'|[^\]]*))?\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = attrPattern.exec(compound[2] ?? "")) !== null) {
+      const raw = match[3];
+      attrs.push({ name: match[1]!.toLowerCase(), op: match[2], value: raw !== undefined ? raw.replace(/^["']|["']$/g, "") : undefined });
+    }
+    return { tag: compound[1]?.toLowerCase(), attrs };
+  });
+}
+
+class ScratchElement {
+  readonly nodeType = 1;
+  readonly tagName: string;
+  readonly attributes = new Map<string, string>();
+  readonly childrenNodes: Array<ScratchElement | ScratchText> = [];
+  offsetParent: object | null = {};
+  constructor(tagName: string, attrs: Record<string, string> = {}) {
+    this.tagName = tagName.toUpperCase();
+    for (const [name, value] of Object.entries(attrs)) this.attributes.set(name.toLowerCase(), value);
+  }
+  get className(): string { return this.attributes.get("class") ?? ""; }
+  get childNodes(): Array<ScratchElement | ScratchText> { return this.childrenNodes; }
+  get childElementCount(): number { return this.childrenNodes.filter(child => child.nodeType === 1).length; }
+  getAttribute(name: string): string | null { return this.attributes.get(name.toLowerCase()) ?? null; }
+  get textContent(): string { return this.childrenNodes.map(child => child.textContent).join(""); }
+  matches(selector: string): boolean {
+    return fakeAttrSelectors(selector).some(alternative => {
+      if (alternative.tag && this.tagName.toLowerCase() !== alternative.tag) return false;
+      return alternative.attrs.every(attr => {
+        const actual = attr.name === "class" ? this.className : this.getAttribute(attr.name);
+        if (actual === null || actual === undefined) return false;
+        if (!attr.op) return true;
+        if (attr.op === "=") return actual === attr.value;
+        if (attr.op === "*=") return actual.includes(attr.value ?? "");
+        if (attr.op === "$=") return actual.endsWith(attr.value ?? "");
+        throw new Error(`fixture DOM attribute operator unsupported: ${attr.op}`);
+      });
+    });
+  }
+  querySelector(selector: string): ScratchElement | null { return this.descendants().find(el => el.matches(selector)) ?? null; }
+  querySelectorAll(selector: string): ScratchElement[] { return this.descendants().filter(el => el.matches(selector)); }
+  descendants(): ScratchElement[] {
+    const found: ScratchElement[] = [];
+    const walk = (node: ScratchElement): void => {
+      for (const child of node.childrenNodes) {
+        if (child instanceof ScratchElement) { found.push(child); walk(child); }
+      }
+    };
+    walk(this);
+    return found;
+  }
+}
+
+function scratchEl(tag: string, attrs: Record<string, string> = {}, children: ScratchElement[] = [], text?: string): ScratchElement {
+  const node = new ScratchElement(tag, attrs);
+  for (const child of children) node.childrenNodes.push(child);
+  if (text !== undefined) node.childrenNodes.push(new ScratchText(text));
+  return node;
+}
+
+/** ChatGPT streaming shape: [data-turn-id-container] > message root carrying
+ * aria-busy="true" with NO completion action yet > partial streamed text. */
+interface FixtureDocument {
+  querySelector: (selector: string) => unknown;
+  querySelectorAll: (selector: string) => unknown[];
+}
+
+function streamingDocument(partialText: string, extra: ScratchElement[] = []): { document: FixtureDocument; identity: string } {
+  const message = scratchEl("div", { "data-turn-id": "r1", "data-message-author-role": "assistant", "aria-busy": "true" }, [
+    scratchEl("div", {}, [scratchEl("p", {}, [], partialText)])
+  ]);
+  const container = scratchEl("div", { "data-turn-id-container": "r1" }, [message, ...extra]);
+  const all = [container, ...container.descendants(), ...extra, ...extra.flatMap(el => el.descendants())];
+  const document = {
+    querySelector: (selector: string) => all.find(el => el.matches(selector)) ?? null,
+    querySelectorAll: (selector: string) => all.filter(el => el.matches(selector))
+  };
+  return { document, identity: "r1" };
+}
+
+function domExpressionClient(document: FixtureDocument): CdpClient {
+  return {
+    Runtime: {
+      evaluate: async ({ expression }: { expression: string }) => ({
+        result: { value: new Function("document", "Node", "location", `"use strict"; return (${expression});`)(document, FAKE_NODE, { href: "https://chatgpt.com/c/fixture-1" }) }
+      })
+    }
+  } as never;
+}
+
+test("streaming capture serializes partial text under a busy message root", async () => {
+  // Root cause regression: while ChatGPT streams, the bound message root
+  // carries aria-busy="true" and the completion action is NOT mounted yet.
+  // The real probe/capture expressions must still serialize the partial
+  // reply (live deltas for the watch loop) — the busy root flag is activity
+  // evidence for messageBusy, never a serialization exclusion for the root.
+  const { document } = streamingDocument("Partial streamed text");
+  const client = domExpressionClient(document);
+  const probe = await readAssistantTurnRevision(client, "r1");
+  const capture = await captureAssistantTurn(client, "r1");
+  assert.ok(probe && capture, "probe and capture must bind the streaming message");
+  // Live partial text is observable mid-generation: tree non-null, markdown
+  // carries the streamed fragment. (Baseline bug: tree was null while busy.)
+  assert.ok(capture.tree, "the busy streaming root must not exclude the reply tree");
+  assert.equal(treeToMarkdown(capture.tree as never), "Partial streamed text");
+  // The revision fingerprint folds the streaming content (non-null) so growth
+  // gates reserialization, and probe/capture revisions stay identical.
+  assert.ok(typeof probe.structureChecksum === "number" && probe.structureChecksum !== null);
+  assert.deepEqual(
+    {
+      textLength: probe.textLength,
+      textChecksum: probe.textChecksum,
+      childCount: probe.childCount,
+      linkChecksum: probe.linkChecksum,
+      languageKey: probe.languageKey,
+      structureChecksum: probe.structureChecksum
+    },
+    capture.revision,
+    "probe revision must equal the atomic capture revision while streaming"
+  );
+  // Completion gating is unchanged: the streaming shape still reads busy with
+  // no visible completion action, so no settle window may open on it.
+  assert.equal(probe.busy, true);
+  assert.equal(capture.busy, true);
+  assert.equal(probe.completionVisible, false);
+  assert.equal(capture.completionVisible, false);
+});
+
+test("streaming growth changes the revision so the watch loop reserializes per delta", async () => {
+  // Each streamed fragment must change the cheap revision fingerprint
+  // (driving assistantRevisionRequiresSerialization) so the watch loop
+  // recaptures and emits onText per poll while generating.
+  const before = await readAssistantTurnRevision(domExpressionClient(streamingDocument("Hel").document), "r1");
+  const after = await readAssistantTurnRevision(domExpressionClient(streamingDocument("Hello world").document), "r1");
+  assert.ok(before && after);
+  assert.equal(assistantRevisionRequiresSerialization({ identity: "r1", revision: before as AssistantTurnRevision }, "r1", after), true,
+    "growth must force a fresh capture so the new fragment streams");
+  assert.equal(assistantRevisionRequiresSerialization({ identity: "r1", revision: after as AssistantTurnRevision }, "r1", after), false);
+  // Rendered busy DESCENDANTS stay excluded from the tree: a visible shimmer
+  // placeholder under the streaming root is chrome, never reply content.
+  const shimmer = scratchEl("div", { class: "loading-shimmer h-2 w-40" });
+  const withShimmer = streamingDocument("Hel", [shimmer]);
+  const shimmerCapture = await captureAssistantTurn(domExpressionClient(withShimmer.document), "r1");
+  assert.ok(shimmerCapture);
+  assert.equal(treeToMarkdown(shimmerCapture.tree as never), "Hel");
 });
 
 // ---------------------------------------------------------------------------
