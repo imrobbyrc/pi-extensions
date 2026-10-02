@@ -140,6 +140,83 @@ test("shouldRefresh honors success TTL then failure retry TTL", async () => {
   assert.equal(stale.shouldRefresh(), true);
 });
 
+/** Catalog with an injected clock so TTL thresholds are asserted exactly. */
+function clockedCatalog(
+  cachePath: string,
+  discover: () => Promise<DiscoveredModel[]>,
+  limits = { successTtlMs: 1000, failureRetryMs: 500 }
+): { catalog: OpenAIWebModelCatalog; advance: (ms: number) => number } {
+  let now = 0;
+  const catalog = new OpenAIWebModelCatalog({ cachePath, limits, discover, now: () => now });
+  return { catalog, advance: (ms: number) => { now += ms; return now; } };
+}
+
+test("failed first attempt backs off from the attempt itself, even with an empty catalog", async () => {
+  const { catalog, advance } = clockedCatalog(
+    join(tmpdir(), `catalog-test-${Math.random().toString(36).slice(2)}.json`),
+    async () => { throw new Error("browser down"); }
+  );
+  assert.equal(catalog.shouldRefresh(), true); // first attempt is immediate
+  assert.equal((await catalog.refresh()).ok, false); // failed attempt at t=0 leaves catalog empty
+  assert.equal(catalog.shouldRefresh(), false); // within failure cooldown
+  advance(499);
+  assert.equal(catalog.shouldRefresh(), false); // one ms before the exact threshold
+  advance(1);
+  assert.equal(catalog.shouldRefresh(), true); // failureRetryMs elapsed since the attempt
+});
+
+test("failure retry cooldown counts from lastAttemptAt, not the cached last success", async () => {
+  const cachePath = join(tmpdir(), `catalog-test-${Math.random().toString(36).slice(2)}.json`);
+  let now = 1000;
+  const good = new OpenAIWebModelCatalog({
+    cachePath,
+    limits: { successTtlMs: 1000, failureRetryMs: 500 },
+    discover: async () => liveCatalog(),
+    now: () => now
+  });
+  await good.refresh(); // last success (and cache write) at t=1000
+  now = 1500;
+  const stale = new OpenAIWebModelCatalog({
+    cachePath,
+    limits: { successTtlMs: 1000, failureRetryMs: 500 },
+    discover: async () => { throw new Error("down"); },
+    now: () => now
+  });
+  await stale.loadCache(); // lastSuccessAt = 1000, well past successTtlMs after the attempt
+  assert.equal((await stale.refresh()).ok, false); // failed attempt at t=1500
+  now += 499;
+  assert.equal(stale.shouldRefresh(), false); // cooldown runs from the attempt, not the stale success
+  now += 1;
+  assert.equal(stale.shouldRefresh(), true);
+});
+
+test("successful refresh TTL still counts from lastSuccessAt at the exact threshold", async () => {
+  const { catalog, advance } = clockedCatalog(
+    join(tmpdir(), `catalog-test-${Math.random().toString(36).slice(2)}.json`),
+    async () => liveCatalog()
+  );
+  assert.equal(catalog.shouldRefresh(), true);
+  assert.equal((await catalog.refresh()).ok, true); // success at t=0
+  assert.equal(catalog.shouldRefresh(), false);
+  advance(999);
+  assert.equal(catalog.shouldRefresh(), false);
+  advance(1);
+  assert.equal(catalog.shouldRefresh(), true); // exactly successTtlMs since lastSuccessAt
+});
+
+test("manual refresh forces a new attempt even inside the failure cooldown", async () => {
+  const { catalog, advance } = clockedCatalog(
+    join(tmpdir(), `catalog-test-${Math.random().toString(36).slice(2)}.json`),
+    async () => { throw new Error("browser down"); }
+  );
+  await catalog.refresh(); // failed attempt at t=0
+  advance(100);
+  assert.equal(catalog.shouldRefresh(), false); // automatic backoff holds
+  const forced = await catalog.refresh(); // manual refresh bypasses shouldRefresh
+  assert.equal(forced.ok, false);
+  assert.equal(catalog.lastAttemptAtMs, 100); // a real new attempt was made
+});
+
 test("diffDescriptorIds reports added/removed/changed", () => {
   const previous = toDescriptors(liveCatalog(), "cache", "t0");
   const next = toDescriptors(

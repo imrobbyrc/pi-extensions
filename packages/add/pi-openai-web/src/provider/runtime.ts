@@ -97,6 +97,8 @@ export interface OpenAIWebRuntimeDeps {
   isHarnessActive?: () => Promise<boolean>;
   /** Optional durable identity store for reconnecting provider browser turns. */
   resumeStore?: ProviderResumeStore;
+  /** Injectable CDP attach for tests; production defaults to the page attach. */
+  attachClient?: typeof attach;
 }
 
 interface ProviderConversation {
@@ -366,8 +368,9 @@ export class OpenAIWebRuntime {
       return undefined;
     }
 
+    let client: CdpClient | undefined;
     try {
-      const client = await attach(this.config, metadata.targetId);
+      client = await (this.deps.attachClient ?? attach)(this.config, metadata.targetId);
       await enablePage(client);
       await waitForComposer(client);
 
@@ -396,6 +399,9 @@ export class OpenAIWebRuntime {
       this.emit("provider_reconnected", { targetId: metadata.targetId });
       return conversation;
     } catch (error) {
+      // Close only the CDP connection this reconnect opened. The target itself
+      // is the user's preexisting tab and must survive a failed reconnect.
+      if (client) await client.close().catch(() => { /* already gone */ });
       await this.deps.resumeStore?.clear().catch(() => {});
       this.emit("provider_reconnect_fallback", { reason: error instanceof Error ? error.message : String(error) });
       return undefined;
@@ -408,8 +414,11 @@ export class OpenAIWebRuntime {
     const target = await CDP.New({ host: this.config.cdpHost, port: this.config.cdpPort, url: tempUrl });
     if (!target.id) throw new Error("CDP created provider tab without targetId; no prompt was sent.");
     this.emit("provider_target_created", { targetId: target.id, model: descriptor.id });
-    const client = await attach(this.config, target.id);
+    // From here the target is owned by this conversation attempt: any failure
+    // must close both the attached client and the freshly created target.
+    let client: CdpClient | undefined;
     try {
+      client = await (this.deps.attachClient ?? attach)(this.config, target.id);
       await enablePage(client);
       await client.Page.bringToFront().catch(() => {});
       await waitForComposer(client);
@@ -433,7 +442,7 @@ export class OpenAIWebRuntime {
       await this.persistResume(conversation);
       return conversation;
     } catch (error) {
-      await client.close().catch(() => { /* best effort */ });
+      if (client) await client.close().catch(() => { /* best effort */ });
       await CDP.Close({ host: this.config.cdpHost, port: this.config.cdpPort, id: target.id }).catch(() => { /* gone */ });
       throw error;
     }
