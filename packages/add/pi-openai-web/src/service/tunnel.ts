@@ -62,11 +62,11 @@ const defaultRuntime: TunnelRuntime = { spawnImpl: ((bin: string, args: string[]
 /** OpenAI Secure MCP Tunnel dependency (tunnel-client, profile pi-planner). */
 export class SecureTunnel {
   managedByPi = false;
-  processState: TunnelProcessState | "exited" = "stopped";
+  processState: TunnelProcessState = "stopped";
   connectionState: TunnelConnectionState = "disconnected";
   child: TunnelChild | undefined;
   pid: number | undefined;
-  readonly startedAt: string | undefined;
+  startedAt: string | undefined;
   lastError: string | undefined;
   recentStderr: string[] = [];
   resolvedBinary: string | undefined;
@@ -125,15 +125,41 @@ export class SecureTunnel {
 
   private get execImpl() { return this.runtime.execImpl; }
 
-  /** Combined state. A fresh health probe always wins over cached transitional state; a live
-   *  child or live-but-unpolled daemon is "connecting", never "stopped". */
+  /** Ownership metadata describes the current owned child only. A healthy
+   *  daemon reconciles it: a live owned child stays ours (running); otherwise
+   *  the daemon is external and stale owned-child metadata (pid/startedAt) is
+   *  cleared so we can neither kill nor claim a process we do not own. */
+  private adoptHealthyDaemon(): void {
+    const owned = !!this.child && this.child.exitCode === null && !this.child.killed;
+    this.managedByPi = owned;
+    this.processState = owned ? "running" : "stopped";
+    if (owned) return;
+    this.releaseOwnershipMetadata();
+  }
+
+  private releaseOwnershipMetadata(): void {
+    this.pid = undefined;
+    this.startedAt = undefined;
+  }
+
+  /** Combined state. A fresh health probe always wins over cached transitional
+   *  state (stale failed/exited included): a live healthy or connecting daemon is
+   *  reported from live evidence; a live-but-unpolled daemon is "connecting",
+   *  never "stopped" or a stale "failed". */
   async probe(): Promise<ResourceState> {
-    if (this.processState === "failed") return "failed";
-    if ((this.processState as string) === "exited") return "failed";
     const health = await this.health();
-    if (health.kind === "pass") { this.connectionState = "ready"; return "ready"; }
-    if (health.kind === "connecting") { this.connectionState = "connecting"; return "connecting"; }
+    if (health.kind === "pass") {
+      this.connectionState = "ready";
+      this.adoptHealthyDaemon();
+      this.lastError = undefined;
+      return "ready";
+    }
+    if (health.kind === "connecting") {
+      this.connectionState = "connecting";
+      return "connecting";
+    }
     if (this.child?.exitCode === null && !this.child.killed) return this.connectionState === "failed" ? "failed" : "connecting";
+    if (this.processState === "failed" || this.processState === "exited") return "failed";
     return "stopped";
   }
 
@@ -149,8 +175,7 @@ export class SecureTunnel {
     const external = await this.health();
     if (external.kind === "pass") {
       this.connectionState = "ready";
-      this.managedByPi = !!this.child && this.child.exitCode === null && !this.child.killed;
-      this.processState = this.managedByPi ? "running" : "stopped";
+      this.adoptHealthyDaemon();
       this.lastError = undefined;
       return "ready";
     }
@@ -178,22 +203,30 @@ export class SecureTunnel {
       const child = this.runtime.spawnImpl(this.resolvedBinary, ["run", "--profile", this.config.tunnelProfile], { env: { ...process.env, CONTROL_PLANE_API_KEY: credential } });
       this.child = child;
       this.pid = child.pid;
+      this.startedAt = new Date().toISOString();
       child.stderr?.on("data", (chunk: Buffer) => {
         this.recentStderr.push(...chunk.toString("utf8").split("\n").filter(Boolean));
         if (this.recentStderr.length > 20) this.recentStderr.splice(0, this.recentStderr.length - 20); // bounded ring, no secrets by default
       });
       child.once("error", ((error: Error) => {
+        // Late/duplicate events after ownership moved on are inert.
         if (this.child !== child) return;
+        this.child = undefined;
+        this.managedByPi = false;
+        this.releaseOwnershipMetadata();
         this.processState = "failed";
         this.connectionState = "failed";
         this.lastError = `spawn failed: ${error.message}`;
       }) as never);
       child.once("exit", ((code: number | null, signal: NodeJS.Signals | null) => {
+        // Late/duplicate events after ownership moved on are inert.
         if (this.child !== child) return;
-        this.processState = (this.processState as string) === "failed" ? "failed" : "exited";
+        this.processState = this.processState === "failed" ? "failed" : "exited";
         this.connectionState = "failed";
         this.lastError = `tunnel-client exited (code=${code ?? "null"} signal=${signal ?? "none"})${this.recentStderr.length ? `: ${this.recentStderr.slice(-3).join(" | ").slice(0, 300)}` : ""}`;
         this.child = undefined;
+        this.managedByPi = false;
+        this.releaseOwnershipMetadata();
       }) as never);
     }
     // The Pi-owned child this startup attempt is bound to. stop() clears this.child,
@@ -201,6 +234,7 @@ export class SecureTunnel {
     const watched = this.child;
     const deadline = Date.now() + this.config.tunnelStartupTimeoutMs;
     while (Date.now() < deadline) {
+      // Cast: processState is mutated by async child events; defeat control-flow narrowing.
       if ((this.processState as string) === "failed" || (this.processState as string) === "exited") return "failed";
       // Ownership lost: a concurrent stop() reaped the child. Settle as stopped —
       // never overwrite the stop's state or spin until the deadline.
@@ -234,6 +268,7 @@ export class SecureTunnel {
     const child = this.child;
     this.child = undefined;
     this.managedByPi = false;
+    this.releaseOwnershipMetadata();
     this.processState = "stopped";
     this.connectionState = "disconnected";
     const pid = child?.pid;
