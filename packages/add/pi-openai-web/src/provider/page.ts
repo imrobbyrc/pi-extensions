@@ -159,24 +159,36 @@ export async function submitPrompt(client: CdpClient, text: string, options: { s
  * readTurnState, the cheap revision probe, and the atomic capture so all
  * three observation paths can never disagree about busy state. ChatGPT
  * leaves stale busy chrome mounted inside completed turns (aria-busy or
- * loading-shimmer nodes hidden via display:none), and that hidden residue
- * must not keep a provider turn alive after visible completion. A marker
- * counts only when actually rendered, using the same offsetParent idiom the
- * rest of this file uses, plus a getClientRects fallback so position:fixed
- * markers (offsetParent null even while visible) still count. The bound
- * message's own aria-busy stays authoritative: it marks the whole turn, not
- * chrome descendants. Textual labels are never consulted.
+ * loading-shimmer nodes hidden via display:none, plus the root aria-busy flag
+ * itself), and that residue must not keep a provider turn alive after visible
+ * completion. A descendant marker counts only when actually rendered, using
+ * the same offsetParent idiom the rest of this file uses, plus a
+ * getClientRects fallback so position:fixed markers (offsetParent null even
+ * while visible) still count. The bound message's own aria-busy marks the
+ * whole turn while the turn has not yet exposed its completion action, but
+ * ChatGPT also leaves the root flag stale after completion: once the same
+ * message exposes the completion action (the same existence check that
+ * drives completionVisible/completionActionVisible), the root flag alone is
+ * treated as residue rather than live activity. Rendered descendant markers
+ * always remain busy evidence, completion action or not. Textual labels are
+ * never consulted.
  */
 const TURN_BUSY_HELPERS = `
     const busyMarkerRendered = (el) => el.offsetParent !== null
       || (typeof el.getClientRects === 'function' && el.getClientRects().length > 0);
+    // Root-flag staleness rule shared by busy semantics and the revision/
+    // serialization fold below (revisionOf runs after this block in the probe
+    // and capture expressions): the bound message's own aria-busy is residue
+    // once the same turn exposes its completion action.
+    const rootBusyResidue = (message) => message.getAttribute('aria-busy') === 'true'
+      && Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}'));
     const messageBusy = (message) => {
       if (!message) return false;
-      if (message.getAttribute('aria-busy') === 'true') return true;
       const markers = message.querySelectorAll('[aria-busy="true"], [class*="loading-shimmer"]');
       for (let index = 0; index < markers.length; index += 1) {
         if (busyMarkerRendered(markers[index])) return true;
       }
+      if (message.getAttribute('aria-busy') === 'true' && !rootBusyResidue(message)) return true;
       return false;
     };
 `;
@@ -377,11 +389,11 @@ const TURN_REVISION_HELPERS = `
     const markedCopy = (node) => (node.getAttribute && node.getAttribute('data-markdown-copy')) || undefined;
     const isMarkedCodeBlock = (node) => markedCopy(node) === 'code-block';
     const isMarkedExclude = (node) => markedCopy(node) === 'exclude';
-    const isExcluded = (node) => {
+    const isExcluded = (node, ownBusyExempt) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return false;
       const tag = node.tagName;
       if (tag === 'BUTTON' || tag === 'SVG' || tag === 'STYLE' || tag === 'SCRIPT' || tag === 'NOSCRIPT') return true;
-      if (node.getAttribute && (node.getAttribute('aria-busy') === 'true' || node.getAttribute('data-testid') === 'tool-call-status')) return true;
+      if (node.getAttribute && ((!ownBusyExempt && node.getAttribute('aria-busy') === 'true') || node.getAttribute('data-testid') === 'tool-call-status')) return true;
       const cls = typeof node.className === 'string' ? node.className : '';
       return cls.includes('tool-message') || cls.includes('loading-shimmer') || cls.includes('agent-turn-status') || cls.includes('sr-only');
     };
@@ -391,19 +403,22 @@ const TURN_REVISION_HELPERS = `
       for (let index = 0; index < name.length; index += 1) sum = (Math.imul(31, sum) + name.charCodeAt(index)) | 0;
       return sum;
     };
-    const structureChecksum = (node, depth, inPre) => {
+    const structureChecksum = (node, depth, inPre, busyResidueRoot) => {
       if (node.nodeType === Node.TEXT_NODE) return (Math.imul(31, (node.textContent || '').length) + depth + 1) | 0;
       // Skipped nodes contribute nothing at all — exactly like the capture
       // serializer drops them — so excluded chrome churn cannot perturb the fold.
       // Marked-exclude UI is dropped even inside PRE-like containers: the
-      // serializer's code-block normalization never emits it either way.
-      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node))) return null;
+      // serializer's code-block normalization never emits it either way. The
+      // bound message's own stale root aria-busy (rootBusyResidue, defined by
+      // TURN_BUSY_HELPERS which runs before revisionOf is invoked) does not
+      // exclude the message: a completed reply still folds and serializes.
+      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node, node === busyResidueRoot))) return null;
       let sum = (Math.imul(depth + 1, 1000003) + tagHash(node.tagName)) | 0;
       // Fold the data-markdown-copy marker itself: flipping it on identical
       // markup changes what the serializer would keep, so it must change the fold.
       if (markedCopy(node)) sum = (Math.imul(31, sum) + tagHash(markedCopy(node))) | 0;
       for (let index = 0; index < node.childNodes.length; index += 1) {
-        const childSum = structureChecksum(node.childNodes[index], depth + 1, inPre || node.tagName === 'PRE' || isMarkedCodeBlock(node));
+        const childSum = structureChecksum(node.childNodes[index], depth + 1, inPre || node.tagName === 'PRE' || isMarkedCodeBlock(node), busyResidueRoot);
         if (childSum !== null) sum = (Math.imul(31, sum) + childSum) | 0;
       }
       return sum;
@@ -418,7 +433,7 @@ const TURN_REVISION_HELPERS = `
         childCount: message.childElementCount,
         linkChecksum: checksum(links),
         languageKey,
-        structureChecksum: structureChecksum(message, 0, false)
+        structureChecksum: structureChecksum(message, 0, false, rootBusyResidue(message) ? message : null)
       };
     };
 `;
@@ -497,12 +512,12 @@ export async function captureAssistantTurn(client: CdpClient, identity: string):
       if (language) entry.language = language;
       return entry;
     };
-    const serialize = (node, inPre) => {
+    const serialize = (node, inPre, busyResidueRoot) => {
       if (node.nodeType === Node.TEXT_NODE) return { tag: '#text', text: node.textContent };
-      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node))) return null;
+      if (node.nodeType !== Node.ELEMENT_NODE || isMarkedExclude(node) || (!inPre && isExcluded(node, node === busyResidueRoot))) return null;
       if (isMarkedCodeBlock(node)) { const normalized = serializeCodeBlock(node); if (normalized) return normalized; }
       const tag = node.tagName.toLowerCase();
-      const children = [...node.childNodes].map(child => serialize(child, inPre || node.tagName === 'PRE')).filter(Boolean);
+      const children = [...node.childNodes].map(child => serialize(child, inPre || node.tagName === 'PRE', busyResidueRoot)).filter(Boolean);
       const entry = { tag, children };
       if (node.tagName === 'A' && node.getAttribute('href')) entry.href = node.getAttribute('href');
       if (node.tagName === 'PRE') entry.language = languageOf(node);
@@ -515,7 +530,7 @@ export async function captureAssistantTurn(client: CdpClient, identity: string):
       stopVisible: Boolean([...document.querySelectorAll('${STOP_BUTTON_SELECTOR}')].find(el => el.offsetParent !== null)),
       completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
       revision: revisionOf(message),
-      tree: serialize(message, false)
+      tree: serialize(message, false, rootBusyResidue(message) ? message : null)
     };
   }`);
   return capture ?? undefined;
