@@ -126,6 +126,17 @@ test("repeated healthy start retains ownership and shutdown reaps the child", as
   assert.equal(t.lastError, undefined);
 });
 
+test("healthy external recovery clears stale process failure", async () => {
+  const t = tunnel({}, () => { throw new Error("must not spawn"); }, async () => ({ stdout: passJson, stderr: "" }));
+  t.processState = "exited";
+  t.connectionState = "failed";
+  t.lastError = "previous child exited";
+  assert.equal(await t.ensureStarted(), "ready");
+  assert.equal(await t.probe(), "ready");
+  assert.equal(t.managedByPi, false);
+  assert.equal(t.lastError, undefined);
+});
+
 test("resolveTunnelBinary prefers explicit override and PATH candidates", () => {
   assert.equal(resolveTunnelBinary("/explicit/tunnel-client"), "/explicit/tunnel-client");
 });

@@ -150,6 +150,8 @@ export class SecureTunnel {
     if (external.kind === "pass") {
       this.connectionState = "ready";
       this.managedByPi = !!this.child && this.child.exitCode === null && !this.child.killed;
+      this.processState = this.managedByPi ? "running" : "stopped";
+      this.lastError = undefined;
       return "ready";
     }
     if (!this.resolvedBinary) {

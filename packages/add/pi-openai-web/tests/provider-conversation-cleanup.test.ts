@@ -238,6 +238,26 @@ test("createConversation closes the freshly created target when attach rejects",
   }
 });
 
+test("persistence failure closes both new resources and preserves the error despite failed client cleanup", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-cleanup-create-persist-fail-"));
+  try {
+    const harness = makeHarness(dir, { elements: composerElements(true), href: "https://chatgpt.com/" });
+    const { client } = pageClient(composerElements(true), "https://chatgpt.com/");
+    harness.attachClient(client);
+    const failure = new Error("resume persistence failed");
+    t.mock.method(harness.resumeStore, "save", async () => { throw failure; });
+    const close = t.mock.method(client, "close", async () => { throw new Error("client cleanup failed"); });
+    await assert.rejects(
+      () => (harness.runtime as unknown as { createConversation: (d: OpenAIWebModelDescriptor) => Promise<unknown> }).createConversation(descriptor),
+      (error: unknown) => error === failure
+    );
+    assert.equal(close.mock.callCount(), 1);
+    assert.deepEqual(cdpCloses, [{ id: "new-target-1" }]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("createConversation success owns target and client without closing either", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-cleanup-create-ok-"));
   try {

@@ -237,7 +237,8 @@ For a low-risk change, use `risk=low`, `planning_kind=compact` and `compact_plan
 - **Dynamic model discovery & exact selection** — the catalog is discovered from the logged-in account via visible picker controls only; deterministic ids (`gpt-5-6-sol-high`, …); versioned last-known-good cache under `<stateDir>/provider/model-catalog.json`; failed discovery never erases the cache; optional `browser-extension/` page-marker assist with CDP fallback.
 - **Token estimation & separate ceilings** — `tiktoken` (`o200k_base`), bounded chunks with UTF-8 boundary guard; separate `providerContextLimitTokens` and `providerComposerLimitTokens`.
 - **Structured compaction** — `/openai-web compact` and the automatic threshold request a handoff brief; only machine-readable `[PI-COMPACTION-CHECKPOINT]` JSON envelopes are accepted; fallback rebuilds from canonical Pi history.
-- **Durable transcripts & resume** — bounded JSONL session records under `<stateDir>/provider/sessions`; provider resume metadata persisted and validated.
+- **Durable transcripts & resume** — bounded JSONL session records under `<stateDir>/provider/sessions`; provider resume metadata persisted and validated. Failed reconnects close only their CDP connection, not the preexisting browser tab; failed new-conversation initialization closes its newly owned target.
+- **Discovery retry discipline** — automatic refresh eligibility backs off from the last failed attempt, including an empty catalog; successful cache TTL is unchanged. `/openai-web models refresh` remains an explicit forced retry.
 
 ## Commands
 
@@ -303,6 +304,7 @@ Defaults < `~/.pi/chatgpt-planner/config.json` < environment variables. Copy [`c
 | Infrastructure not ready | `/openai-web doctor`; `npm run doctor` for Node, Git, Pi, CDP. |
 | Authentication missing | `/openai-web setup`, then retry. |
 | Browser/CDP unreachable or logged out | Keep the dedicated profile running, log into ChatGPT, rerun `npm run browser` or `npm run chrome`. |
+| `ChatGPT did not confirm the submitted user message` | Send was clicked, but no new user-message identity was detected within 10 seconds. Inspect the provider tab before retrying: submission may already have succeeded. Page-evaluation failures now appear in the error instead of being treated as an empty conversation. Check `/openai-web doctor` separately for tunnel readiness; this error alone does not establish a tunnel outage. |
 | Herdr unavailable | Check `herdr status server`; workers also need `pi auth check --provider openai-codex`. |
 | `herdr run` rejected headless | Set `HARNESS_AUTO_APPROVE_HERDR_RUN=true` explicitly, or run with a TUI so confirmation can be asked. |
 | Catalog stale | `/openai-web models refresh` with the browser running. |
@@ -334,7 +336,8 @@ Read [`SECURITY.md`](SECURITY.md) before exposing MCP. Key boundaries:
 
 ## Limitations
 
-- ChatGPT UI settings and app-picker markup can change; manual selection may be required.
+- ChatGPT UI settings and app-picker markup can change; manual selection may be required. Provider app-attachment detection is currently best-effort; a healthy tunnel or successful text reply does not prove that `Pi Workspace` tools are available in the conversation. Validate a read-only MCP round trip before qualifying a release.
+- Cancellation is checked before submission and during confirmation/compaction. Cancelling a running turn also attempts to stop browser generation and owned workers. An unconfirmed submission is never automatically resent.
 - MCP server has no OAuth/pairing; never expose the loopback endpoint directly to the public internet.
 - Work graphs contain 1–4 workers; configured concurrency is also 1–4 per scheduler wave. Older saved values 5–8 load at an effective cap of 4 without rewriting the file.
 - Pi extension events do not provide authoritative per-command test output; workers must surface their own evidence.

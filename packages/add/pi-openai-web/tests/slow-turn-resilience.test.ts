@@ -336,7 +336,8 @@ test("abort signal cancels the turn even while harness is active", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-grace-abort-"));
   try {
     const cfg = baseConfig(dir, { stallTimeoutMs: 200, turnTimeoutMs: 10_000 });
-    const h = makeWatch(cfg, [spinner()], async () => true);
+    let harnessStops = 0;
+    const h = makeWatch(cfg, [spinner()], async () => true, undefined, async () => { harnessStops++; });
     const controller = new AbortController();
     const abortTimer = setTimeout(() => controller.abort(), 700);
     try {
@@ -344,6 +345,8 @@ test("abort signal cancels the turn even while harness is active", async () => {
       assert.equal(outcome.kind, "failed");
       assert.equal(outcome.error, "provider_turn_aborted");
       assert.equal(h.controller.state, "aborted");
+      assert.equal(h.stopClickCount(), 1, "abort must stop browser generation");
+      assert.equal(harnessStops, 1, "abort must stop owned workers");
     } finally {
       clearTimeout(abortTimer);
     }

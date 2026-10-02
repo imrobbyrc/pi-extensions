@@ -16,6 +16,15 @@ Shipped:
 - [x] Planner subsystem removed: `/planner` commands, task store, `submit_plan`/`submit_review` protocol, browser worker tabs, and Pi subagent delegation.
 - [x] Worker orchestration consolidated in `@imrobbyrc/pi-core-subagent` public API; planner owns only OpenAI Web, MCP, Lead policy, and composition. No new scheduler/IPC/worktree implementation belongs in this repository.
 
+## Reliability qualification
+
+- [x] Propagate browser evaluation errors instead of fabricating empty conversation state; preserve the last DOM failure on submission timeout and never automatically resend.
+- [x] Check cancellation before submission and during confirmation/compaction; stop browser generation and owned workers when a turn is cancelled.
+- [x] Preserve Pi-owned tunnel ownership across repeated starts; serialize shutdown behind pending startup/reload, settle concurrent starts on failure, and attempt remaining cleanup after a dependency fails.
+- [x] Close failed reconnect CDP connections without closing preexisting tabs; close newly created targets when attachment or later initialization fails, preserving the original error.
+- [x] Apply failed catalog discovery retry cooldown from the last attempt, including empty catalogs; keep successful cache TTL and explicit manual refresh behavior unchanged.
+- [x] Confirm the `Pi Workspace` read-only MCP round trip in a fresh provider conversation on the current macOS/Dia profile: `read_file` returned the package name/version, and the ChatGPT activity card confirmed workspace inspection. A separate manually selected app also completed `list_directory`. This is account/profile-specific evidence, not cross-platform release qualification.
+
 ## Next
 
 - [ ] Authenticated remote MCP story beyond the tunnel (per-tool authorization or OAuth/pairing).

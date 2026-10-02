@@ -235,6 +235,7 @@ export class OpenAIWebRuntime {
   get estimatedContextTokens(): number { return this.contextTokens; }
   private contextTokens = 0;
   private canonicalContext: { systemPrompt?: string; messages: unknown[] } = { messages: [] };
+  private turnAbort: AbortController | undefined;
 
   conversationSummary(): Record<string, unknown> {
     return {
@@ -250,6 +251,7 @@ export class OpenAIWebRuntime {
   }
 
   async abort(): Promise<void> {
+    this.turnAbort?.abort();
     if (this.turn && !this.turn.isTerminal) this.turn.transition("aborted", "aborted by user");
     if (this.conversation) {
       try { await stopGeneration(this.conversation.client); } catch { /* best effort */ }
@@ -515,10 +517,19 @@ export class OpenAIWebRuntime {
     options: { signal?: AbortSignal } = {}
   ): Promise<TurnOutcome> {
     if (this.stopping) return { kind: "failed", error: "provider_runtime_stopped" };
+    if (options.signal?.aborted) return { kind: "failed", error: "provider_turn_aborted" };
     this.canonicalContext = context;
+    const turnAbort = new AbortController();
+    const callerSignal = options.signal;
+    const forwardAbort = () => turnAbort.abort(callerSignal?.reason);
+    callerSignal?.addEventListener("abort", forwardAbort, { once: true });
+    if (callerSignal?.aborted) forwardAbort();
 
     try {
       await this.supersedeStaleTurn();
+      this.turnAbort = turnAbort;
+      options = { signal: turnAbort.signal };
+      options.signal?.throwIfAborted();
       const existing = this.conversation;
       if (existing) {
         // Preflight estimates only the pending prompt that would be submitted
@@ -531,10 +542,11 @@ export class OpenAIWebRuntime {
           // Preserve the actual sync boundary from the existing browser conversation.
           // The current Pi batch has not been submitted yet and must be sent after
           // compaction resumes; passing context.messages.length would swallow it.
-          await this.compactConversation(descriptor, existing.syncedMessageCount, context);
+          await this.compactConversation(descriptor, existing.syncedMessageCount, context, options);
         }
       }
       const conversation = await this.ensureConversation(descriptor);
+      options.signal?.throwIfAborted();
       const prompt = this.fitComposerPrompt(this.buildPrompt(context, conversation));
       const controller = new ProviderTurnController(
         descriptor, conversation.targetId, randomUUID(), this.fingerprint(prompt),
@@ -548,7 +560,7 @@ export class OpenAIWebRuntime {
       // waitForConversationUrl returns; watching from a post-submit baseline
       // would then wait forever for a message that already exists.
       const submitBaseline = await readTurnState(conversation.client);
-      await submitPrompt(conversation.client, prompt);
+      await submitPrompt(conversation.client, prompt, options);
       controller.touchProgress();
       const url = await waitForConversationUrl(conversation.client);
       const conversationId = extractConversationId(url);
@@ -568,9 +580,16 @@ export class OpenAIWebRuntime {
       }
       return outcome;
     } catch (error) {
+      if (options.signal?.aborted) {
+        if (this.turnAbort === turnAbort) await this.abort();
+        return { kind: "failed", error: "provider_turn_aborted" };
+      }
       const message = error instanceof Error ? error.message : String(error);
       if (this.turn && !this.turn.isTerminal) this.turn.transition("failed", message);
       return { kind: "failed", error: message };
+    } finally {
+      callerSignal?.removeEventListener("abort", forwardAbort);
+      if (this.turnAbort === turnAbort) this.turnAbort = undefined;
     }
   }
 
@@ -631,7 +650,8 @@ export class OpenAIWebRuntime {
   }
 
   /** Request a bounded handoff brief, recycle browser conversation, and seed fresh chat. */
-  async compactConversation(descriptor: OpenAIWebModelDescriptor, syncedMessageCount?: number, canonicalContext?: { systemPrompt?: string; messages: unknown[] }): Promise<void> {
+  async compactConversation(descriptor: OpenAIWebModelDescriptor, syncedMessageCount?: number, canonicalContext?: { systemPrompt?: string; messages: unknown[] }, options: { signal?: AbortSignal } = {}): Promise<void> {
+    options.signal?.throwIfAborted();
     const previous = this.conversation;
     if (!previous) throw new Error("provider_compaction_unavailable: no active provider conversation");
     const handoffTurnId = randomUUID();
@@ -644,8 +664,9 @@ export class OpenAIWebRuntime {
     controller.transition("submitted");
     controller.transition("generating");
     const handoffBaseline = await readTurnState(previous.client);
-    await submitPrompt(previous.client, handoffPrompt);
-    const outcome = await this.watch(controller, {}, {}, handoffBaseline);
+    await submitPrompt(previous.client, handoffPrompt, options);
+    const outcome = await this.watch(controller, {}, options, handoffBaseline);
+    options.signal?.throwIfAborted();
     // Compaction is best-effort. A model may ignore the no-tools instruction or stall;
     // never strand the provider turn. Reset and continue with canonical Pi history.
     const checkpoint = outcome.kind === "completed" ? parseCompactionCheckpoint(outcome.markdown) : undefined;
@@ -689,8 +710,9 @@ export class OpenAIWebRuntime {
     this.turn = bootstrapController;
     bootstrapController.transition("submitted");
     bootstrapController.transition("generating");
-    await submitPrompt(fresh.client, bootstrap);
-    const bootstrapOutcome = await this.watch(bootstrapController, {}, {}, bootstrapBaseline);
+    await submitPrompt(fresh.client, bootstrap, options);
+    const bootstrapOutcome = await this.watch(bootstrapController, {}, options, bootstrapBaseline);
+    options.signal?.throwIfAborted();
     if (bootstrapOutcome.kind !== "completed") {
       await this.resetConversation("compact_resume_failed");
       throw new Error(`provider_compaction_resume_failed: ${bootstrapOutcome.kind === "failed" ? bootstrapOutcome.error : "bootstrap requested a tool"}`);
@@ -735,8 +757,9 @@ export class OpenAIWebRuntime {
     const stallGraceAfterHarnessMs = this.config.providerStallGraceMs ?? 30_000;
 
     while (true) {
-      if (options.signal?.aborted) {
-        controller.transition("aborted", "aborted by user");
+      if (options.signal?.aborted || controller.state === "aborted") {
+        if (!controller.isTerminal) controller.transition("aborted", "aborted by user");
+        if (!this.turn || this.turn === controller) await this.abort();
         return { kind: "failed", error: "provider_turn_aborted" };
       }
       if (controller.expired()) {

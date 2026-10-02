@@ -52,6 +52,53 @@ const descriptor: OpenAIWebModelDescriptor = {
   capabilityState: "unknown"
 };
 
+test("already cancelled turn does not prepare or submit a browser conversation", async () => {
+  const runtime = new OpenAIWebRuntime({
+    config: baseConfig(tmpdir()),
+    catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+    ensureBrowser: async () => {},
+    getBranchKey: () => "branch-1"
+  });
+  let prepared = false;
+  (runtime as any).ensureConversation = async () => { prepared = true; throw new Error("unexpected browser preparation"); };
+  const outcome = await runtime.runTurn(descriptor, { messages: [] }, {}, { signal: AbortSignal.abort() });
+  assert.deepEqual(outcome, { kind: "failed", error: "provider_turn_aborted" });
+  assert.equal(prepared, false);
+});
+
+for (const via of ["signal", "runtime"] as const) {
+  test(`cancellation via ${via} during preparation prevents submission`, async () => {
+    const runtime = new OpenAIWebRuntime({
+      config: baseConfig(tmpdir()),
+      catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+      ensureBrowser: async () => {},
+      getBranchKey: () => "branch-1"
+    });
+    const controller = new AbortController();
+    let reads = 0;
+    const conversation = { client: { Runtime: { evaluate: async () => { reads++; throw new Error("unexpected submission"); } } } };
+    (runtime as any).ensureConversation = async () => {
+      if (via === "signal") controller.abort();
+      else await runtime.abort();
+      return conversation;
+    };
+    const outcome = await runtime.runTurn(descriptor, { messages: [] }, {}, { signal: controller.signal });
+    assert.deepEqual(outcome, { kind: "failed", error: "provider_turn_aborted" });
+    assert.equal(reads, 0);
+  });
+}
+
+test("compaction respects cancellation before asking for a checkpoint", async () => {
+  const runtime = new OpenAIWebRuntime({
+    config: baseConfig(tmpdir()),
+    catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+    ensureBrowser: async () => {},
+    getBranchKey: () => "branch-1"
+  });
+  (runtime as any).conversation = { client: {} };
+  await assert.rejects(runtime.compactConversation(descriptor, 0, undefined, { signal: AbortSignal.abort() }), { name: "AbortError" });
+});
+
 test("reconnectConversation rejects stale/invalid conversationId, clears resume store, and emits fallback", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-temp-test-"));
   try {

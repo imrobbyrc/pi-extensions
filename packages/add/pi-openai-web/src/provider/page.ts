@@ -51,11 +51,12 @@ export async function enablePage(client: CdpClient): Promise<void> {
 }
 
 /** Poll until evalFn (a JS expression or arrow function) returns true. */
-export async function waitFor(client: CdpClient, evalFn: string, timeoutMs: number, intervalMs = 250): Promise<boolean> {
+export async function waitFor(client: CdpClient, evalFn: string, timeoutMs: number, intervalMs = 250, signal?: AbortSignal): Promise<boolean> {
   // Handle both plain expressions and arrow functions: call it if it is a function.
   const expression = `Boolean((() => { const f = (${evalFn}); return typeof f === "function" ? f() : f; })())`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     try {
       const result = await client.Runtime.evaluate({ expression, returnByValue: true });
       if (result.exceptionDetails) { /* expression error: retry until deadline */ }
@@ -70,6 +71,10 @@ export async function evalJson<T>(client: CdpClient, expression: string): Promis
   // Accept both plain expressions and arrow functions: call it if it evaluates to a function.
   const wrapped = `(() => { const v = (${expression}); return typeof v === "function" ? v() : v; })()`;
   const result = await client.Runtime.evaluate({ expression: wrapped, returnByValue: true });
+  if (result.exceptionDetails) {
+    const detail = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
+    throw new Error(`ChatGPT page evaluation failed: ${detail.slice(0, 500)}`);
+  }
   return result.result.value as T | undefined;
 }
 
@@ -113,25 +118,39 @@ export async function focusComposer(client: CdpClient): Promise<void> {
 }
 
 /** Submit text via the composer. Caller must already have confirmed fresh state when required. */
-export async function submitPrompt(client: CdpClient, text: string): Promise<void> {
+export async function submitPrompt(client: CdpClient, text: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+  const { signal } = options;
+  signal?.throwIfAborted();
   const previousUsers = new Set((await readTurnState(client)).userIdentities);
   await focusComposer(client);
   const hasExistingText = await evalJson<boolean>(client, `() => {
     const el = [...document.querySelectorAll('${COMPOSER_SELECTOR}')].filter(el => el.offsetParent !== null).at(-1);
     return Boolean(el && (el.textContent || '').trim().length > 0);
   }`);
+  signal?.throwIfAborted();
   if (hasExistingText) await clearComposer(client);
+  signal?.throwIfAborted();
   await client.Input.insertText({ text });
-  // Click Send until the button accepts it; it mounts/disables while the composer settles.
-  if (!await waitFor(client, SEND_BUTTON_FN, 5_000)) throw new Error("ChatGPT Send button is unavailable");
+  signal?.throwIfAborted();
+  // Wait for an enabled Send control, then click once. Never retry an unconfirmed submission.
+  if (!await waitFor(client, SEND_BUTTON_FN, 5_000, 250, signal)) throw new Error("ChatGPT Send button is unavailable");
   const deadline = Date.now() + 10_000;
+  let lastReadError: string | undefined;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     try {
-      if ((await readTurnState(client)).userIdentities.some(id => !previousUsers.has(id))) return;
-    } catch { /* transient navigation */ }
+      const state = await readTurnState(client);
+      signal?.throwIfAborted();
+      if (state.userIdentities.some(id => !previousUsers.has(id))) return;
+      lastReadError = undefined;
+    } catch (error) {
+      signal?.throwIfAborted();
+      lastReadError = error instanceof Error ? error.message : String(error);
+    }
     await sleep(250);
   }
-  throw new Error("ChatGPT did not confirm the submitted user message");
+  signal?.throwIfAborted();
+  throw new Error(`ChatGPT did not confirm the submitted user message within 10 seconds.${lastReadError ? ` Last page check: ${lastReadError}` : " No new user-message identity appeared."} Check the browser tab before retrying; the message may already have been submitted.`);
 }
 
 export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
@@ -174,7 +193,8 @@ export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
       url: location.href
     };
   }`);
-  return state ?? { turnIdentities: [], userIdentities: [], responseIdentities: [], completionActionVisible: false, stopVisible: false, busy: false, url: "" };
+  if (!state) throw new Error("ChatGPT conversation state unavailable");
+  return state;
 }
 
 export async function waitForConversationUrl(client: CdpClient, timeoutMs = 10_000): Promise<string> {
