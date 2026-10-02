@@ -1472,28 +1472,34 @@ test("OpenAIWebRuntime injects the always-on Lead contract into buildPrompt", ()
 
   // Access private buildPrompt via reflect / any
   const runtimeAny = runtime as unknown as {
-    buildPrompt: (context: { messages: unknown[] }, conv: { bootstrapped: boolean; syncedMessageCount: number }) => string;
+    buildPrompt: (context: { systemPrompt?: string; messages: unknown[] }, conv: { bootstrapped: boolean; syncedMessageCount: number }) => string;
   };
 
-  // Turn 1 (not bootstrapped): full Lead contract with strict tool allowlist.
-  const prompt1 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Plan an architecture" }] }, { bootstrapped: false, syncedMessageCount: 0 });
+  // Turn 1 (not bootstrapped): full Lead contract with strict tool allowlist
+  // plus the bounded stable Pi system instructions.
+  const prompt1 = runtimeAny.buildPrompt({ systemPrompt: "Stable Pi system instructions.", messages: [{ role: "user", content: "Plan an architecture" }] }, { bootstrapped: false, syncedMessageCount: 0 });
   assert.match(prompt1, /LEAD ARCHITECT MODE \(always on\)/);
   assert.match(prompt1, /You are the Lead Architect/);
   assert.match(prompt1, /zai\/glm-5\.3/);
   assert.match(prompt1, /Inspect through the "Pi Workspace" MCP read tools only/);
   assert.match(prompt1, /Use read_context once/);
   assert.match(prompt1, /never edit, run shell commands, spawn subagents, or create panes yourself/);
+  assert.ok(prompt1.includes("<pi_system>\nStable Pi system instructions.\n</pi_system>"), "stable Pi instructions are serialized into the bootstrap composer text");
   assert.match(prompt1, /Plan an architecture/);
   assert.match(prompt1, /decision_graph \{problem, shapes, graph, cardinality, boundaries, behavior, scope, verification, critique\}/);
   assert.match(prompt1, /Report only reviewed results/);
 
-  // Continuation (bootstrapped) carries the concise protocol reminder.
-  const prompt2 = runtimeAny.buildPrompt({ messages: [{ role: "user", content: "Next step" }] }, { bootstrapped: true, syncedMessageCount: 0 });
+  // Continuation (bootstrapped) carries the concise protocol reminder and never
+  // repeats the full Lead contract or the stable Pi instructions.
+  const prompt2 = runtimeAny.buildPrompt({ systemPrompt: "Stable Pi system instructions.", messages: [{ role: "user", content: "Next step" }] }, { bootstrapped: true, syncedMessageCount: 0 });
   assert.match(prompt2, /\[LEAD-MODE: active/);
   assert.match(prompt2, /\[LEAD-PROTOCOL:.*medium=standard_plan, high=decision_graph/);
   assert.match(prompt2, /escalate, never downgrade/);
   assert.match(prompt2, /zai\/glm-5\.3/);
   assert.match(prompt2, /Next step/);
+  assert.doesNotMatch(prompt2, /LEAD ARCHITECT MODE/);
+  assert.doesNotMatch(prompt2, /You are the Lead Architect/);
+  assert.doesNotMatch(prompt2, /<pi_system>/);
 
   // Undefined config still yields the contract with defaults.
   orchConfig = undefined;

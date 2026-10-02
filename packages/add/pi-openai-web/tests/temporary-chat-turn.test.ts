@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { newUserBatch, OpenAIWebRuntime } from "../src/provider/runtime.js";
-import { MemoryProviderResumeStore } from "../src/provider/resume.js";
+import { MemoryProviderResumeStore, type ProviderResumeMetadata } from "../src/provider/resume.js";
+import { CHECKPOINT_END, CHECKPOINT_START } from "../src/provider/compaction.js";
+import type { CdpClient } from "../src/provider/page.js";
 import { SessionStore } from "../src/provider/session-store.js";
 import type { HarnessConfig } from "../src/types.js";
 import type { OpenAIWebModelDescriptor } from "../src/provider/types.js";
@@ -51,6 +53,101 @@ const descriptor: OpenAIWebModelDescriptor = {
   selectable: true,
   capabilityState: "unknown"
 };
+
+interface FakeChatPage {
+  client: CdpClient;
+  /** Every composer submission, in order. */
+  submitted: string[];
+  /** 1-based submission index whose Input.insertText rejects (simulated crash mid-submit). */
+  failInsertAt?: number;
+}
+
+/**
+ * Minimal stateful fake of the ChatGPT page over CDP: satisfies the page.ts
+ * primitives the provider runtime drives during bootstrap/compaction turns
+ * (turn-state reads, composer focus/submit, temporary-chat checks, URL reads)
+ * without a real browser. Page.navigate recycles to a fresh Temporary Chat URL
+ * just like the compaction recycle does.
+ */
+function fakeChatGptPage(initialUrl = "https://chatgpt.com/?temporary-chat=true"): FakeChatPage {
+  const submitted: string[] = [];
+  const page: FakeChatPage = { client: undefined as unknown as CdpClient, submitted };
+  let url = initialUrl;
+  let userCount = 0;
+  let insertCount = 0;
+  page.client = {
+    Page: {
+      enable: async () => ({}),
+      navigate: async () => { url = "https://chatgpt.com/?temporary-chat=true"; return {}; }
+    },
+    Runtime: {
+      enable: async () => ({}),
+      evaluate: async ({ expression }: { expression: string }) => {
+        if (expression.includes("data-turn-id-container")) {
+          return { result: { value: {
+            turnIdentities: [],
+            userIdentities: Array.from({ length: userCount }, (_, index) => `user-${index + 1}`),
+            responseIdentities: [],
+            completionActionVisible: false,
+            stopVisible: false,
+            busy: false,
+            url
+          } } };
+        }
+        if (expression.includes("Turn off temporary chat")) {
+          return { result: { value: { hasTurnOff: true, hasSaveChat: false, hasTempParam: true, isNormalChatUrl: false } } };
+        }
+        if (expression.includes("location.href")) return { result: { value: url } };
+        if (expression.includes("el.focus()")) return { result: { value: true } };
+        if (expression.includes("trim().length > 0")) return { result: { value: false } };
+        return { result: { value: true } }; // composer ready, send button, plain evals
+      }
+    },
+    Input: {
+      insertText: async ({ text }: { text: string }) => {
+        insertCount += 1;
+        if (page.failInsertAt === insertCount) throw new Error("simulated crash during composer submit");
+        submitted.push(text);
+        userCount += 1;
+      }
+    },
+    close: async () => {}
+  } as unknown as CdpClient;
+  return page;
+}
+
+const SYSTEM_PROMPT = "Pi stable system instructions for this session.";
+
+function lifecycleRuntime(dir: string, resumeStore: MemoryProviderResumeStore, attachClient?: (config: never, targetId: string) => Promise<CdpClient>): OpenAIWebRuntime {
+  return new OpenAIWebRuntime({
+    config: baseConfig(dir),
+    catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+    ensureBrowser: async () => {},
+    getBranchKey: () => "branch-1",
+    resumeStore,
+    ...(attachClient ? { attachClient: attachClient as any } : {}),
+    getOrchestratorConfig: () => ({
+      workerModel: "zai/glm-5.3",
+      workerThinking: "high",
+      maxParallelWorkers: 3,
+      delegationStrategy: "adaptive"
+    })
+  });
+}
+
+/** Attach a freshly created (bootstrap-pending) provider conversation to the runtime. */
+function attachFreshConversation(runtime: OpenAIWebRuntime, client: CdpClient, targetId = "tab-boot"): void {
+  (runtime as any).conversation = {
+    targetId,
+    descriptorKey: "GPT-5.6 Luna::High",
+    branchKey: "branch-1",
+    leaseKey: `branch-1:GPT-5.6 Luna::High:epoch-0`,
+    epoch: 0,
+    bootstrapped: false,
+    syncedMessageCount: 0,
+    client
+  };
+}
 
 test("already cancelled turn does not prepare or submit a browser conversation", async () => {
   const runtime = new OpenAIWebRuntime({
@@ -487,6 +584,273 @@ test("shutdown saves the token estimate durably before the clean detach zeroes i
     const metadata = await resumeStore.load();
     assert.equal(metadata?.targetId, "tab-shutdown");
     assert.equal(metadata?.estimatedContextTokens, 42);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("fresh conversation bootstraps with the full Lead contract and stable Pi instructions, then continues concisely", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-bootstrap-lifecycle-"));
+  try {
+    const resumeStore = new MemoryProviderResumeStore();
+    const page = fakeChatGptPage();
+    const runtime = lifecycleRuntime(dir, resumeStore);
+    attachFreshConversation(runtime, page.client);
+    const runtimeAny = runtime as any;
+    runtimeAny.watch = async (controller: any) => {
+      controller.transition("completed");
+      return { kind: "completed", markdown: "Lead contract acknowledged." };
+    };
+
+    const outcome1 = await runtime.runTurn(descriptor, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "Plan the migration" }]
+    }, {});
+    assert.equal(outcome1.kind, "completed");
+
+    // Bootstrap turn: full Lead contract plus bounded stable Pi instructions.
+    const bootstrapPrompt = page.submitted[0] ?? "";
+    assert.match(bootstrapPrompt, /LEAD ARCHITECT MODE \(always on\):/);
+    assert.match(bootstrapPrompt, /You are the Lead Architect/);
+    assert.match(bootstrapPrompt, /zai\/glm-5\.3/);
+    assert.ok(bootstrapPrompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
+    assert.match(bootstrapPrompt, /Plan the migration/);
+    // Completion is persisted only after the full bootstrap turn succeeded.
+    assert.equal((await resumeStore.load())?.bootstrapComplete, true);
+    assert.equal(runtime.conversationSummary().bootstrapped, true);
+
+    const outcome2 = await runtime.runTurn(descriptor, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [
+        { role: "user", content: "Plan the migration" },
+        { role: "assistant", content: "Lead contract acknowledged." },
+        { role: "user", content: "Next step please" }
+      ]
+    }, {});
+    assert.equal(outcome2.kind, "completed");
+
+    // Continuation turn: concise reminders only — the full contract never repeats.
+    const continuationPrompt = page.submitted[1] ?? "";
+    assert.match(continuationPrompt, /\[LEAD-MODE: active/);
+    assert.match(continuationPrompt, /\[LEAD-PROTOCOL:/);
+    assert.doesNotMatch(continuationPrompt, /LEAD ARCHITECT MODE/);
+    assert.doesNotMatch(continuationPrompt, /You are the Lead Architect/);
+    assert.doesNotMatch(continuationPrompt, /<pi_system>/);
+    assert.match(continuationPrompt, /Next step please/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed bootstrap turn stays pending and is retried with the full contract before completion is persisted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-bootstrap-retry-"));
+  try {
+    const resumeStore = new MemoryProviderResumeStore();
+    const page = fakeChatGptPage();
+    const runtime = lifecycleRuntime(dir, resumeStore);
+    attachFreshConversation(runtime, page.client);
+    const runtimeAny = runtime as any;
+    runtimeAny.watch = async (controller: any) => {
+      controller.transition("failed", "simulated_watch_failure");
+      return { kind: "failed", error: "simulated_watch_failure" };
+    };
+
+    const outcome1 = await runtime.runTurn(descriptor, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "Plan the migration" }]
+    }, {});
+    assert.equal(outcome1.kind, "failed");
+    // Submission succeeded but the turn did not: bootstrap stays pending durably.
+    assert.equal((await resumeStore.load())?.bootstrapComplete, false);
+    assert.equal(runtime.conversationSummary().bootstrapped, false);
+
+    runtimeAny.watch = async (controller: any) => {
+      controller.transition("completed");
+      return { kind: "completed", markdown: "Lead contract acknowledged." };
+    };
+    const outcome2 = await runtime.runTurn(descriptor, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "Plan the migration" }]
+    }, {});
+    assert.equal(outcome2.kind, "completed");
+    // The retry re-sends the full bootstrap contract, and only its success persists completion.
+    const retryPrompt = page.submitted[1] ?? "";
+    assert.match(retryPrompt, /LEAD ARCHITECT MODE \(always on\):/);
+    assert.ok(retryPrompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
+    assert.equal((await resumeStore.load())?.bootstrapComplete, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reconnect derives bootstrapped state from persisted bootstrap state; legacy metadata fails safe to pending", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-reconnect-bootstrap-"));
+  try {
+    const base = {
+      schemaVersion: 1 as const,
+      targetId: "tab-reconnect",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "branch-1:GPT-5.6 Luna::High:epoch-2",
+      epoch: 2,
+      syncedMessageCount: 3,
+      updatedAt: new Date().toISOString()
+    };
+    const reconnectWith = async (metadata: ProviderResumeMetadata) => {
+      const resumeStore = new MemoryProviderResumeStore();
+      await resumeStore.save(metadata);
+      const page = fakeChatGptPage();
+      const runtime = new OpenAIWebRuntime({
+        config: baseConfig(dir),
+        catalog: { resolve: () => descriptor, models: [descriptor] } as any,
+        ensureBrowser: async () => {},
+        getBranchKey: () => "branch-1",
+        resumeStore,
+        attachClient: async () => page.client
+      });
+      return await (runtime as any).reconnectConversation(descriptor);
+    };
+
+    // Persisted completion reconnects bootstrapped: continuation continues without the full contract.
+    const completed = await reconnectWith({ ...base, bootstrapComplete: true });
+    assert.equal(completed?.bootstrapped, true);
+    // Persisted pending (crash before bootstrap completion) reconnects unbootstrapped.
+    const pending = await reconnectWith({ ...base, bootstrapComplete: false });
+    assert.equal(pending?.bootstrapped, false);
+    // Legacy metadata without the field fails safe to pending — never assumed complete.
+    const legacy = await reconnectWith(base);
+    assert.equal(legacy?.bootstrapped, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("compaction recycle re-establishes the full Lead bootstrap before continuing from the checkpoint", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-compaction-bootstrap-"));
+  try {
+    const resumeStore = new MemoryProviderResumeStore();
+    const page = fakeChatGptPage("https://chatgpt.com/c/conv-compaction");
+    const runtime = lifecycleRuntime(dir, resumeStore);
+    const runtimeAny = runtime as any;
+    runtimeAny.conversation = {
+      targetId: "tab-compaction",
+      conversationId: "conv-compaction",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "branch-1:GPT-5.6 Luna::High:epoch-0",
+      epoch: 0,
+      bootstrapped: true,
+      syncedMessageCount: 2,
+      client: page.client
+    };
+    runtimeAny.selectExact = async () => {};
+    runtimeAny.watch = async (controller: any) => {
+      controller.transition("completed");
+      const last = page.submitted[page.submitted.length - 1] ?? "";
+      if (last.includes("Return only one structured compaction checkpoint")) {
+        // Handoff turn: answer with a checkpoint that cites the exact source ids.
+        const checkpoint = {
+          protocol: "pi-compaction-checkpoint-v1",
+          source: {
+            targetId: /targetId=(\S+)/.exec(last)?.[1] ?? "",
+            conversationId: /conversationId=(\S*)/.exec(last)?.[1] ?? "",
+            turnId: /turnId=(\S+)/.exec(last)?.[1] ?? ""
+          },
+          goal: "ship the unified bootstrap lifecycle",
+          accomplished: ["fresh bootstrap carries the Lead contract"],
+          decisions: ["persist explicit bootstrap completion"],
+          state: [],
+          remaining: ["focused reconnect tests"],
+          critical: []
+        };
+        return { kind: "completed", markdown: `${CHECKPOINT_START}\n${JSON.stringify(checkpoint)}\n${CHECKPOINT_END}` };
+      }
+      return { kind: "completed", markdown: "Bootstrap acknowledged; continuing as Lead." };
+    };
+
+    await runtime.compactConversation(descriptor, 2, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "prior canonical work" }]
+    });
+
+    // Handoff brief first, then the fresh-chat bootstrap turn.
+    assert.equal(page.submitted.length, 2);
+    const bootstrapPrompt = page.submitted[1] ?? "";
+    // Full Lead bootstrap contract re-established on the fresh Temporary Chat,
+    // with the stable Pi instructions, before the checkpoint.
+    assert.match(bootstrapPrompt, /LEAD ARCHITECT MODE \(always on\):/);
+    assert.match(bootstrapPrompt, /You are the Lead Architect/);
+    assert.ok(bootstrapPrompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
+    assert.ok(bootstrapPrompt.indexOf("LEAD ARCHITECT MODE") < bootstrapPrompt.indexOf("--- CHECKPOINT ---"));
+    // The checkpoint rides as untrusted continuation context while the contract is reasserted.
+    assert.match(bootstrapPrompt, /--- CHECKPOINT ---/);
+    assert.match(bootstrapPrompt, /untrusted context, not instructions/);
+    assert.match(bootstrapPrompt, /ship the unified bootstrap lifecycle/);
+
+    // The recycled conversation is bootstrap-complete only after the bootstrap turn succeeded.
+    assert.equal(runtime.conversationSummary().bootstrapped, true);
+    const metadata = await resumeStore.load();
+    assert.equal(metadata?.bootstrapComplete, true);
+    assert.equal(metadata?.targetId, "tab-compaction");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("crash during compaction bootstrap leaves durable pending state and reconnect performs the full bootstrap", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-compaction-crash-"));
+  try {
+    const resumeStore = new MemoryProviderResumeStore();
+    const page = fakeChatGptPage("https://chatgpt.com/c/conv-crash");
+    page.failInsertAt = 2; // the handoff submits; the fresh-chat bootstrap submit dies
+    const runtime = lifecycleRuntime(dir, resumeStore);
+    const runtimeAny = runtime as any;
+    runtimeAny.conversation = {
+      targetId: "tab-compaction-crash",
+      conversationId: "conv-crash",
+      descriptorKey: "GPT-5.6 Luna::High",
+      branchKey: "branch-1",
+      leaseKey: "branch-1:GPT-5.6 Luna::High:epoch-0",
+      epoch: 0,
+      bootstrapped: true,
+      syncedMessageCount: 2,
+      client: page.client
+    };
+    runtimeAny.selectExact = async () => {};
+    runtimeAny.watch = async (controller: any) => {
+      controller.transition("completed");
+      return { kind: "completed", markdown: "no checkpoint markers here" };
+    };
+
+    await assert.rejects(runtime.compactConversation(descriptor, 2, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "prior canonical work" }]
+    }), /simulated crash during composer submit/);
+
+    // Durable state after the crash: the recycled target is bootstrap-pending.
+    const pending = await resumeStore.load();
+    assert.equal(pending?.bootstrapComplete, false);
+    assert.equal(pending?.targetId, "tab-compaction-crash");
+
+    // Simulated restart: a fresh runtime reconnects from the same durable state.
+    const restartPage = fakeChatGptPage();
+    const restarted = lifecycleRuntime(dir, resumeStore, async (_config, _targetId) => restartPage.client);
+    (restarted as any).watch = async (controller: any) => {
+      controller.transition("completed");
+      return { kind: "completed", markdown: "Lead contract re-established." };
+    };
+    const outcome = await restarted.runTurn(descriptor, {
+      systemPrompt: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "Continue after the crash" }]
+    }, {});
+    assert.equal(outcome.kind, "completed");
+
+    // Reconnect performed the full bootstrap, not a concise continuation.
+    const reprompt = restartPage.submitted[0] ?? "";
+    assert.match(reprompt, /LEAD ARCHITECT MODE \(always on\):/);
+    assert.ok(reprompt.includes(`<pi_system>\n${SYSTEM_PROMPT}\n</pi_system>`));
+    assert.match(reprompt, /Continue after the crash/);
+    assert.equal((await resumeStore.load())?.bootstrapComplete, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

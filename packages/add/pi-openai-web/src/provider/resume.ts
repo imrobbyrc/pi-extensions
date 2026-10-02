@@ -14,6 +14,13 @@ export interface ProviderResumeMetadata {
   syncedMessageCount?: number;
   /** Running provider context-token estimate at save time. Absent in older metadata: reconnect restarts the estimate at zero. */
   estimatedContextTokens?: number;
+  /**
+   * Explicit bootstrap lifecycle state at save time: the full Lead/bootstrap
+   * contract turn completed successfully. Absent in older metadata: reconnect
+   * fails safe to pending (the full bootstrap contract is re-established)
+   * rather than assuming a completion that was never recorded.
+   */
+  bootstrapComplete?: boolean;
   updatedAt: string;
 }
 
@@ -38,6 +45,10 @@ export class FileProviderResumeStore implements ProviderResumeStore {
       if (value.estimatedContextTokens !== undefined
         && (typeof value.estimatedContextTokens !== "number" || !Number.isFinite(value.estimatedContextTokens) || value.estimatedContextTokens < 0)
       ) return undefined;
+      // Optional explicit bootstrap completion state: absent (older metadata)
+      // stays valid and reconnect treats it as pending; a present value must be
+      // a boolean or the whole load fails closed at this parse boundary.
+      if (value.bootstrapComplete !== undefined && typeof value.bootstrapComplete !== "boolean") return undefined;
       return value as ProviderResumeMetadata;
     } catch {
       return undefined;

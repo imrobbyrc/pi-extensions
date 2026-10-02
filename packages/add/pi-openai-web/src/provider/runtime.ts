@@ -156,11 +156,47 @@ function messageText(content: unknown): string {
 /**
  * Stable Pi instructions only. Raw history is intentionally excluded: ChatGPT
  * Web keeps its own working conversation and inspects the workspace through the
- * strict MCP tool allowlist.
+ * strict MCP tool allowlist. ChatGPT Web exposes no system-role message to this
+ * provider: the Pi systemPrompt is serialized into the Web composer text
+ * (bounded by systemPromptMax) as part of the bootstrap prompt below — it is
+ * never delivered as a ChatGPT system message.
  */
-export function buildBootstrapContext(context: { systemPrompt?: string }): string {
+export function buildBootstrapContext(context: { systemPrompt?: string | undefined }): string {
   if (!context.systemPrompt?.trim()) return "";
   return `<pi_system>\n${truncate(context.systemPrompt, BOOTSTRAP_LIMITS.systemPromptMax)}\n</pi_system>`;
+}
+
+export interface BootstrapPromptInput {
+  /** Always-on Lead Architect profile; undefined resolves the documented defaults. */
+  leadConfig: OrchestratorConfig | undefined;
+  /** MCP app name the Lead contract names for its read-tool allowlist. */
+  appName: string;
+  /** Stable Pi system instructions, bounded and wrapped as <pi_system> composer text. */
+  systemPrompt?: string | undefined;
+  /**
+   * Task payload appended after the contract: the latest Pi user request for an
+   * initial fresh conversation, or the compaction checkpoint continuation for a
+   * post-compaction recycle. The only part allowed to differ between the paths.
+   */
+  payload: string;
+}
+
+/**
+ * The single authoritative full-bootstrap turn text. Initial conversation
+ * creation and post-compaction Temporary Chat recycle both build their
+ * bootstrap prompts through this one function — only the trailing payload
+ * differs — so the full Lead contract and the stable Pi instructions can
+ * never drift semantically between the two bootstrap paths.
+ */
+export function buildBootstrapPrompt(input: BootstrapPromptInput): string {
+  const stableContext = buildBootstrapContext(input);
+  return [
+    "You are the selected ChatGPT model inside Pi. Pi executes workspace tools.",
+    buildLeadContract(input.leadConfig, input.appName),
+    ...(stableContext ? ["", "Stable Pi instructions:", stableContext] : []),
+    "",
+    input.payload
+  ].join("\n");
 }
 
 /** Latest canonical user request for a fresh Web conversation; never replays old noise. */
@@ -351,6 +387,7 @@ export class OpenAIWebRuntime {
       epoch: conversation.epoch,
       syncedMessageCount: conversation.syncedMessageCount,
       estimatedContextTokens: this.contextTokens,
+      bootstrapComplete: conversation.bootstrapped,
       updatedAt: new Date().toISOString()
     };
     await store.save(metadata);
@@ -394,7 +431,12 @@ export class OpenAIWebRuntime {
         branchKey: metadata.branchKey,
         leaseKey: metadata.leaseKey,
         epoch: metadata.epoch,
-        bootstrapped: true,
+        // Bootstrap completion is derived from the persisted bootstrap state,
+        // never assumed: an explicit true means the full bootstrap turn already
+        // succeeded. Pending (false) and legacy metadata without the field both
+        // fail safe to unbootstrapped, so the next turn re-runs the full
+        // Lead/bootstrap contract instead of continuing without it.
+        bootstrapped: metadata.bootstrapComplete === true,
         syncedMessageCount: metadata.syncedMessageCount ?? 0,
         client
       };
@@ -565,7 +607,9 @@ export class OpenAIWebRuntime {
       const url = await waitForConversationUrl(conversation.client);
       const conversationId = extractConversationId(url);
       if (conversationId && isValidConversationId(conversationId)) conversation.conversationId = conversationId;
-      conversation.bootstrapped = true;
+      // Bootstrap stays pending after submission: only a fully successful turn
+      // completes it below. A crash or failure before that leaves the persisted
+      // resume state pending so a reconnect re-runs the full bootstrap contract.
       conversation.syncedMessageCount = context.messages.length;
       this.contextTokens += estimateTokens(prompt);
       await this.persistResume(conversation);
@@ -573,6 +617,10 @@ export class OpenAIWebRuntime {
       this.emit("provider_submitted", { targetId: conversation.targetId, model: descriptor.id });
       const outcome = await this.watch(controller, handlers, options, submitBaseline);
       if (outcome.kind === "completed") {
+        // Bootstrap completion gate: the full bootstrap turn must succeed before
+        // continuation turns may switch to concise LEAD-MODE/LEAD-PROTOCOL
+        // reminders. For already-bootstrapped conversations this is a no-op.
+        conversation.bootstrapped = true;
         conversation.syncedMessageCount = context.messages.length;
         this.contextTokens += estimateTokens(outcome.markdown);
         await this.persistResume(conversation);
@@ -599,16 +647,17 @@ export class OpenAIWebRuntime {
       : latestUserMessage(context);
     const userBatch = rawBatch || (conversation.bootstrapped ? "Continue with the current task." : "Begin the conversation.");
     if (!conversation.bootstrapped) {
-      const stableContext = buildBootstrapContext(context);
-      const leadContract = buildLeadContract(this.deps.getOrchestratorConfig?.(), this.config.chatgptAppName);
-      return [
-        "You are the selected ChatGPT model inside Pi. Pi executes workspace tools.",
-        leadContract,
-        ...(stableContext ? ["", "Stable Pi instructions:", stableContext] : []),
-        "",
-        "Latest Pi user message:",
-        `<user>\n${truncate(userBatch, BOOTSTRAP_LIMITS.userBatchMax)}\n</user>`
-      ].join("\n");
+      // Fresh conversation: the full bootstrap turn through the single
+      // authoritative construction shared with the post-compaction recycle.
+      return buildBootstrapPrompt({
+        leadConfig: this.deps.getOrchestratorConfig?.(),
+        appName: this.config.chatgptAppName,
+        systemPrompt: context.systemPrompt,
+        payload: [
+          "Latest Pi user message:",
+          `<user>\n${truncate(userBatch, BOOTSTRAP_LIMITS.userBatchMax)}\n</user>`
+        ].join("\n")
+      });
     }
     const lead = this.deps.getOrchestratorConfig?.();
     const leadReminder = `[LEAD-MODE: active (worker: ${lead?.workerModel ?? "default"}, default_thinking: ${lead?.workerThinking ?? "default"} (fallback; explicit user effort wins), workers: ${lead?.maxParallelWorkers ?? 3}, strategy: ${lead?.delegationStrategy ?? "adaptive"})]`;
@@ -700,9 +749,23 @@ export class OpenAIWebRuntime {
       await this.resetConversation("compact_resume");
       throw error;
     }
-    const bootstrap = compactionBootstrapPrompt(validated ?? canonicalHistoryFallback(canonicalContext ?? this.canonicalContext));
-    const bootstrapBaseline = await readTurnState(fresh.client);
+    // The recycled Temporary Chat is a fresh conversation: bootstrap is pending
+    // until its full turn succeeds, exactly like an initial creation. Persist
+    // the pending state before submitting so a crash mid-bootstrap leaves durable
+    // pending state and a reconnect re-runs the full contract.
     this.conversation = fresh;
+    await this.persistResume(fresh).catch(() => { /* best effort */ });
+    const compactionContext = canonicalContext ?? this.canonicalContext;
+    // Re-establish the identical Lead/bootstrap contract through the single
+    // authoritative construction; only the payload differs — the checkpoint
+    // rides as untrusted continuation context, never as instructions.
+    const bootstrap = buildBootstrapPrompt({
+      leadConfig: this.deps.getOrchestratorConfig?.(),
+      appName: this.config.chatgptAppName,
+      systemPrompt: compactionContext.systemPrompt,
+      payload: compactionBootstrapPrompt(validated ?? canonicalHistoryFallback(compactionContext))
+    });
+    const bootstrapBaseline = await readTurnState(fresh.client);
     const bootstrapController = new ProviderTurnController(
       descriptor, fresh.targetId, randomUUID(), this.fingerprint(bootstrap),
       this.config.providerTurnTimeoutMs, this.config.providerStallTimeoutMs
