@@ -34,6 +34,9 @@ import type { OpenAIWebModelDescriptor } from "../src/provider/types.js";
  *    display:none after completion) is ignored by ALL observation paths
  *    (readTurnState, probe, capture), while genuinely rendered markers — and
  *    the visible Stop control — still block completion.
+ * 4. The bound message's own root aria-busy is residue once the same turn
+ *    exposes its completion action: the turn reads calm unless a rendered
+ *    busy marker (or the visible Stop control) still reports activity.
  */
 
 // ---------------------------------------------------------------------------
@@ -191,6 +194,9 @@ const contentSpec = (blocks: DomSpec[]): DomSpec => ({
   tag: "div",
   children: [...blocks, { tag: "button", attrs: { "data-testid": "copy-turn-action-button" } }]
 });
+
+/** Content wrapper WITHOUT the completion action: a turn still streaming. */
+const streamingSpec = (blocks: DomSpec[]): DomSpec => ({ tag: "div", children: [...blocks] });
 
 /** Execute a CDP Runtime.evaluate expression against the fake DOM. */
 function runExpression(expression: string, document: FakeDocument): unknown {
@@ -469,15 +475,16 @@ test("readTurnState ignores hidden stale aria-busy/loading-shimmer chrome", asyn
   }
 });
 
-test("readTurnState stays busy for rendered markers and message-level aria-busy", async () => {
+test("readTurnState stays busy for rendered markers", async () => {
   for (const dom of VISIBLE_BUSY_DOMS) {
     const state = await readTurnState(staticDomClient(dom));
     assert.equal(state.busy, true, "a rendered busy marker must keep blocking completion");
   }
-  // The bound message's own aria-busy marks the whole turn: authoritative
-  // regardless of descendant chrome.
-  const messageLevel = await readTurnState(staticDomClient(contentSpec([replyDoneSpec]), { "aria-busy": "true" }));
-  assert.equal(messageLevel.busy, true);
+  // The bound message's own aria-busy still marks a streaming turn as busy
+  // while the turn has not yet exposed its completion action.
+  const streaming = await readTurnState(staticDomClient(streamingSpec([replyDoneSpec]), { "aria-busy": "true" }));
+  assert.equal(streaming.busy, true);
+  assert.equal(streaming.completionActionVisible, false);
 });
 
 test("probe and capture agree: hidden stale busy chrome ignored, rendered markers busy", async () => {
@@ -521,6 +528,84 @@ test("visible Stop stays authoritative busy evidence independent of busy markers
   const calm = await readTurnState(docClient(buildDocument("r1", hiddenAriaBusyDom, {}, [hiddenStop])));
   assert.equal(calm.busy, false);
   assert.equal(calm.stopVisible, false);
+});
+
+// ---------------------------------------------------------------------------
+// 1c. Root aria-busy staleness once the turn exposes its completion action
+// ---------------------------------------------------------------------------
+
+/** The bound assistant message itself carries aria-busy="true". */
+const ROOT_BUSY: Record<string, string> = { "aria-busy": "true" };
+
+test("root aria-busy with no completion action stays busy on every observation path", async () => {
+  const client = staticDomClient(streamingSpec([replyDoneSpec]), ROOT_BUSY);
+  const state = await readTurnState(client);
+  assert.equal(state.busy, true, "a streaming turn's root aria-busy is live activity");
+  assert.equal(state.completionActionVisible, false);
+  const probe = await readAssistantTurnRevision(client, "r1");
+  const capture = await captureAssistantTurn(client, "r1");
+  assert.ok(probe && capture);
+  assert.equal(probe.busy, true, "probe must honor the streaming root flag");
+  assert.equal(capture.busy, true, "atomic capture must honor the streaming root flag");
+  assert.equal(probe.completionVisible, false);
+  assert.equal(capture.completionVisible, false);
+});
+
+test("stale root aria-busy reads calm once the same turn exposes its completion action", async () => {
+  const client = staticDomClient(contentSpec([replyDoneSpec]), ROOT_BUSY);
+  const state = await readTurnState(client);
+  assert.equal(state.busy, false, "the root flag is residue once the copy action is exposed");
+  assert.equal(state.completionActionVisible, true);
+  assert.equal(state.completionResponseIdentity, "r1");
+  const probe = await readAssistantTurnRevision(client, "r1");
+  const capture = await captureAssistantTurn(client, "r1");
+  assert.ok(probe && capture);
+  assert.equal(probe.busy, false, "probe must treat the stale root flag as calm");
+  assert.equal(capture.busy, false, "atomic capture must treat the stale root flag as calm");
+  assert.equal(probe.busy, capture.busy);
+  assert.equal(probe.completionVisible, true);
+  assert.equal(capture.completionVisible, true);
+  // The stale root flag must not exclude the message from the fold either:
+  // probe and capture compute identical, non-null revisions so the settle
+  // loop can trust the cached snapshot.
+  assert.ok(capture.revision.structureChecksum !== null && capture.revision.structureChecksum !== undefined,
+    "the bound message must fold despite its stale root aria-busy");
+  assert.deepEqual(
+    {
+      textLength: probe.textLength,
+      textChecksum: probe.textChecksum,
+      childCount: probe.childCount,
+      linkChecksum: probe.linkChecksum,
+      languageKey: probe.languageKey,
+      structureChecksum: probe.structureChecksum
+    },
+    capture.revision,
+    "probe revision must equal the atomic capture revision on a stale-root turn"
+  );
+});
+
+test("rendered busy descendants still win over the completion action; hidden ones stay inert", async () => {
+  for (const dom of VISIBLE_BUSY_DOMS) {
+    const client = staticDomClient(dom, ROOT_BUSY);
+    const state = await readTurnState(client);
+    assert.equal(state.busy, true, "a rendered marker keeps the turn busy beside the copy action");
+    const probe = await readAssistantTurnRevision(client, "r1");
+    const capture = await captureAssistantTurn(client, "r1");
+    assert.ok(probe && capture);
+    assert.equal(probe.busy, true, "probe must honor the rendered marker over the root staleness rule");
+    assert.equal(capture.busy, true, "capture must honor the rendered marker over the root staleness rule");
+    assert.equal(probe.busy, capture.busy);
+  }
+  for (const dom of HIDDEN_STALE_BUSY_DOMS) {
+    const client = staticDomClient(dom, ROOT_BUSY);
+    const state = await readTurnState(client);
+    assert.equal(state.busy, false, "hidden stale chrome must not resurrect activity beside the copy action");
+    const probe = await readAssistantTurnRevision(client, "r1");
+    const capture = await captureAssistantTurn(client, "r1");
+    assert.ok(probe && capture);
+    assert.equal(probe.busy, false);
+    assert.equal(capture.busy, false);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -586,6 +671,8 @@ function domState(overrides: Partial<TurnDomState>): TurnDomState {
 interface DomFrame {
   state: TurnDomState;
   dom?: DomSpec;
+  /** Attributes for the bound assistant message element (e.g. root aria-busy). */
+  messageAttrs?: Record<string, string>;
 }
 
 /**
@@ -612,12 +699,12 @@ function domWatchClient(frames: DomFrame[]) {
         if (expression.includes("piRevisionProbe")) {
           revisionProbes += 1;
           if (!current.dom) return { result: { value: null } };
-          return { result: { value: runExpression(expression, buildDocument("r1", current.dom)) } };
+          return { result: { value: runExpression(expression, buildDocument("r1", current.dom, current.messageAttrs ?? {})) } };
         }
         if (expression.includes("piAtomicTurnCapture")) {
           serializations += 1;
           if (!current.dom) return { result: { value: null } };
-          return { result: { value: runExpression(expression, buildDocument("r1", current.dom)) } };
+          return { result: { value: runExpression(expression, buildDocument("r1", current.dom, current.messageAttrs ?? {})) } };
         }
         return { result: { value: undefined } };
       }
@@ -751,6 +838,53 @@ test("stable reply with only hidden stale busy chrome completes in the normal se
     // two full captures (first sight + final atomic verification). Baseline
     // behavior never completed here — it polled busy until hard timeout.
     assert.ok(h.pollCount() <= 6, `hidden chrome must not stretch the window, got ${h.pollCount()} polls`);
+    assert.equal(h.serializeCount(), 2);
+    assert.equal(h.revisionProbeCount(), h.pollCount());
+    assert.equal(h.controller.state, "completed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("completed reply with stale root aria-busy settles and completes in the normal settle window", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-revision-root-busy-"));
+  try {
+    // ChatGPT can leave the bound message's own aria-busy=true mounted after
+    // the reply finished and the copy action appeared. The old semantics
+    // treated that root flag as authoritative forever, so the REAL probe and
+    // capture expressions kept reporting busy and the turn rode the hard
+    // timeout instead of settling. Now the completion action retires the root
+    // flag: completion must arrive after the normal semantic settle window.
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 8_000 });
+    const emitted: string[] = [];
+    const staleRootBusy = (): DomFrame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
+      dom: contentSpec([replyDoneSpec]),
+      messageAttrs: { "aria-busy": "true" }
+    });
+    const h = makeDomWatchHarness(
+      cfg,
+      [
+        staleRootBusy(),
+        staleRootBusy(),
+        staleRootBusy(),
+        staleRootBusy(),
+        staleRootBusy(),
+        staleRootBusy(),
+        staleRootBusy(),
+        staleRootBusy()
+      ],
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Done.");
+    assert.deepEqual(emitted, ["Done."]);
+    // Normal semantic settle window only: a handful of calm polls and exactly
+    // two full captures (first sight + final atomic verification). Baseline
+    // behavior never completed here — the stale root flag polled busy until
+    // the hard timeout.
+    assert.ok(h.pollCount() <= 6, `stale root flag must not stretch the window, got ${h.pollCount()} polls`);
     assert.equal(h.serializeCount(), 2);
     assert.equal(h.revisionProbeCount(), h.pollCount());
     assert.equal(h.controller.state, "completed");

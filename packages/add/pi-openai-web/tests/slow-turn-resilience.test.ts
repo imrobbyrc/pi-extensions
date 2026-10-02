@@ -314,6 +314,39 @@ test("busy browser state does not falsely stall without harness activity", async
   }
 });
 
+test("busy evidence outranks a visible completion action until the marker clears", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-grace-busy-beats-copy-"));
+  try {
+    // Watcher-level guard for the root aria-busy staleness rule: a turn can
+    // legitimately still read busy while its copy action is already visible
+    // (a rendered shimmer, or a streaming root aria-busy with no completion
+    // semantics yet). Those busy readings from any observation path must keep
+    // blocking settle and completion; the turn completes only after the busy
+    // evidence clears, over the normal semantic settle window.
+    const cfg = baseConfig(dir, { stallTimeoutMs: 1_000, turnTimeoutMs: 30_000 });
+    const emitted: string[] = [];
+    const busyBesideCopyAction = (): Frame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1", busy: true }),
+      tree: { tag: "p", children: [{ tag: "#text", text: "Busy beside the copy action" }] }
+    });
+    const done = completedFrame("r1", "Busy beside the copy action");
+    const h = makeWatch(
+      cfg,
+      [busyBesideCopyAction(), busyBesideCopyAction(), busyBesideCopyAction(), done, done, done, done, done, done],
+      undefined,
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.match(outcome.markdown ?? "", /Busy beside the copy action/);
+    assert.deepEqual(emitted, ["Busy beside the copy action"], "busy polls stream once; completion waits for the calm window");
+    assert.equal(h.stopClickCount(), 0);
+    assert.equal(h.controller.state, "completed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hard turn timeout still fires while harness stays active", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-grace-timeout-"));
   try {
