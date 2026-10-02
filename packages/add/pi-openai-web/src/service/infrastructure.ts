@@ -52,16 +52,31 @@ export class HarnessInfrastructureManager {
 
   get isStopping(): boolean { return this.stopping; }
 
+  /**
+   * Lifecycle gate shared by start and reload: an in-flight stop always wins
+   * (fresh transitions reject promptly instead of outliving the shutdown),
+   * while sibling starts/reloads share the in-flight transition.
+   */
+  private rejectIfStopping(): void {
+    if (this.stopInFlight || this.stopping) throw new Error("Harness infrastructure is stopping");
+  }
+
+  /** Shared MCP + tunnel startup leg (Dia starts only on a full start). */
+  private async ensureMcpTunnelStarted(onProgress?: (message: string) => void): Promise<void> {
+    await settleStarts([
+      this.mcp.ensureStarted().then(() => onProgress?.("MCP ready")),
+      this.tunnel.ensureStarted((message) => onProgress?.(`Tunnel: ${message}`))
+    ]);
+  }
+
   /** Start MCP, tunnel, and Dia in parallel; readiness waits for all. Single-flight. */
   async start(onProgress?: (message: string) => void): Promise<HarnessInfrastructureStatus> {
-    if (this.stopping) throw new Error("Harness infrastructure is stopping");
+    this.rejectIfStopping();
     if (this.startInFlight) return this.startInFlight;
     this.startInFlight = (async () => {
       this.started = true;
-      const progress = (label: string) => (message: string) => onProgress?.(`${label}: ${message}`);
       await settleStarts([
-        this.mcp.ensureStarted().then(() => onProgress?.("MCP ready")),
-        this.tunnel.ensureStarted(progress("Tunnel")),
+        this.ensureMcpTunnelStarted(onProgress),
         this.dia.ensureStarted().then(() => onProgress?.("Dia CDP ready"))
       ]);
       return this.snapshot();
@@ -75,17 +90,21 @@ export class HarnessInfrastructureManager {
     return { mcp, tunnel, dia, ready: isHarnessReady({ mcp, tunnel, dia }) };
   }
 
+  /**
+   * Hard-reload Pi-owned MCP and tunnel while preserving the provider
+   * conversation/browser. Concurrent reloads share the one in-flight
+   * stop/start cycle; an in-flight stop still wins and rejects new reloads.
+   */
   async reloadMcpAndTunnel(onProgress?: (message: string) => void): Promise<HarnessInfrastructureStatus> {
-    if (this.stopping) throw new Error("Harness infrastructure is stopping");
+    if (this.stopInFlight) throw new Error("Harness infrastructure is stopping"); // pending stop wins
+    if (this.reloadInFlight) return this.reloadInFlight; // sibling reloads share the one cycle
+    this.rejectIfStopping();
     this.stopping = true;
     this.reloadInFlight = (async () => {
       if (this.startInFlight) await this.startInFlight;
       await stopOwned([this.tunnel, this.mcp]);
       this.started = true;
-      await settleStarts([
-        this.mcp.ensureStarted().then(() => onProgress?.("MCP ready")),
-        this.tunnel.ensureStarted((message) => onProgress?.(`Tunnel: ${message}`))
-      ]);
+      await this.ensureMcpTunnelStarted(onProgress);
       return this.snapshot();
     })().finally(() => {
       this.reloadInFlight = undefined;

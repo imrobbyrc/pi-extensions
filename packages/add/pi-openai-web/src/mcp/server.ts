@@ -513,9 +513,16 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
 
 export class HarnessMcpHttpServer {
   private app: FastifyInstance | undefined;
+  /**
+   * Serialized lifecycle transitions. Concurrent starts share one listener
+   * (never a duplicate Fastify app), and a start queued behind a stop waits
+   * for the listener to close instead of racing it for the port (no transient
+   * EADDRINUSE). Transitions apply in call order and always settle.
+   */
+  private transitions: Promise<unknown> = Promise.resolve();
 
   constructor(
-    private readonly config: HarnessConfig,
+    private readonly config: Pick<HarnessConfig, "mcpHost" | "mcpPort" | "mcpPath">,
     private readonly factory: () => McpServer
   ) {}
 
@@ -529,29 +536,42 @@ export class HarnessMcpHttpServer {
     return typeof address === "object" && address ? address.port : undefined;
   }
 
+  /** Run one lifecycle transition after all previously requested transitions. */
+  private transition<T>(run: () => Promise<T>): Promise<T> {
+    const outcome = this.transitions.then(run, run);
+    this.transitions = outcome.then(() => undefined, () => undefined);
+    return outcome;
+  }
+
+  /** Start listening. Concurrent invocations share the single listener. */
   async start(): Promise<void> {
-    if (this.app) return;
-    const handler = createMcpHandler(this.factory);
-    const nodeHandler = toNodeHandler(handler);
-    const app = Fastify({ logger: false });
+    return this.transition(async () => {
+      if (this.app) return;
+      const handler = createMcpHandler(this.factory);
+      const nodeHandler = toNodeHandler(handler);
+      const app = Fastify({ logger: false });
 
-    app.get("/healthz", async () => ({ ok: true, name: "pi-harness" }));
-    app.all(this.config.mcpPath, async (request, reply) => {
-      // MCP streamable HTTP owns raw response lifecycle; prevent Fastify from
-      // closing the SSE stream before the handler finishes writing.
-      reply.hijack();
-      await nodeHandler(request.raw as NodeIncomingMessageLike, reply.raw, request.body);
+      app.get("/healthz", async () => ({ ok: true, name: "pi-harness" }));
+      app.all(this.config.mcpPath, async (request, reply) => {
+        // MCP streamable HTTP owns raw response lifecycle; prevent Fastify from
+        // closing the SSE stream before the handler finishes writing.
+        reply.hijack();
+        await nodeHandler(request.raw as NodeIncomingMessageLike, reply.raw, request.body);
+      });
+
+      await app.listen({ host: this.config.mcpHost, port: this.config.mcpPort });
+      this.app = app;
     });
-
-    await app.listen({ host: this.config.mcpHost, port: this.config.mcpPort });
-    this.app = app;
   }
 
   get running(): boolean { return this.app !== undefined; }
 
+  /** Stop the listener. Idempotent; a queued start waits for the close to finish. */
   async stop(): Promise<void> {
-    const app = this.app;
-    this.app = undefined;
-    if (app) await app.close();
+    return this.transition(async () => {
+      const app = this.app;
+      this.app = undefined;
+      if (app) await app.close();
+    });
   }
 }

@@ -249,6 +249,8 @@ For a low-risk change, use `risk=low`, `planning_kind=compact` and `compact_plan
 | `/openai-web start` | Start browser/CDP, local MCP, and the tunnel |
 | `/openai-web reload` | Hard-reload Pi-owned MCP and tunnel; preserves provider conversation |
 | `/reload-tunnel` | Top-level shortcut for `/openai-web reload`: recovers Pi-owned local MCP and the Secure MCP Tunnel through the same shared recovery path (identical progress/errors; browser and provider conversation untouched) |
+
+Lifecycle transitions are serialized per resource: overlapping invocations (e.g. `/reload-tunnel` racing `/openai-web start` or a provider turn) share the in-flight transition instead of racing for the MCP port or failing with a spurious "stopping" error. Only Pi-owned resources are ever stopped; an externally healthy tunnel is adopted, never killed. |
 | `/openai-web models [refresh]` | Show (or re-discover) the model catalog |
 | `/openai-web reset` | Reset the provider conversation (next turn opens a fresh Temporary Chat) |
 | `/openai-web compact` | Compact the conversation via validated checkpoint |

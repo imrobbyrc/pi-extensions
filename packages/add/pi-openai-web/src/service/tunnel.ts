@@ -196,10 +196,19 @@ export class SecureTunnel {
         this.child = undefined;
       }) as never);
     }
+    // The Pi-owned child this startup attempt is bound to. stop() clears this.child,
+    // so a mid-poll ownership loss (or a late exit event) is detectable.
+    const watched = this.child;
     const deadline = Date.now() + this.config.tunnelStartupTimeoutMs;
     while (Date.now() < deadline) {
       if ((this.processState as string) === "failed" || (this.processState as string) === "exited") return "failed";
+      // Ownership lost: a concurrent stop() reaped the child. Settle as stopped —
+      // never overwrite the stop's state or spin until the deadline.
+      if (this.child !== watched) return "stopped";
       const health = await this.health();
+      // stop() may land while the probe is in flight; late probes must not
+      // resurrect stopped state or report the aborted attempt as connecting.
+      if (this.child !== watched) return "stopped";
       if (health.kind === "pass") {
         this.processState = "running";
         this.connectionState = "ready";
