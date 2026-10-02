@@ -63,3 +63,30 @@ test("waitForCdp polls until browser endpoint responds", async () => {
   assert.equal(version, "Dia");
   assert.equal(attempts, 2);
 });
+
+test("waitForCdp honors the overall deadline when a single attempt hangs", async () => {
+  const started = Date.now();
+  // A request that never settles must not be able to outlive the budget.
+  const outcome = await Promise.race([
+    waitForCdp({ ...config, browserStartupTimeoutMs: 400 }, () => new Promise<Response>(() => {}))
+      .then(
+        () => "resolved unexpectedly",
+        (error: Error) => error.message
+      ),
+    new Promise<string>((resolve) => setTimeout(() => resolve("HUNG: deadline not enforced"), 2_000))
+  ]);
+  const elapsed = Date.now() - started;
+  assert.match(outcome, /^Browser\/CDP did not become reachable/);
+  assert.ok(elapsed < 1_500, `deadline materially overrun: ${elapsed}ms`);
+});
+
+test("waitForCdp polling delay never materially overruns the deadline", async () => {
+  const started = Date.now();
+  await assert.rejects(
+    waitForCdp({ ...config, browserStartupTimeoutMs: 100 }, async () => {
+      throw new Error("connection refused");
+    })
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 250, `poll delay overran the 100ms deadline: ${elapsed}ms`);
+});

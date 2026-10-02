@@ -109,6 +109,8 @@ test("timeout with alive child -> connecting; repeated start shares child; stop 
   assert.equal(t.processState, "stopped");
   assert.equal(t.connectionState, "disconnected");
   assert.equal(t.managedByPi, false);
+  assert.equal(t.pid, undefined); // ownership metadata reset with the child
+  assert.equal(t.startedAt, undefined);
   assert.equal(await t.probe(), "stopped");
 });
 
@@ -135,6 +137,45 @@ test("healthy external recovery clears stale process failure", async () => {
   assert.equal(await t.probe(), "ready");
   assert.equal(t.managedByPi, false);
   assert.equal(t.lastError, undefined);
+});
+
+test("probe: fresh healthy daemon supersedes stale failed/exited state", async () => {
+  // Stale "failed" (e.g. prior spawn failure) + healthy external daemon.
+  const failed = tunnel({}, () => { throw new Error("must not spawn"); }, async () => ({ stdout: passJson, stderr: "" }));
+  failed.processState = "failed";
+  failed.connectionState = "failed";
+  failed.lastError = "spawn failed: previous attempt";
+  failed.pid = 4242;
+  failed.startedAt = "2024-01-01T00:00:00.000Z";
+  assert.equal(await failed.probe(), "ready");
+  assert.equal(failed.connectionState, "ready");
+  assert.equal(failed.managedByPi, false); // external daemon: never claimed
+  assert.equal(failed.processState, "stopped");
+  assert.equal(failed.lastError, undefined); // stale error metadata cleared
+  assert.equal(failed.pid, undefined);
+  assert.equal(failed.startedAt, undefined);
+
+  // Stale "exited" + healthy external daemon: same recovery.
+  const exited = tunnel({}, () => { throw new Error("must not spawn"); }, async () => ({ stdout: passJson, stderr: "" }));
+  exited.processState = "exited";
+  exited.connectionState = "failed";
+  exited.lastError = "tunnel-client exited (code=1)";
+  exited.pid = 1111;
+  assert.equal(await exited.probe(), "ready");
+  assert.equal(exited.managedByPi, false);
+  assert.equal(exited.lastError, undefined);
+  assert.equal(exited.pid, undefined);
+  assert.equal(exited.startedAt, undefined);
+});
+
+test("probe: live connecting daemon reported connecting, not stale failed", async () => {
+  const connectingJson = JSON.stringify({ healthz: { ok: true }, readyz: { ok: true }, control_plane_poll: { ok: false, error: "no successful control-plane poll observed" }, result: "fail" });
+  const t = tunnel({}, () => { throw new Error("must not spawn"); }, async () => ({ stdout: connectingJson, stderr: "" }));
+  t.processState = "failed";
+  t.connectionState = "failed";
+  t.lastError = "tunnel-client exited (code=1)";
+  assert.equal(await t.probe(), "connecting"); // live daemon evidence wins over the stale cache
+  assert.equal(t.connectionState, "connecting");
 });
 
 test("resolveTunnelBinary prefers explicit override and PATH candidates", () => {
@@ -237,6 +278,62 @@ test("late child exit/error events after stop never resurrect state", async () =
   assert.equal(t.connectionState, "disconnected");
   assert.equal(t.child, undefined);
   assert.equal(t.managedByPi, false);
+  assert.equal(t.pid, undefined); // late events never resurrect owned-child metadata
+  assert.equal(t.startedAt, undefined);
+});
+
+test("ownership metadata describes the current owned child only", async () => {
+  const child = fakeChild(7578);
+  let pass = false;
+  const t = tunnel({}, () => child, async () => ({ stdout: pass ? passJson : failJson, stderr: "" }));
+  assert.equal(t.pid, undefined);
+  assert.equal(t.startedAt, undefined);
+  const before = Date.now();
+  const starting = t.ensureStarted();
+  await new Promise((r) => setTimeout(r, 60));
+  // Spawned owned child: pid and startedAt recorded.
+  assert.equal(t.pid, 7578);
+  assert.ok(t.startedAt !== undefined && Date.parse(t.startedAt) >= before - 1_000);
+  pass = true;
+  assert.equal(await starting, "ready");
+  assert.equal(t.pid, 7578); // still the current owned child while running
+  assert.ok(t.startedAt !== undefined);
+  // Child exit releases ownership: metadata cleared immediately.
+  child.emit("exit", 0, null);
+  assert.equal(t.processState, "exited");
+  assert.equal(t.managedByPi, false);
+  assert.equal(t.pid, undefined);
+  assert.equal(t.startedAt, undefined);
+  assert.match(t.lastError ?? "", /code=0/);
+  // A healthy external daemon afterwards adopts without restoring owned-child metadata.
+  assert.equal(await t.ensureStarted(), "ready");
+  assert.equal(t.managedByPi, false);
+  assert.equal(t.pid, undefined);
+  assert.equal(t.startedAt, undefined);
+});
+
+test("spawn failure clears ownership metadata and stays retryable", async () => {
+  const failing = fakeChild(8181);
+  const good = fakeChild(8282);
+  let failSpawn = true;
+  let spawns = 0;
+  const t = tunnel({ tunnelStartupTimeoutMs: 1_000 }, () => { spawns += 1; return failSpawn ? failing : good; }, async () => ({ stdout: failJson, stderr: "" }));
+  const starting = t.ensureStarted();
+  await new Promise((r) => setTimeout(r, 60));
+  failing.emit("error", new Error("spawn ENOENT"));
+  assert.equal(await starting, "failed");
+  assert.match(t.lastError ?? "", /spawn failed/);
+  assert.equal(t.managedByPi, false); // nothing was ever owned
+  assert.equal(t.pid, undefined);
+  assert.equal(t.startedAt, undefined);
+  assert.equal(t.child, undefined);
+  // Retry spawns a fresh owned child with fresh metadata.
+  failSpawn = false;
+  assert.equal(await t.ensureStarted(), "connecting");
+  assert.equal(spawns, 2);
+  assert.equal(t.pid, 8282);
+  assert.ok(t.startedAt !== undefined);
+  assert.equal(t.managedByPi, true);
 });
 
 test("health parser regression against real observed payload and negatives", async () => {

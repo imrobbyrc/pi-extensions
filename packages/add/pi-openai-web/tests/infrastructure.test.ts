@@ -1,6 +1,42 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import type { HarnessConfig } from "../src/types.js";
 import { isHarnessReady, HarnessInfrastructureManager, type InfrastructureDependency, type ResourceState } from "../src/service/infrastructure.js";
+import { SecureTunnel } from "../src/service/tunnel.js";
+import { HarnessDia, type DiaChild } from "../src/service/dia.js";
+
+const dependencyConfig: HarnessConfig = {
+  mcpHost: "127.0.0.1",
+  mcpPort: 8765,
+  mcpPath: "/mcp",
+  publicMcpUrl: undefined,
+  stateDir: "/tmp/planner",
+  browser: "dia",
+  browserBinary: "/nonexistent/pi-dia-test-browser",
+  browserProfileDir: "/tmp/planner/dia-profile",
+  browserStartupTimeoutMs: 1_000,
+  cdpHost: "127.0.0.1",
+  cdpPort: 9222,
+  chatgptUrl: "https://chatgpt.com/",
+  chatgptAppName: "Pi Workspace",
+  browserAutoAttachApp: true,
+  maxReadLines: 500,
+  maxFileBytes: 1_000_000,
+  tunnelBinary: "tunnel-client",
+  tunnelProfile: "pi-planner",
+  tunnelHealthPort: 8080,
+  tunnelStartupTimeoutMs: 120_000,
+  catalogSuccessTtlMs: 86_400_000,
+  catalogFailureRetryMs: 180_000,
+  providerTurnTimeoutMs: 600_000,
+  providerStallTimeoutMs: 90_000,
+  providerToolWaitMs: 300_000
+};
+
+function fakeDiaChild(): DiaChild {
+  return Object.assign(new EventEmitter(), { unref() {} }) as unknown as DiaChild;
+}
 
 function dependency(state: () => ResourceState, opts: { startTo?: ResourceState; owned?: boolean; stopCalls?: string[]; name?: string } = {}): InfrastructureDependency {
   const killed = { value: false };
@@ -293,4 +329,59 @@ test("start -> ready -> stop stops owned deps once; restart works; external unto
   assert.deepEqual(externalStops, []);
   mcpState.value = "ready"; tunnelState.value = "ready"; diaState.value = "ready";
   assert.equal((await manager.start()).ready, true);
+});
+
+test("manager interaction: external tunnel/dia stay untouched; owned dia stops and restarts", async () => {
+  const tunnelPassJson = JSON.stringify({ healthz: { ok: true }, readyz: { ok: true }, control_plane_poll: { ok: true }, result: "ok" });
+  const tunnelDep = new SecureTunnel(
+    { tunnelBinary: "/resolved/tunnel-client", tunnelProfile: "pi-planner", tunnelHealthPort: 8080, tunnelStartupTimeoutMs: 2_000, stateDir: "/tmp" },
+    {
+      spawnImpl: (() => { throw new Error("must not spawn"); }) as never,
+      execImpl: (async () => ({ stdout: tunnelPassJson, stderr: "" })) as never,
+      credential: async () => "sk-test"
+    }
+  );
+
+  let browserUp = true; // phase 1: an external browser already serves CDP
+  let diaSpawns = 0;
+  const diaCloses: string[] = [];
+  const diaDep = new HarnessDia(
+    {
+      ...dependencyConfig,
+      cdpHost: "127.0.0.1",
+      cdpPort: 47823,
+      browserStartupTimeoutMs: 400
+    },
+    {
+      spawnImpl: () => { diaSpawns += 1; browserUp = true; return fakeDiaChild(); },
+      fetchImpl: ((async () =>
+        browserUp
+          ? new Response(JSON.stringify({ Browser: "Dia" }), { status: 200 })
+          : Promise.reject(new Error("connection refused"))) as unknown as typeof fetch),
+      closeImpl: async () => { diaCloses.push("dia"); browserUp = false; }
+    }
+  );
+
+  const manager = new HarnessInfrastructureManager(dependency(() => "ready"), tunnelDep, diaDep);
+
+  // Phase 1: tunnel and Dia both external/ready — start claims nothing.
+  const started = await manager.start();
+  assert.equal(started.ready, true);
+  assert.equal(diaSpawns, 0);
+  assert.equal(diaDep.managedByPi, false);
+  assert.equal(tunnelDep.managedByPi, false);
+  await manager.stopOwnedResources(); // nothing owned: external resources untouched
+  assert.deepEqual(diaCloses, []);
+
+  // Phase 2: browser gone — start spawns one owned Dia; stop closes exactly it.
+  browserUp = false;
+  const restarted = await manager.start();
+  assert.equal(restarted.ready, true);
+  assert.equal(diaSpawns, 1);
+  assert.equal(diaDep.managedByPi, true);
+
+  const stopped = await manager.stopOwnedResources();
+  assert.deepEqual(diaCloses, ["dia"]); // only the Pi-owned browser state stopped
+  assert.equal(stopped.dia, "stopped");
+  assert.equal(stopped.ready, false);
 });

@@ -40,8 +40,22 @@ export async function waitForCdp(
   let lastError = "not reachable";
 
   while (Date.now() < deadline) {
+    // Bound each attempt by the time still available: a hanging request is
+    // aborted (and raced against the remaining budget) so one stuck fetch can
+    // never outlive the overall startup deadline.
+    const remaining = deadline - Date.now();
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
     try {
-      const response = await request(url);
+      const response = await Promise.race([
+        request(url, { signal: controller.signal }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`no response within ${remaining}ms`));
+          }, remaining);
+        })
+      ]);
       if (response.ok) {
         const body = (await response.json()) as { Browser?: string };
         return body.Browser ?? "reachable";
@@ -49,8 +63,15 @@ export async function waitForCdp(
       lastError = `HTTP ${response.status}`;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    // Cap the poll delay to the budget left so polling never materially
+    // overruns the deadline.
+    const budgetLeft = deadline - Date.now();
+    if (budgetLeft > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, budgetLeft)));
+    }
   }
 
   throw new Error(`Browser/CDP did not become reachable at ${url}: ${lastError}`);
