@@ -30,6 +30,7 @@ export interface TurnDomState {
   /** Identity owning visible completion action, when available. */
   completionResponseIdentity?: string;
   stopVisible: boolean;
+  /** Visibility-aware busy: hidden stale aria-busy/loading-shimmer chrome does not count. */
   busy: boolean;
   url: string;
 }
@@ -153,8 +154,36 @@ export async function submitPrompt(client: CdpClient, text: string, options: { s
   throw new Error(`ChatGPT did not confirm the submitted user message within 10 seconds.${lastReadError ? ` Last page check: ${lastReadError}` : " No new user-message identity appeared."} Check the browser tab before retrying; the message may already have been submitted.`);
 }
 
+/**
+ * Browser-side visibility-aware busy semantics, interpolated verbatim into
+ * readTurnState, the cheap revision probe, and the atomic capture so all
+ * three observation paths can never disagree about busy state. ChatGPT
+ * leaves stale busy chrome mounted inside completed turns (aria-busy or
+ * loading-shimmer nodes hidden via display:none), and that hidden residue
+ * must not keep a provider turn alive after visible completion. A marker
+ * counts only when actually rendered, using the same offsetParent idiom the
+ * rest of this file uses, plus a getClientRects fallback so position:fixed
+ * markers (offsetParent null even while visible) still count. The bound
+ * message's own aria-busy stays authoritative: it marks the whole turn, not
+ * chrome descendants. Textual labels are never consulted.
+ */
+const TURN_BUSY_HELPERS = `
+    const busyMarkerRendered = (el) => el.offsetParent !== null
+      || (typeof el.getClientRects === 'function' && el.getClientRects().length > 0);
+    const messageBusy = (message) => {
+      if (!message) return false;
+      if (message.getAttribute('aria-busy') === 'true') return true;
+      const markers = message.querySelectorAll('[aria-busy="true"], [class*="loading-shimmer"]');
+      for (let index = 0; index < markers.length; index += 1) {
+        if (busyMarkerRendered(markers[index])) return true;
+      }
+      return false;
+    };
+`;
+
 export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
   const state = await evalJson<TurnDomState>(client, `() => {
+    ${TURN_BUSY_HELPERS}
     const containers = [...document.querySelectorAll('[data-turn-id-container]')].filter(el =>
       !el.parentElement?.closest('[data-turn-id-container]'));
     // Fallback containers are queried only when the primary binding is absent.
@@ -177,10 +206,7 @@ export async function readTurnState(client: CdpClient): Promise<TurnDomState> {
     // Bind copy/completion action to newest assistant message. A stale copy
     // button from an earlier turn must not complete a partially rendered turn.
     const completion = last?.querySelector('${COMPLETION_ACTION_SELECTOR}');
-    const busy = last ? Boolean(
-      last.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') ||
-      last.getAttribute('aria-busy') === 'true'
-    ) : false;
+    const busy = messageBusy(last);
 
     return {
       turnIdentities,
@@ -324,9 +350,9 @@ export interface SerializedAssistantTurn {
 
 /** Revision fingerprint plus the bound message's completion/busy flags; still no tree serialization. */
 export interface AssistantTurnProbe extends AssistantTurnRevision {
-  /** Copy/completion action visible inside the bound message (same binding as the atomic capture). */
+  /** Completion action visible inside the bound message (same binding as the atomic capture). */
   completionVisible: boolean;
-  /** Busy shimmer inside the bound message (same binding as the atomic capture). */
+  /** Visibility-aware busy marker inside the bound message (same binding as the atomic capture). */
   busy: boolean;
 }
 
@@ -404,7 +430,7 @@ const TURN_REVISION_HELPERS = `
  */
 export async function readAssistantTurnRevision(client: CdpClient, identity: string): Promise<AssistantTurnProbe | undefined> {
   const revision = await evalJson<AssistantTurnProbe | null>(client, `/* piRevisionProbe */ (() => {
-    ${TURN_REVISION_HELPERS}
+    ${TURN_REVISION_HELPERS}${TURN_BUSY_HELPERS}
     const wanted = ${JSON.stringify(identity)};
     const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
       || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
@@ -412,7 +438,7 @@ export async function readAssistantTurnRevision(client: CdpClient, identity: str
     return {
       ...revisionOf(message),
       completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
-      busy: Boolean(message.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') || message.getAttribute('aria-busy') === 'true')
+      busy: messageBusy(message)
     };
   })()`);
   return revision ?? undefined;
@@ -452,7 +478,7 @@ export interface AssistantTurnCapture {
 /** Atomically capture completion state and content from one DOM revision. */
 export async function captureAssistantTurn(client: CdpClient, identity: string): Promise<AssistantTurnCapture | undefined> {
   const capture = await evalJson<AssistantTurnCapture | null>(client, `/* piAtomicTurnCapture */ () => {
-    ${TURN_REVISION_HELPERS}
+    ${TURN_REVISION_HELPERS}${TURN_BUSY_HELPERS}
     const wanted = ${JSON.stringify(identity)};
     const message = document.querySelector('[data-turn-id=' + JSON.stringify(wanted) + ']')
       || document.querySelector('[data-content-search-unit-key=' + JSON.stringify(wanted) + ']');
@@ -485,7 +511,7 @@ export async function captureAssistantTurn(client: CdpClient, identity: string):
     };
     return {
       identity: message.getAttribute('data-turn-id') || wanted,
-      busy: Boolean(message.querySelector('[aria-busy="true"], [class*="loading-shimmer"]') || message.getAttribute('aria-busy') === 'true'),
+      busy: messageBusy(message),
       stopVisible: Boolean([...document.querySelectorAll('${STOP_BUTTON_SELECTOR}')].find(el => el.offsetParent !== null)),
       completionVisible: Boolean(message.querySelector('${COMPLETION_ACTION_SELECTOR}')),
       revision: revisionOf(message),

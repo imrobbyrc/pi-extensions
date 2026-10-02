@@ -7,6 +7,7 @@ import {
   assistantRevisionRequiresSerialization,
   captureAssistantTurn,
   readAssistantTurnRevision,
+  readTurnState,
   type CdpClient,
   type TurnDomState
 } from "../src/provider/page.js";
@@ -29,6 +30,10 @@ import type { OpenAIWebModelDescriptor } from "../src/provider/types.js";
  *    inline code into a fenced block) changes the revision — the blind spot
  *    that let a live response settle as inline `const replySmoke = "ok";`
  *    while the DOM held the fenced block.
+ * 3. Hidden stale busy chrome (aria-busy / loading-shimmer left mounted with
+ *    display:none after completion) is ignored by ALL observation paths
+ *    (readTurnState, probe, capture), while genuinely rendered markers — and
+ *    the visible Stop control — still block completion.
  */
 
 // ---------------------------------------------------------------------------
@@ -103,11 +108,20 @@ class FakeElement {
   readonly tagName: string;
   readonly attributes = new Map<string, string>();
   readonly childrenNodes: Array<FakeElement | FakeText> = [];
-  readonly offsetParent: object | null = {};
+  /** Rendered-visibility double: non-null by default, null for hidden fixtures. */
+  offsetParent: object | null = {};
+  /** Present only on fixed-position fixtures: rendered despite a null offsetParent. */
+  getClientRects?: () => Array<object>;
 
-  constructor(tagName: string, attrs: Record<string, string> = {}) {
+  constructor(tagName: string, attrs: Record<string, string> = {}, options: { hidden?: boolean; fixed?: boolean } = {}) {
     this.tagName = tagName.toUpperCase();
     for (const [name, value] of Object.entries(attrs)) this.attributes.set(name.toLowerCase(), value);
+    if (options.fixed) {
+      this.offsetParent = null;
+      this.getClientRects = () => [{}];
+    } else if (options.hidden) {
+      this.offsetParent = null;
+    }
   }
 
   get className(): string { return this.attributes.get("class") ?? ""; }
@@ -126,7 +140,7 @@ class FakeDocument {
   querySelectorAll(selector: string): FakeElement[] { return this.all.filter(el => elementMatches(el, selector)); }
 }
 
-/** Fixture DOM spec: tag, optional text/href/class/attrs, children. */
+/** Fixture DOM spec: tag, optional text/href/class/attrs, children, visibility. */
 interface DomSpec {
   tag: string;
   text?: string;
@@ -134,10 +148,14 @@ interface DomSpec {
   cls?: string;
   attrs?: Record<string, string>;
   children?: DomSpec[];
+  /** Rendered as display:none: offsetParent null and no client rects. */
+  hidden?: boolean;
+  /** position:fixed: offsetParent null but client rects present (still rendered). */
+  fixed?: boolean;
 }
 
 function buildElement(spec: DomSpec): FakeElement {
-  const element = new FakeElement(spec.tag);
+  const element = new FakeElement(spec.tag, {}, { hidden: spec.hidden, fixed: spec.fixed });
   if (spec.cls !== undefined) element.attributes.set("class", spec.cls);
   if (spec.href !== undefined) element.attributes.set("href", spec.href);
   for (const [name, value] of Object.entries(spec.attrs ?? {})) element.attributes.set(name, value);
@@ -149,11 +167,23 @@ function buildElement(spec: DomSpec): FakeElement {
   return element;
 }
 
-/** ChatGPT-shaped message: [data-turn-id] div > content div > blocks + copy action. */
-function buildDocument(identity: string, dom: DomSpec | undefined): FakeDocument {
-  const message = new FakeElement("div", { "data-turn-id": identity });
+/**
+ * ChatGPT-shaped turn: [data-turn-id-container] wrapper > [data-turn-id]
+ * assistant message > content div > blocks + copy action, so the REAL
+ * readTurnState expression (turn-container binding + assistant role) runs
+ * against the fixture exactly like the probe/capture expressions.
+ */
+function buildDocument(
+  identity: string,
+  dom: DomSpec | undefined,
+  messageAttrs: Record<string, string> = {},
+  extraRoots: FakeElement[] = []
+): FakeDocument {
+  const message = new FakeElement("div", { "data-turn-id": identity, "data-message-author-role": "assistant", ...messageAttrs });
   if (dom) message.childrenNodes.push(buildElement(dom));
-  return new FakeDocument([message]);
+  const container = new FakeElement("div", { "data-turn-id-container": identity });
+  container.childrenNodes.push(message);
+  return new FakeDocument([container, ...extraRoots]);
 }
 
 /** Message content wrapper: blocks plus the copy action button (excluded chrome). */
@@ -164,8 +194,9 @@ const contentSpec = (blocks: DomSpec[]): DomSpec => ({
 
 /** Execute a CDP Runtime.evaluate expression against the fake DOM. */
 function runExpression(expression: string, document: FakeDocument): unknown {
-  const fn = new Function("document", "Node", `"use strict"; return (${expression});`);
-  return fn(document, FAKE_NODE);
+  const location = { href: "https://chatgpt.com/c/fixture-1" };
+  const fn = new Function("document", "Node", "location", `"use strict"; return (${expression});`);
+  return fn(document, FAKE_NODE, location);
 }
 
 // ---------------------------------------------------------------------------
@@ -244,13 +275,16 @@ const unmarkedBlockDom: DomSpec = contentSpec([{
   ]
 }]);
 
-function staticDomClient(dom: DomSpec | undefined): CdpClient {
-  const document = dom ? buildDocument("r1", dom) : new FakeDocument([]);
+function docClient(document: FakeDocument): CdpClient {
   return {
     Runtime: {
       evaluate: async ({ expression }: { expression: string }) => ({ result: { value: runExpression(expression, document) } })
     }
   } as never;
+}
+
+function staticDomClient(dom: DomSpec | undefined, messageAttrs: Record<string, string> = {}): CdpClient {
+  return docClient(dom ? buildDocument("r1", dom, messageAttrs) : new FakeDocument([]));
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +437,90 @@ test("excluded action-bar chrome does not change the revision or serialized tree
 test("probe returns undefined when the bound message is gone", async () => {
   const probe = await readAssistantTurnRevision(staticDomClient(undefined), "r1");
   assert.equal(probe, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// 1b. Visibility-aware busy semantics across all three observation paths
+// ---------------------------------------------------------------------------
+
+/** Completed reply paragraph plus busy chrome ChatGPT left mounted after completion. */
+const replyDoneSpec: DomSpec = { tag: "p", text: "Done." };
+/** Hidden stale aria-busy marker (display:none subtree → offsetParent null). */
+const hiddenAriaBusyDom: DomSpec = contentSpec([replyDoneSpec, { tag: "div", attrs: { "aria-busy": "true" }, hidden: true }]);
+/** Hidden stale loading-shimmer node. */
+const hiddenShimmerDom: DomSpec = contentSpec([replyDoneSpec, { tag: "div", cls: "loading-shimmer h-2 w-40", hidden: true }]);
+/** Genuinely rendered busy markers: visible and position:fixed variants. */
+const visibleAriaBusyDom: DomSpec = contentSpec([replyDoneSpec, { tag: "div", attrs: { "aria-busy": "true" } }]);
+const visibleShimmerDom: DomSpec = contentSpec([replyDoneSpec, { tag: "div", cls: "loading-shimmer h-2 w-40" }]);
+/** position:fixed marker: offsetParent is null even while rendered. */
+const fixedShimmerDom: DomSpec = contentSpec([replyDoneSpec, { tag: "div", cls: "loading-shimmer h-2 w-40", fixed: true }]);
+
+const HIDDEN_STALE_BUSY_DOMS: DomSpec[] = [hiddenAriaBusyDom, hiddenShimmerDom];
+const VISIBLE_BUSY_DOMS: DomSpec[] = [visibleAriaBusyDom, visibleShimmerDom, fixedShimmerDom];
+
+test("readTurnState ignores hidden stale aria-busy/loading-shimmer chrome", async () => {
+  for (const dom of HIDDEN_STALE_BUSY_DOMS) {
+    const state = await readTurnState(staticDomClient(dom));
+    assert.equal(state.busy, false, "hidden stale busy chrome must not report busy");
+    assert.equal(state.completionActionVisible, true, "completed reply keeps its visible copy action");
+    assert.equal(state.completionResponseIdentity, "r1");
+    assert.equal(state.stopVisible, false);
+    assert.deepEqual(state.responseIdentities, ["r1"]);
+  }
+});
+
+test("readTurnState stays busy for rendered markers and message-level aria-busy", async () => {
+  for (const dom of VISIBLE_BUSY_DOMS) {
+    const state = await readTurnState(staticDomClient(dom));
+    assert.equal(state.busy, true, "a rendered busy marker must keep blocking completion");
+  }
+  // The bound message's own aria-busy marks the whole turn: authoritative
+  // regardless of descendant chrome.
+  const messageLevel = await readTurnState(staticDomClient(contentSpec([replyDoneSpec]), { "aria-busy": "true" }));
+  assert.equal(messageLevel.busy, true);
+});
+
+test("probe and capture agree: hidden stale busy chrome ignored, rendered markers busy", async () => {
+  for (const dom of HIDDEN_STALE_BUSY_DOMS) {
+    const client = staticDomClient(dom);
+    const probe = await readAssistantTurnRevision(client, "r1");
+    const capture = await captureAssistantTurn(client, "r1");
+    assert.ok(probe && capture);
+    assert.equal(probe.busy, false, "probe must ignore hidden stale busy chrome");
+    assert.equal(capture.busy, false, "atomic capture must ignore hidden stale busy chrome");
+    assert.equal(probe.busy, capture.busy);
+    assert.equal(probe.completionVisible, true);
+    assert.equal(capture.completionVisible, true);
+  }
+  for (const dom of VISIBLE_BUSY_DOMS) {
+    const client = staticDomClient(dom);
+    const probe = await readAssistantTurnRevision(client, "r1");
+    const capture = await captureAssistantTurn(client, "r1");
+    assert.ok(probe && capture);
+    assert.equal(probe.busy, true, "probe must honor a rendered busy marker");
+    assert.equal(capture.busy, true, "atomic capture must honor a rendered busy marker");
+    assert.equal(probe.busy, capture.busy);
+  }
+});
+
+test("visible Stop stays authoritative busy evidence independent of busy markers", async () => {
+  // Calm completed message (only hidden stale chrome) plus a VISIBLE stop
+  // button: the busy flags must read false while stopVisible stays true — the
+  // stop control is independent, visibility-checked evidence of its own.
+  const stop = new FakeElement("button", { "data-testid": "stop-button" });
+  const client = docClient(buildDocument("r1", hiddenAriaBusyDom, {}, [stop]));
+  const state = await readTurnState(client);
+  assert.equal(state.busy, false);
+  assert.equal(state.stopVisible, true);
+  const capture = await captureAssistantTurn(client, "r1");
+  assert.ok(capture);
+  assert.equal(capture.busy, false);
+  assert.equal(capture.stopVisible, true);
+  // A hidden stop control is not busy evidence either.
+  const hiddenStop = new FakeElement("button", { "data-testid": "stop-button" }, { hidden: true });
+  const calm = await readTurnState(docClient(buildDocument("r1", hiddenAriaBusyDom, {}, [hiddenStop])));
+  assert.equal(calm.busy, false);
+  assert.equal(calm.stopVisible, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -590,6 +708,94 @@ test("nested same-text markup change mid-settle reserializes and completes with 
     const swapPoll = h.pollTimestamps[3]!;
     const last = h.pollTimestamps[h.pollTimestamps.length - 1]!;
     assert.ok(last - swapPoll >= 1_250, `post-swap settle must span the full window, got ${last - swapPoll}ms`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("stable reply with only hidden stale busy chrome completes in the normal settle window", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-revision-hidden-busy-"));
+  try {
+    // The turn timeout bounds the baseline failure: without visibility-aware
+    // busy semantics the REAL probe expression reports busy forever, so the
+    // loop touches progress until the hard timeout instead of settling.
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 8_000 });
+    const emitted: string[] = [];
+    const calmWithHiddenChrome = (dom: DomSpec): DomFrame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
+      dom
+    });
+    // Both stale-marker shapes (hidden aria-busy, then hidden shimmer) sit
+    // inside a stable completed reply whose visible copy action is present.
+    // The real expressions must read them as calm: completion happens after
+    // the normal semantic settle window, not after touching progress forever.
+    const h = makeDomWatchHarness(
+      cfg,
+      [
+        calmWithHiddenChrome(hiddenAriaBusyDom),
+        calmWithHiddenChrome(hiddenAriaBusyDom),
+        calmWithHiddenChrome(hiddenAriaBusyDom),
+        calmWithHiddenChrome(hiddenAriaBusyDom),
+        calmWithHiddenChrome(hiddenShimmerDom),
+        calmWithHiddenChrome(hiddenShimmerDom),
+        calmWithHiddenChrome(hiddenShimmerDom),
+        calmWithHiddenChrome(hiddenShimmerDom)
+      ],
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Done.");
+    assert.deepEqual(emitted, ["Done."]);
+    // Normal semantic settle window only: a handful of calm polls and exactly
+    // two full captures (first sight + final atomic verification). Baseline
+    // behavior never completed here — it polled busy until hard timeout.
+    assert.ok(h.pollCount() <= 6, `hidden chrome must not stretch the window, got ${h.pollCount()} polls`);
+    assert.equal(h.serializeCount(), 2);
+    assert.equal(h.revisionProbeCount(), h.pollCount());
+    assert.equal(h.controller.state, "completed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("visible busy marker still blocks settling; completion re-earned after it hides", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-revision-visible-busy-"));
+  try {
+    const cfg = baseConfig(dir, { stallTimeoutMs: 5_000, turnTimeoutMs: 30_000 });
+    const emitted: string[] = [];
+    const frame = (dom: DomSpec): DomFrame => ({
+      state: domState({ responseIdentities: ["r1"], completionActionVisible: true, completionResponseIdentity: "r1" }),
+      dom
+    });
+    // The shimmer renders for two polls (the real probe expression must keep
+    // reporting busy and block any settle window), then ChatGPT hides the
+    // stale chrome: completion must be re-earned over a full fresh window
+    // measured from the first calm poll — never inherited from busy polls.
+    const h = makeDomWatchHarness(
+      cfg,
+      [
+        frame(visibleShimmerDom),
+        frame(visibleShimmerDom),
+        frame(hiddenShimmerDom),
+        frame(hiddenShimmerDom),
+        frame(hiddenShimmerDom),
+        frame(hiddenShimmerDom),
+        frame(hiddenShimmerDom),
+        frame(hiddenShimmerDom)
+      ],
+      { onText: (full) => emitted.push(full) }
+    );
+    const outcome = await h.run();
+    assert.equal(outcome.kind, "completed", outcome.error);
+    assert.equal(outcome.markdown, "Done.");
+    assert.deepEqual(emitted, ["Done."], "busy polls stream once; hiding chrome opens the window");
+    assert.equal(h.serializeCount(), 2);
+    const last = h.pollTimestamps[h.pollTimestamps.length - 1]!;
+    const firstCalm = h.pollTimestamps[2]!;
+    assert.ok(last - firstCalm >= 1_250, `completion must earn a full fresh window after the marker hides, got ${last - firstCalm}ms`);
+    assert.ok(h.pollCount() >= 5, `visible busy must delay completion past its own polls, got ${h.pollCount()} polls`);
+    assert.equal(h.controller.state, "completed");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
