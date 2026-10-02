@@ -200,6 +200,45 @@ test("hard timeout leaves healthy owned child alive; live probe can still become
   assert.equal(await t.probe(), "ready"); // /info (and /chatgpt-plan guard) see live ready
 });
 
+test("stop during in-flight startup poll settles stopped without resurrecting state", async () => {
+  const child = fakeChild();
+  const t = tunnel({ tunnelStartupTimeoutMs: 5_000 }, () => child, async () => ({ stdout: failJson, stderr: "" }));
+  const starting = t.ensureStarted();
+  await new Promise((r) => setTimeout(r, 120)); // inside the health poll loop
+  signalProcess.mock.mockImplementation((): true => { child.emit("exit", null, "SIGTERM"); return true; });
+  const stoppedAt = Date.now();
+  await t.stop();
+  // Regression: the orphaned poll loop used to keep spinning until the 5s
+  // deadline, overwrite processState back to "running", and report
+  // "connecting" for a tunnel that had just been stopped.
+  const outcome = await starting;
+  assert.equal(outcome, "stopped");
+  assert.equal(t.processState, "stopped");
+  assert.equal(t.connectionState, "disconnected");
+  assert.equal(t.managedByPi, false);
+  assert.equal(t.child, undefined);
+  assert.ok(Date.now() - stoppedAt < 2_000); // settles promptly, not at the deadline
+});
+
+test("late child exit/error events after stop never resurrect state", async () => {
+  const child = fakeChild();
+  let pass = false;
+  const t = tunnel({}, () => child, async () => ({ stdout: pass ? passJson : failJson, stderr: "" }));
+  const starting = t.ensureStarted();
+  await new Promise((r) => setTimeout(r, 80));
+  pass = true;
+  assert.equal(await starting, "ready");
+  signalProcess.mock.mockImplementation((): true => { child.emit("exit", null, "SIGTERM"); return true; });
+  await t.stop();
+  // Duplicated/late events arriving after ownership was released must be inert.
+  child.emit("exit", 1, null);
+  child.emit("error", new Error("spawn ENOENT"));
+  assert.equal(t.processState, "stopped");
+  assert.equal(t.connectionState, "disconnected");
+  assert.equal(t.child, undefined);
+  assert.equal(t.managedByPi, false);
+});
+
 test("health parser regression against real observed payload and negatives", async () => {
   const healthy = JSON.stringify({ healthz: { ok: true, status: 200, body: "live" }, readyz: { ok: true, status: 200, body: "ready" }, control_plane_poll: { value: 1788094021, ok: true }, result: "ok" });
   const t = (stdout: string) => tunnel({}, () => fakeChild(), async () => ({ stdout, stderr: "" }));

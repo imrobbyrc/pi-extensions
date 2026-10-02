@@ -51,6 +51,8 @@ export interface TunnelReloadHost {
 export interface ProviderModuleDeps {
   /** Replaces HarnessRuntime construction with a fake host for command tests. */
   readonly infrastructureHost?: () => Promise<HarnessRuntime>;
+  /** Replaces service initialization (catalog/session/provider registration) for lifecycle tests. */
+  readonly servicesHost?: () => Promise<void>;
 }
 
 /**
@@ -77,12 +79,24 @@ export async function runTunnelReload(host: TunnelReloadHost, ctx: ExtensionComm
  */
 export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentController, deps: ProviderModuleDeps = {}): ProviderModule {
   let configPromise: Promise<HarnessConfig> | undefined;
-  const config = (): Promise<HarnessConfig> => { configPromise ??= loadConfig(); return configPromise; };
+  const config = (): Promise<HarnessConfig> => {
+    if (!configPromise) {
+      const attempt = loadConfig();
+      configPromise = attempt;
+      // A failed load must not poison the latch: retrying initialization stays possible.
+      void attempt.catch(() => { if (configPromise === attempt) configPromise = undefined; });
+    }
+    return configPromise;
+  };
 
   let catalog: OpenAIWebModelCatalog | undefined;
   let setCatalog: ((descriptors: OpenAIWebModelDescriptor[]) => void) | undefined;
   let runtime: OpenAIWebRuntime | undefined;
   let infrastructure: HarnessRuntime | undefined;
+  /** Small explicit in-flight lifecycle state: one shared attempt per resource plus teardown serialization. */
+  let servicesInit: Promise<void> | undefined;
+  let infrastructureInit: Promise<HarnessRuntime> | undefined;
+  let teardown: Promise<void> | undefined;
   let sessionStore: SessionStore | undefined;
   let catalogError: string | undefined;
   let backgroundRefreshDone = false;
@@ -120,33 +134,58 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
     recordActivity(`lead config updated (${scope}: worker ${newConfig.workerModel})`);
   }
 
-  async function ensureServices(): Promise<void> {
+  /**
+   * Single-flight service initialization: concurrent callers share one attempt, so
+   * catalog/session state is created and the provider registered exactly once. A
+   * failed attempt clears the latch (and leaves no committed state behind), so a
+   * later retry is possible and deterministic.
+   */
+  function ensureServices(): Promise<void> {
+    if (runtime) return Promise.resolve();
+    if (!servicesInit && teardown) return Promise.reject(new Error("openai-web services are shutting down"));
+    if (!servicesInit) {
+      const attempt = initializeServices();
+      servicesInit = attempt;
+      void attempt.catch(() => { if (servicesInit === attempt) servicesInit = undefined; });
+    }
+    return servicesInit;
+  }
+
+  async function initializeServices(): Promise<void> {
+    if (deps.servicesHost) {
+      // Lifecycle-test seam: stand-in bootstrap; the single-flight/teardown contract around it is the real one.
+      await deps.servicesHost();
+      return;
+    }
     if (runtime) return;
     const cfg = await config();
-    orchestratorState = await loadOrchestratorState(process.cwd(), cfg.stateDir);
-    catalog = new OpenAIWebModelCatalog({
+    // Everything is built locally and committed only after pi.registerProvider succeeds,
+    // so a failure anywhere above leaves no partial module state for a retry to inherit.
+    const nextOrchestratorState = await loadOrchestratorState(process.cwd(), cfg.stateDir);
+    const nextCatalog = new OpenAIWebModelCatalog({
       cachePath: join(cfg.stateDir, "provider", "model-catalog.json"),
       limits: { successTtlMs: cfg.catalogSuccessTtlMs, failureRetryMs: cfg.catalogFailureRetryMs },
       discover: () => discoverModelCatalog(cfg, (message) => recordActivity(`discovery: ${message}`))
     });
+    let nextCatalogError: string | undefined;
     try {
-      const loaded = await catalog.loadCache();
+      const loaded = await nextCatalog.loadCache();
       recordActivity(loaded.loaded ? `catalog cache loaded (${loaded.count} entries)` : "catalog cache empty");
     } catch (error) {
-      catalogError = error instanceof Error ? error.message : String(error);
+      nextCatalogError = error instanceof Error ? error.message : String(error);
     }
-    sessionStore = new SessionStore(join(cfg.stateDir, "provider", "sessions"), cfg.providerSessionRetentionDays);
-    await sessionStore.prune();
-    runtime = new OpenAIWebRuntime({
+    const nextSessionStore = new SessionStore(join(cfg.stateDir, "provider", "sessions"), cfg.providerSessionRetentionDays);
+    await nextSessionStore.prune();
+    const nextRuntime = new OpenAIWebRuntime({
       config: cfg,
-      catalog,
+      catalog: nextCatalog,
       ensureBrowser: async () => {
         const host = await ensureInfrastructure();
         const snapshot = await host.startInfrastructure();
         if (!snapshot.ready) throw new Error(host.tunnel.lastError ?? "openai-web infrastructure is not ready. Run /openai-web setup, then /openai-web doctor.");
       },
       getBranchKey: () => session?.branchKey() ?? "no-session",
-      sessionStore,
+      sessionStore: nextSessionStore,
       resumeStore: new FileProviderResumeStore(join(cfg.stateDir, "provider", "resume.json")),
       activity: (event, detail) => recordActivity(event, detail),
       getOrchestratorConfig: () => orchestratorState?.config,
@@ -154,17 +193,49 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       isHarnessActive: async () => Boolean(subagents?.hasActiveRun()) || mcpToolActivity.active
     });
     const created = createOpenAIWebProvider({
-      runtime,
-      catalog,
+      runtime: nextRuntime,
+      catalog: nextCatalog,
       onCatalogChanged: (source, count) => recordActivity(`provider catalog ${source} (${count} models)`)
     });
-    setCatalog = created.setCatalog;
-    if (catalog.models.length) setCatalog(catalog.models);
+    if (nextCatalog.models.length) created.setCatalog(nextCatalog.models);
     pi.registerProvider(created.provider);
+    orchestratorState = nextOrchestratorState;
+    catalog = nextCatalog;
+    catalogError = nextCatalogError;
+    setCatalog = created.setCatalog;
+    sessionStore = nextSessionStore;
+    runtime = nextRuntime;
     recordActivity("openai-web provider registered (Lead Architect always on)");
   }
 
-  const ensureInfrastructure: () => Promise<HarnessRuntime> = deps.infrastructureHost ?? async function (): Promise<HarnessRuntime> {
+  /**
+   * Single-flight infrastructure construction: concurrent callers resolve to one
+   * HarnessRuntime instance (a single MCP/tunnel/browser owner). A failed attempt
+   * clears the latch — and any instance it came to own — so a retry re-attempts
+   * construction instead of caching the failure.
+   */
+  function ensureInfrastructure(): Promise<HarnessRuntime> {
+    if (infrastructureInit) return infrastructureInit;
+    if (teardown) return Promise.reject(new Error("openai-web infrastructure is shutting down"));
+    const attempt = buildInfrastructure();
+    infrastructureInit = attempt;
+    void attempt.catch(() => {
+      if (infrastructureInit === attempt) {
+        infrastructureInit = undefined;
+        infrastructure = undefined;
+      }
+    });
+    return attempt;
+  }
+
+  async function buildInfrastructure(): Promise<HarnessRuntime> {
+    if (deps.infrastructureHost) {
+      // Command-test seam: adopt the fake host as the owned runtime so doctor and
+      // shutdown observe the exact instance callers receive.
+      const host = await deps.infrastructureHost();
+      infrastructure = host;
+      return host;
+    }
     await ensureServices();
     if (!infrastructure) {
       const cfg = await config();
@@ -189,6 +260,25 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       })());
     }
     return infrastructure;
+  }
+
+  /**
+   * Teardown boundary: settle every in-flight initialization FIRST so shutdown
+   * stops each runtime this module came to own before teardown completes — never
+   * racing a late construction — then drop the infrastructure reference so nothing
+   * owned outlives the session.
+   */
+  async function runTeardown(): Promise<void> {
+    const pending: Promise<unknown>[] = [];
+    if (servicesInit) pending.push(servicesInit);
+    if (infrastructureInit) pending.push(infrastructureInit);
+    await Promise.all(pending.map((attempt) => attempt.then(() => {}, () => {})));
+    // Reap owned worker panes first so Herdr panes never outlive the session.
+    subagents?.shutdown();
+    await runtime?.shutdown();
+    await infrastructure?.stop();
+    infrastructure = undefined;
+    infrastructureInit = undefined;
   }
 
   function captureSession(ctx: ExtensionContext): void {
@@ -406,11 +496,13 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       ];
     },
     shutdown: async () => {
-      // Reap owned worker panes first so Herdr panes never outlive the session.
-      subagents?.shutdown();
-      await runtime?.shutdown();
-      await infrastructure?.stop();
-      infrastructure = undefined;
+      // Serialize on one teardown: shutdown settles any in-flight initialization
+      // first (see runTeardown) so no runtime is created behind its back.
+      try {
+        await (teardown ??= runTeardown());
+      } finally {
+        teardown = undefined;
+      }
     }
   };
 

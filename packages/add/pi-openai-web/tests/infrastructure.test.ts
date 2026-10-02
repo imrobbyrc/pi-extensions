@@ -225,6 +225,43 @@ for (const operation of ["start", "reload"] as const) {
  });
 }
 
+test("concurrent reloads share the one in-flight stop/start cycle instead of rejecting", async () => {
+  const stops: string[] = [];
+  const gate = deferred();
+  let release = false;
+  let tunnelStarts = 0;
+  const tunnelDep: InfrastructureDependency = {
+    probe: async () => "ready" as ResourceState,
+    get managedByPi() { return true; },
+    ensureStarted: async () => {
+      tunnelStarts += 1;
+      // Gate only the reload's startup leg (the second tunnel start), not the
+      // initial full start, so the first reload is provably in-flight below.
+      if (tunnelStarts >= 2 && !release) await gate.promise;
+      return "ready";
+    },
+    stop: async () => { stops.push("tunnel"); }
+  };
+  const manager = new HarnessInfrastructureManager(
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "mcp" }),
+    tunnelDep,
+    dependency(() => "ready", { owned: true, stopCalls: stops, name: "dia" })
+  );
+  await manager.start();
+  stops.length = 0;
+  const first = manager.reloadMcpAndTunnel();
+  await new Promise((resolve) => setImmediate(resolve)); // first reload is inside its cycle
+  // Regression: the second reload used to reject with "Harness infrastructure
+  // is stopping" (misleading — nothing was stopping; a sibling reload ran).
+  const second = manager.reloadMcpAndTunnel();
+  release = true;
+  gate.resolve();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.ready, true);
+  assert.equal(b.ready, true);
+  assert.deepEqual(stops.slice().sort(), ["mcp", "tunnel"]); // exactly one stop cycle, dia preserved
+});
+
 test("shutdown leaves external dependencies untouched", async () => {
   const stops: string[] = [];
   const external = () => dependency(() => "ready", { stopCalls: stops });
