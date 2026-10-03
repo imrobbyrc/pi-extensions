@@ -37,6 +37,16 @@ export const DEFAULT_WATCH_POLL_CADENCE = {
 const COMPLETION_SETTLE_MS = { semantic: 1_250, fallback: 2_500 } as const;
 const COMPLETION_SETTLE_OBSERVATIONS = { semantic: 3, fallback: 4 } as const;
 
+/** The explicit browser-side error for a conversation whose logical turn identities are transiently unstable (remount in progress). */
+const UNSTABLE_IDENTITY_MARKER = "no stable logical identity";
+/**
+ * Bounded grace for the unstable-identity remount error inside watch: ChatGPT
+ * can re-render the conversation (duplicate/missing/inconsistent logical
+ * identities) while a turn is live. The watcher retries that one explicit
+ * error within this window; persistent instability still fails closed.
+ */
+const TURN_IDENTITY_REMOUNT_GRACE_MS = 10_000;
+
 interface CompletionSettle {
   identity: string;
   markdown: string;
@@ -549,13 +559,27 @@ export class OpenAIWebRuntime {
 
   /**
    * A new user turn supersedes a stale non-terminal turn (e.g. Pi never re-entered
-   * after a stream aborted): abort it instead of failing the new turn.
+   * after a stream aborted): abort it instead of failing the new turn. The stale
+   * turn is detached from the runtime synchronously, BEFORE any awaited abort
+   * side effects, so a late-waking stale watcher can never observe itself as
+   * the runtime's current turn while a newer turn controller is being installed
+   * — its abort path must never abort the newer turn's signal.
    */
   private async supersedeStaleTurn(): Promise<void> {
-    if (this.turn && !this.turn.isTerminal) {
-      this.emit("provider_turn_superseded", { previous: this.turn.state, turnId: this.turn.turnId });
-      await this.abort();
+    const stale = this.turn;
+    if (!stale || stale.isTerminal) return;
+    this.emit("provider_turn_superseded", { previous: stale.state, turnId: stale.turnId });
+    const staleAbort = this.turnAbort;
+    this.turn = undefined;
+    this.turnAbort = undefined;
+    staleAbort?.abort();
+    if (!stale.isTerminal) stale.transition("aborted", "superseded by a newer provider turn");
+    if (this.conversation) {
+      try { await stopGeneration(this.conversation.client); } catch { /* best effort */ }
     }
+    // Reap harness-owned worker panes so the superseded turn never leaks them.
+    try { await this.deps.stopHarness?.(); } catch { /* best effort */ }
+    this.emit("provider_abort");
   }
 
   /**
@@ -608,11 +632,10 @@ export class OpenAIWebRuntime {
       if (!conversation.bootstrapped) controller.transition("bootstrapping");
       else controller.transition("submitted");
       controller.transition("generating");
-      // Capture assistant count before submit. Fast responses can finish before
-      // waitForConversationUrl returns; watching from a post-submit baseline
-      // would then wait forever for a message that already exists.
-      const submitBaseline = await readTurnState(conversation.client);
-      await submitPrompt(conversation.client, prompt, options);
+      // The submitted user identity is the causal anchor: watch binds only
+      // assistant responses ordered after it, so fast responses that finish
+      // before waitForConversationUrl returns are still bound correctly.
+      const submittedUserIdentity = await submitPrompt(conversation.client, prompt, options);
       controller.touchProgress();
       const url = await waitForConversationUrl(conversation.client);
       const conversationId = extractConversationId(url);
@@ -625,7 +648,7 @@ export class OpenAIWebRuntime {
       await this.persistResume(conversation);
       await this.record(conversation, "user", prompt);
       this.emit("provider_submitted", { targetId: conversation.targetId, model: descriptor.id });
-      const outcome = await this.watch(controller, handlers, options, submitBaseline);
+      const outcome = await this.watch(controller, handlers, options, submittedUserIdentity);
       if (outcome.kind === "completed") {
         // Bootstrap completion gate: the full bootstrap turn must succeed before
         // continuation turns may switch to concise LEAD-MODE/LEAD-PROTOCOL
@@ -723,9 +746,8 @@ export class OpenAIWebRuntime {
     this.turn = controller;
     controller.transition("submitted");
     controller.transition("generating");
-    const handoffBaseline = await readTurnState(previous.client);
-    await submitPrompt(previous.client, handoffPrompt, options);
-    const outcome = await this.watch(controller, {}, options, handoffBaseline);
+    const handoffAnchor = await submitPrompt(previous.client, handoffPrompt, options);
+    const outcome = await this.watch(controller, {}, options, handoffAnchor);
     options.signal?.throwIfAborted();
     // Compaction is best-effort. A model may ignore the no-tools instruction or stall;
     // never strand the provider turn. Reset and continue with canonical Pi history.
@@ -776,7 +798,6 @@ export class OpenAIWebRuntime {
       systemPrompt: compactionContext.systemPrompt,
       payload: compactionBootstrapPrompt(validated ?? canonicalHistoryFallback(compactionContext))
     });
-    const bootstrapBaseline = await readTurnState(fresh.client);
     const bootstrapController = new ProviderTurnController(
       descriptor, fresh.targetId, randomUUID(), this.fingerprint(bootstrap),
       this.config.providerTurnTimeoutMs, this.config.providerStallTimeoutMs
@@ -784,8 +805,8 @@ export class OpenAIWebRuntime {
     this.turn = bootstrapController;
     bootstrapController.transition("submitted");
     bootstrapController.transition("generating");
-    await submitPrompt(fresh.client, bootstrap, options);
-    const bootstrapOutcome = await this.watch(bootstrapController, {}, options, bootstrapBaseline);
+    const bootstrapAnchor = await submitPrompt(fresh.client, bootstrap, options);
+    const bootstrapOutcome = await this.watch(bootstrapController, {}, options, bootstrapAnchor);
     options.signal?.throwIfAborted();
     if (bootstrapOutcome.kind !== "completed") {
       await this.resetConversation("compact_resume_failed");
@@ -805,18 +826,23 @@ export class OpenAIWebRuntime {
     this.emit("provider_compacted", { previousTargetId: previous.targetId, targetId: fresh.targetId });
   }
 
-  /** Poll the provider target until completion. */
+  /**
+   * Poll the provider target until completion. Binds the assistant response
+   * causally: only assistant identities ordered strictly after the confirmed
+   * submitted user identity are candidates (a remount that rekeys an earlier
+   * turn can never satisfy that ordering), and the watcher always follows the
+   * latest such response so a tool-summary turn is superseded by its final
+   * answer as soon as the later identity mounts.
+   */
   private async watch(
     controller: ProviderTurnController,
     handlers: TurnWatchHandlers,
     options: { signal?: AbortSignal },
-    baselineOverride?: TurnDomState
+    submittedUserIdentity: string
   ): Promise<TurnOutcome> {
     const conversation = this.conversation;
     if (!conversation) return { kind: "failed", error: "provider_target_lost" };
 
-    const baseline = baselineOverride ?? await readTurnState(conversation.client);
-    const initialResponseIdentities = new Set(baseline.responseIdentities);
     // Track the last forwarded snapshot by content: a rewrite can shrink or
     // replace text without changing length, and each new snapshot must reach
     // the output path so it can replace stale streamed text.
@@ -826,6 +852,9 @@ export class OpenAIWebRuntime {
     // Last assistant identity that counted as progress while still empty; a
     // persistent unchanged empty identity must not refresh progress per poll.
     let emptyIdentityProgress: string | undefined;
+    // First poll (of the current streak) that observed the explicit unstable
+    // logical identity remount error; a stable reading clears it.
+    let unstableSinceMs: number | undefined;
     let harnessWasActive = false;
     let harnessSettledGraceUntil = 0;
     const stallGraceAfterHarnessMs = this.config.providerStallGraceMs ?? 30_000;
@@ -833,7 +862,11 @@ export class OpenAIWebRuntime {
     while (true) {
       if (options.signal?.aborted || controller.state === "aborted") {
         if (!controller.isTerminal) controller.transition("aborted", "aborted by user");
-        if (!this.turn || this.turn === controller) await this.abort();
+        // Runtime-level abort side effects belong to the turn that still owns
+        // the runtime. A superseded watcher (its controller was synchronously
+        // detached by supersedeStaleTurn) must never run abort logic that
+        // could abort a newer turn controller's signal.
+        if (this.turn === controller || (!this.turn && !this.turnAbort)) await this.abort();
         return { kind: "failed", error: "provider_turn_aborted" };
       }
       if (controller.expired()) {
@@ -855,14 +888,43 @@ export class OpenAIWebRuntime {
       let state: TurnDomState;
       try {
         state = await readTurnState(conversation.client);
+        unstableSinceMs = undefined;
       } catch (error) {
-        const message = `provider_target_lost: ${error instanceof Error ? error.message : String(error)}`;
-        controller.transition("failed", message);
-        return { kind: "failed", error: message };
+        const detail = error instanceof Error ? error.message : String(error);
+        if (!detail.includes(UNSTABLE_IDENTITY_MARKER)) {
+          const message = `provider_target_lost: ${detail}`;
+          controller.transition("failed", message);
+          return { kind: "failed", error: message };
+        }
+        // The explicit unstable logical identity error: ChatGPT is re-rendering
+        // the conversation (remount) and logical identities are transiently
+        // duplicated, missing, or inconsistent. Retry only this error, within a
+        // bounded grace; persistent instability still fails closed below.
+        const now = Date.now();
+        if (unstableSinceMs === undefined) unstableSinceMs = now;
+        if (now - unstableSinceMs > TURN_IDENTITY_REMOUNT_GRACE_MS) {
+          const message = `provider_target_lost: conversation turn identity stayed unstable for more than ${TURN_IDENTITY_REMOUNT_GRACE_MS}ms (remount grace exhausted)`;
+          await stopGeneration(conversation.client).catch(() => {});
+          controller.transition("failed", message);
+          return { kind: "failed", error: message };
+        }
+        await sleepUntil(
+          watchPollDelayMs({ stopVisible: true, busy: true, textChanged: false, harnessActive: false }, this.config),
+          options.signal,
+          controller.startedAtMs + controller.turnTimeoutMs
+        );
+        continue;
       }
 
-      // Bind response by stable logical data-turn-id. DOM display indexes can renumber or virtualize.
-      const identity = state.responseIdentities.find(candidate => !initialResponseIdentities.has(candidate));
+      // Bind the response causally by stable logical identity, ordered
+      // strictly AFTER the confirmed submitted user identity, following the
+      // latest such response. DOM display indexes can renumber or virtualize,
+      // and a remount can rekey an earlier turn's identity — neither can make a
+      // stale previous answer satisfy this ordering constraint.
+      const userIndex = state.turnIdentities.indexOf(submittedUserIdentity);
+      const identity = userIndex >= 0
+        ? [...state.responseIdentities].reverse().find(candidate => state.turnIdentities.indexOf(candidate) > userIndex)
+        : undefined;
       let currentFullMarkdown = "";
       let probe: AssistantTurnProbe | undefined;
       // This poll's atomic capture, when one was taken. The capture reads a

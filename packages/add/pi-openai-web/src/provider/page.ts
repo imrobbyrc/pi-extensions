@@ -118,8 +118,14 @@ export async function focusComposer(client: CdpClient): Promise<void> {
   throw new Error("Unable to focus ChatGPT composer");
 }
 
-/** Submit text via the composer. Caller must already have confirmed fresh state when required. */
-export async function submitPrompt(client: CdpClient, text: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+/**
+ * Submit text via the composer and confirm the submission. Caller must
+ * already have confirmed fresh state when required. Resolves with the exact
+ * stable logical identity of the newly confirmed user message — the causal
+ * anchor response watching must bind against (only assistant turns ordered
+ * after this user identity belong to this submission).
+ */
+export async function submitPrompt(client: CdpClient, text: string, options: { signal?: AbortSignal } = {}): Promise<string> {
   const { signal } = options;
   signal?.throwIfAborted();
   const previousUsers = new Set((await readTurnState(client)).userIdentities);
@@ -142,7 +148,8 @@ export async function submitPrompt(client: CdpClient, text: string, options: { s
     try {
       const state = await readTurnState(client);
       signal?.throwIfAborted();
-      if (state.userIdentities.some(id => !previousUsers.has(id))) return;
+      const confirmed = state.userIdentities.find(id => !previousUsers.has(id));
+      if (confirmed) return confirmed;
       lastReadError = undefined;
     } catch (error) {
       signal?.throwIfAborted();
