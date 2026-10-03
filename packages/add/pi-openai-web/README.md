@@ -9,7 +9,8 @@ Pi-native harness with an **always-on ChatGPT Web Lead Architect**: ChatGPT Web 
 One product, one flow:
 
 - **OpenAI Web Lead (always on)** — ChatGPT Web behaves like a native Pi model through `/model openai-web/<id>`, with dynamic model/effort discovery, exact browser selection, bounded context, and structured checkpoint compaction.
-- **Strict lead tools** — the Lead sees exactly eight MCP tools: seven bounded read-only workspace inspections (including optional root `CONTEXT.md` guidance via `read_context`) plus one Pi-native `herdr` execution tool. No shell, no writes, no subagent spawning, no browser worker tabs.
+- **Strict lead tools** — the Lead sees exactly nine MCP tools: seven bounded read-only workspace inspections (including optional root `CONTEXT.md` guidance via `read_context`), one Pi-native `herdr` execution tool, and one `codemode` tool that composes the other eight inside the official `@earendil-works/pi-codemode` sandbox. No shell, no writes, no subagent spawning, no browser worker tabs.
+- **Codemode composition (official sandbox)** — `codemode` runs Lead-written JavaScript that loops, branches, filters, and fans the eight harness tools out with `Promise.all`, then returns exactly one script result to the conversation (nested tool results never enter Lead context). Nested calls re-enter the exact registered handlers, so `herdr` keeps its plan binding and explicit TUI confirmation; invalid scripts, unsupported tools, exceeded limits (script size, deadline, output budget, 200 nested calls), and a missing runtime all fail closed.
 - **Risk-aware planning & work-graph validation** — v2 low-risk plans use four-field `compact_plan`, medium-risk plans use five-field `standard_plan`, and high-risk plans keep the nine-axis `decision_graph` (a previously issued medium `decision_graph` stays valid). Gates are optional at every v2 risk; v1 keeps strict gates. Every 1–4 worker graph validates ids, dependencies and ownership before handoff. Risk and planning kind join the v2 fingerprint.
 - **Asynchronous native Herdr** — one `herdr` MCP tool with `plan | run | status | correct | accept | stop | verify` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
 - **Risk-bound acceptance** — `herdr verify` produces read-only evidence (spec, design, quality, evidence) and a fingerprint. v2 low compact and v2 medium standard work can be accepted after diff review without a fingerprint, but the handoff must match the actual run and worker prompts. v1, v2 high design-graph, and v2 medium design-graph require a fresh verification fingerprint; drift fails closed.
@@ -48,7 +49,7 @@ Lead turn → herdr plan (low: compact; medium: standard or legacy graph; high: 
 ### Prerequisites
 
 - macOS first; Linux partially supported; Windows launcher not supported
-- Node.js 20+, Pi, Git
+- Node.js 22.19+ (required by Pi 0.99+/1.0 and `@earendil-works/pi-codemode`), Pi, Git
 - Herdr CLI installed with a running Herdr server (workers run through the `herdr` command)
 - Dia Browser (default) or optional Chrome/Chromium
 - ChatGPT Web workspace supporting custom MCP apps
@@ -121,7 +122,7 @@ The Lead inspects the workspace through MCP, runs its planning protocol at the a
                    CONTROL PLANE
                         │
                         ▼
-   strict MCP data plane (8 tools, via tunnel)
+   strict MCP data plane (9 tools, via tunnel)
                         │
                         ▼
                  Pi Host / Harness
@@ -158,8 +159,9 @@ Strict frozen allowlist — the only tools the Lead can see:
 | `git_status` | read-only | Git status |
 | `git_diff` | read-only | Git diff (staged or unstaged) |
 | `herdr` | **mutating** (the `verify` action is read-only) | `plan \| run \| status \| correct \| accept \| stop \| verify` — Pi-native workers; `verify` yields a fingerprint required for v1, v2 high, and v2 medium design-graph acceptance |
+| `codemode` | **mutating** (inherits the nested surface: seven read-only tools + `herdr`) | Official `@earendil-works/pi-codemode` sandbox: Lead-written JavaScript composes the eight tools above with loops/branches/`Promise.all` and returns one bounded script result |
 
-The `herdr` tool is honestly annotated (`readOnlyHint: false`, `destructiveHint: true`). Everything else is read-only. There are no shell, edit, write, install, migration, git-mutation, or subagent tools at any endpoint.
+The `herdr` and `codemode` tools are honestly annotated (`readOnlyHint: false`, `destructiveHint: true`). Everything else is read-only. There are no shell, edit, write, install, migration, git-mutation, or subagent tools at any endpoint.
 
 ### Authority
 

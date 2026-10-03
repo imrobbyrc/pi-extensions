@@ -32,6 +32,7 @@ Create one custom ChatGPT app named `Pi Workspace` (configurable via `PLANNER_CH
 | `git_status` | read-only |
 | `git_diff` | read-only |
 | `herdr` | mutating (`run \| status \| correct \| stop`) |
+| `codemode` | mutating (official `@earendil-works/pi-codemode` sandbox composing the eight tools above) |
 
 Nothing else is served: no shell, no write/edit, no protocol-write planner tools, no worker-tab or bridge tools.
 
