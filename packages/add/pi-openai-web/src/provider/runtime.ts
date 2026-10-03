@@ -93,8 +93,6 @@ export function watchPollDelayMs(inputs: WatchPollInputs, config?: WatchPollCade
 export type BrowserCompletionKind = "busy" | "semantic" | "fallback" | "none";
 
 export interface BrowserCompletionObservation {
-  /** A causally-bound assistant identity exists this poll. */
-  bound: boolean;
   /** The bound reply has streamed text. */
   text: boolean;
   /** Newest observed browser activity: stop button, shimmer, or a newer busy/stop probe or capture reading. */
@@ -113,12 +111,13 @@ export interface BrowserCompletionObservation {
  * - "busy": newest browser activity — always blocks completion.
  * - "semantic": calm bound reply with its completion control visible: browser truth.
  * - "fallback": calm bound reply without completion evidence: conservative.
- * - "none": no bound text — remount gap, pre-text shell, or unreadable probe;
- *   a settle window opened against earlier text must not survive the gap.
+ * - "none": no streamed text on the bound reply — remount gap, pre-text
+ *   shell, or unreadable probe; a settle window opened against earlier text
+ *   must not survive the gap.
  */
 export function classifyBrowserCompletion(observation: BrowserCompletionObservation): BrowserCompletionKind {
   if (observation.busy) return "busy";
-  if (!observation.bound || !observation.text || !observation.probed) return "none";
+  if (!observation.text || !observation.probed) return "none";
   return observation.completionVisible ? "semantic" : "fallback";
 }
 
@@ -1022,7 +1021,6 @@ export class OpenAIWebRuntime {
       // activity is deliberately not an input: it is a stall/liveness concern,
       // never browser completion truth.
       const completion = classifyBrowserCompletion({
-        bound: identity !== undefined,
         text: turnMarkdown.length > 0,
         busy: busyNow,
         probed: probe !== undefined,
