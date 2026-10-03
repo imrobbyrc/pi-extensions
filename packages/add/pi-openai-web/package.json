@@ -12,7 +12,7 @@
     "herdr"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "pi": {
     "extensions": [
@@ -28,6 +28,7 @@
     "gui": "tsx scripts/demo-orchestrator-gui.ts"
   },
   "dependencies": {
+    "@earendil-works/pi-codemode": "^0.99.2 || ^1.0.0",
     "@imrobbyrc/pi-core-subagent": "file:../../core/pi-core-subagent",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
@@ -37,9 +38,9 @@
     "zod": "^4.1.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.99.2",
-    "@earendil-works/pi-coding-agent": "^0.99.2",
-    "@earendil-works/pi-tui": "^0.99.2",
+    "@earendil-works/pi-ai": "^0.99.2 || ^1.0.0",
+    "@earendil-works/pi-coding-agent": "^0.99.2 || ^1.0.0",
+    "@earendil-works/pi-tui": "^0.99.2 || ^1.0.0",
     "@types/chrome-remote-interface": "^0.34.0",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",

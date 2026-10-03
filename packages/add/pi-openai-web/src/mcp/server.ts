@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { toNodeHandler, type NodeIncomingMessageLike } from "@modelcontextprotocol/node";
-import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler, McpServer, type CallToolResult, type ToolAnnotations } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import type { HarnessConfig } from "../types.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
@@ -8,6 +8,7 @@ import { listDirectory, readContextFile, readTextFile, repoMap } from "../worksp
 import { searchWorkspace } from "../workspace/search.js";
 import { parseHerdrHandoff, issueHerdrHandoff, issueHerdrHandoffV2, planFingerprint, planFingerprintV2, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, assertRiskLevel, assertPlanningKind, assertRiskPlanningPair, assertCompactPlan, assertStandardPlan, compileDecisionGraph, compileCompactPlan, compileStandardPlan, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, COMPACT_PLAN_FIELDS, COMPACT_PLAN_VALUE_MAX, STANDARD_PLAN_FIELDS, STANDARD_PLAN_VALUE_MAX, RISK_LEVELS, PLANNING_KINDS, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice, type RiskLevel, type PlanningKind } from "../provider/orchestrator.js";
 import { buildWorkerTask, type AdapterRunSnapshot } from "./subagent-adapter.js";
+import { CODEMODE_SCRIPT_MAX, codemodeToolDescription, runHarnessCodemode, type HarnessCodemodeBridge } from "./codemode.js";
 type HerdrWorker = WorkerSlice;
 
 /**
@@ -298,6 +299,21 @@ export async function runHerdrVerification(deps: { runId: string; handoff: strin
   });
 }
 
+/**
+ * One registered harness tool: the single source shared by the MCP surface AND
+ * the codemode sandbox. Codemode nested calls re-enter `run` with `schema`
+ * validation, so scripts compose exactly the tools — and exactly the policies
+ * — the Lead sees over MCP. Nothing else is exposed to scripts.
+ */
+interface HarnessToolSpec {
+  name: string;
+  title: string;
+  description: string;
+  schema: z.ZodObject<any>;
+  annotations: ToolAnnotations;
+  run: (args: any) => Promise<CallToolResult>;
+}
+
 export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity; workflows?: () => Record<WorkflowToggleId, boolean> }) {
   return (): McpServer => {
     const server = new McpServer({ name: "pi-harness", version: "1.0.0" });
@@ -307,97 +323,78 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
     // Workflow enforcement source: fresh per call so TUI toggles apply without restart; absent = all enabled.
     const workflows = () => deps.workflows?.() ?? resolveWorkflowToggles(undefined);
 
-    server.registerTool(
-      "repo_map",
+    // One spec per harness tool: registered on the MCP surface verbatim, then
+    // bridged verbatim into the codemode sandbox (schema + handler identical).
+    const specs: HarnessToolSpec[] = [
       {
+        name: "repo_map",
         title: "Repository map",
         description: "Return a bounded directory tree for the Pi workspace.",
-        inputSchema: z.object({ max_depth: z.number().int().min(1).max(6).optional() }),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        schema: z.object({ max_depth: z.number().int().min(1).max(6).optional() }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        run: track(async ({ max_depth }) => text(await repoMap(workspaceRoot, max_depth ?? 3)))
       },
-      track(async ({ max_depth }) => text(await repoMap(workspaceRoot, max_depth ?? 3)))
-    );
-
-    server.registerTool(
-      "list_directory",
       {
+        name: "list_directory",
         title: "List directory",
         description: "List one directory inside the Pi workspace. Paths are workspace-relative.",
-        inputSchema: z.object({ path: z.string().default(".") }),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        schema: z.object({ path: z.string().default(".") }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        run: track(async ({ path }) => text((await listDirectory(workspaceRoot, path)).join("\n")))
       },
-      track(async ({ path }) => text((await listDirectory(workspaceRoot, path)).join("\n")))
-    );
-
-    server.registerTool(
-      "read_context",
       {
+        name: "read_context",
         title: "Read project context",
         description: "Read the bounded root CONTEXT.md project guidance, or report that it is absent.",
-        inputSchema: z.object({}),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        schema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        run: track(async () => text(await readContextFile(workspaceRoot, limits)))
       },
-      track(async () => text(await readContextFile(workspaceRoot, limits)))
-    );
-
-    server.registerTool(
-      "read_file",
       {
+        name: "read_file",
         title: "Read file",
         description: "Read a bounded line range from a UTF-8 text file inside the Pi workspace.",
-        inputSchema: z.object({
+        schema: z.object({
           path: z.string().min(1),
           start_line: z.number().int().positive().optional(),
           end_line: z.number().int().positive().optional()
         }),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        run: track(async ({ path, start_line, end_line }) => text(await readTextFile(workspaceRoot, path, limits, start_line ?? 1, end_line)))
       },
-      track(async ({ path, start_line, end_line }) => text(await readTextFile(workspaceRoot, path, limits, start_line ?? 1, end_line)))
-    );
-
-    server.registerTool(
-      "search_workspace",
       {
+        name: "search_workspace",
         title: "Search workspace",
         description: "Search text in the Pi workspace using ripgrep when available, with a safe JS fallback.",
-        inputSchema: z.object({
+        schema: z.object({
           query: z.string().min(1),
           glob: z.string().optional(),
           max_results: z.number().int().min(1).max(200).optional()
         }),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        run: track(async ({ query, glob, max_results }) => text(await searchWorkspace(workspaceRoot, query, max_results ?? 50, glob)))
       },
-      track(async ({ query, glob, max_results }) => text(await searchWorkspace(workspaceRoot, query, max_results ?? 50, glob)))
-    );
-
-    server.registerTool(
-      "git_status",
       {
+        name: "git_status",
         title: "Git status",
         description: "Read git status for the Pi workspace.",
-        inputSchema: z.object({}),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        schema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        run: track(async () => text(await gitStatus(workspaceRoot)))
       },
-      track(async () => text(await gitStatus(workspaceRoot)))
-    );
-
-    server.registerTool(
-      "git_diff",
       {
+        name: "git_diff",
         title: "Git diff",
         description: "Read the current git diff for the Pi workspace.",
-        inputSchema: z.object({ staged: z.boolean().optional() }),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        schema: z.object({ staged: z.boolean().optional() }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        run: track(async ({ staged }) => text(await gitDiff(workspaceRoot, staged ?? false)))
       },
-      track(async ({ staged }) => text(await gitDiff(workspaceRoot, staged ?? false)))
-    );
-
-    server.registerTool(
-      "herdr",
       {
+        name: "herdr",
         title: "Herdr harness execution",
         description: HERDR_TOOL_DESCRIPTION,
-        inputSchema: z.object({
+        schema: z.object({
           action: z.enum(["plan", "run", "status", "correct", "accept", "stop", "verify"]),
           goal: herdrText(HERDR_GOAL_MAX).optional(),
           workers: herdrWorkers.optional(),
@@ -415,95 +412,123 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           worker_id: z.string().min(1).max(100).optional(),
           instructions: herdrText(HERDR_GOAL_MAX).optional()
         }),
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
-      },
-      track(async (args) => {
-        const { action, goal, workers, gates, decision_graph, worker_model, worker_thinking, handoff, verification_fingerprint, run_id, worker_id, instructions } = args;
-        const execution_spec = (args as { execution_spec?: unknown }).execution_spec;
-        // Risk-aware fields (v2 handoffs): schema-validated above, consumed only when present.
-        const compact_plan = (args as { compact_plan?: unknown }).compact_plan;
-        const standard_plan = (args as { standard_plan?: unknown }).standard_plan;
-        const risk = (args as { risk?: unknown }).risk;
-        const planning_kind = (args as { planning_kind?: unknown }).planning_kind;
-        if (action === "plan") {
-          if (!goal || !workers) throw new Error("herdr plan requires goal and workers.");
-          // Risk-aware path: any v2 field present → v2 issuance. The compact/
-          // standard plan (or decision graph) compiles into the spec authority
-          // BEFORE the fingerprint, and risk + planning kind join the immutable
-          // identity. Gates are optional at every risk; v1 keeps requiring them.
-          if (compact_plan !== undefined || standard_plan !== undefined || risk !== undefined || planning_kind !== undefined) {
-            return text({ ok: true, handoff: issueHerdrHandoffV2(goal, workers, gates, risk, planning_kind, { compactPlan: compact_plan, standardPlan: standard_plan, decisionGraph: decision_graph }), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, planning authority, risk, and planning_kind." });
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+        run: track(async (args) => {
+          const { action, goal, workers, gates, decision_graph, worker_model, worker_thinking, handoff, verification_fingerprint, run_id, worker_id, instructions } = args;
+          const execution_spec = (args as { execution_spec?: unknown }).execution_spec;
+          // Risk-aware fields (v2 handoffs): schema-validated above, consumed only when present.
+          const compact_plan = (args as { compact_plan?: unknown }).compact_plan;
+          const standard_plan = (args as { standard_plan?: unknown }).standard_plan;
+          const risk = (args as { risk?: unknown }).risk;
+          const planning_kind = (args as { planning_kind?: unknown }).planning_kind;
+          if (action === "plan") {
+            if (!goal || !workers) throw new Error("herdr plan requires goal and workers.");
+            // Risk-aware path: any v2 field present → v2 issuance. The compact/
+            // standard plan (or decision graph) compiles into the spec authority
+            // BEFORE the fingerprint, and risk + planning kind join the immutable
+            // identity. Gates are optional at every risk; v1 keeps requiring them.
+            if (compact_plan !== undefined || standard_plan !== undefined || risk !== undefined || planning_kind !== undefined) {
+              return text({ ok: true, handoff: issueHerdrHandoffV2(goal, workers, gates, risk, planning_kind, { compactPlan: compact_plan, standardPlan: standard_plan, decisionGraph: decision_graph }), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, planning authority, risk, and planning_kind." });
+            }
+            if (!gates || (!decision_graph && execution_spec === undefined)) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
+            return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and decision_graph." });
           }
-          if (!gates || (!decision_graph && execution_spec === undefined)) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
-          return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and decision_graph." });
-        }
-        if (action === "run") {
-          // Workflow enforcement (fail-closed): effort lock gates the per-run thinking argument.
-          // (Herdr delegation is an always-on invariant, not a toggle.)
-          if (worker_thinking && !workflows().adaptiveWorkerEffort) {
-            throw new Error("herdr_worker_effort_locked: adaptive worker effort is disabled by the operator; omit worker_thinking and the configured profile default applies.");
+          if (action === "run") {
+            // Workflow enforcement (fail-closed): effort lock gates the per-run thinking argument.
+            // (Herdr delegation is an always-on invariant, not a toggle.)
+            if (worker_thinking && !workflows().adaptiveWorkerEffort) {
+              throw new Error("herdr_worker_effort_locked: adaptive worker effort is disabled by the operator; omit worker_thinking and the configured profile default applies.");
+            }
+            // The envelope's authorized slices are the single source of truth for
+            // what each worker is told — already fingerprint-bound to this exact
+            // goal/workers/spec, so run-time args can never drift from the plan.
+            const authorized = validateHerdrRunInput({ goal, workers, execution_spec, decision_graph, compact_plan, standard_plan, risk, planning_kind, handoff });
+            const run = await deps.subagent.run({ goal, workers: authorized.workers, handoff, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}) });
+            return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
           }
-          // The envelope's authorized slices are the single source of truth for
-          // what each worker is told — already fingerprint-bound to this exact
-          // goal/workers/spec, so run-time args can never drift from the plan.
-          const authorized = validateHerdrRunInput({ goal, workers, execution_spec, decision_graph, compact_plan, standard_plan, risk, planning_kind, handoff });
-          const run = await deps.subagent.run({ goal, workers: authorized.workers, handoff, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}) });
-          return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
-        }
-        if (action === "status") {
-          const result = await deps.subagent.status(run_id);
-          return text(result);
-        }
-        if (action === "correct") {
-          if (!run_id || !worker_id || !instructions) throw new Error("herdr correct requires run_id, worker_id, and instructions.");
-          const run = await deps.subagent.correct(run_id, worker_id, instructions);
-          const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
-          return text({ ok: true, run_id: run.id, status: run.status, corrections: task?.corrections ?? 0, accepted: task?.acceptedAt ? true : undefined });
-        }
-        if (action === "accept") {
-          if (!run_id || !worker_id) throw new Error("herdr accept requires run_id and worker_id.");
-          const evidenceGate = workflows().verificationGate;
-          if (evidenceGate) {
-            if (!handoff?.trim()) throw new Error("herdr accept requires the exact Pi-issued handoff (and a verification_fingerprint for v1 or design-graph plans).");
-            const plan = parseHerdrHandoff(handoff);
-            // Lightweight accept: v2 low compact and v2 medium standard plans —
-            // the planning authority already bounds them — accept on diff review
-            // with the handoff bound to the observed run/prompts, no fingerprint.
-            // v1, v2 high design-graph, and v2 medium design-graph (including
-            // legacy plans) stay strict: fresh verification evidence required.
-            const lightweight = plan.version === "v2" && !verification_fingerprint && (plan.risk === "low" || (plan.risk === "medium" && plan.planningKind === "standard"));
-            if (lightweight) {
-              // A lightweight claim relaxes verification only after matching the
-              // exact worker prompts observed in THIS run to the handoff.
-              if (typeof deps.subagent.inspect !== "function") throw new Error("herdr_verify_unavailable: read-only run inspection is required.");
-              const bound = bindHerdrRunToHandoff(handoff, run_id, await deps.subagent.inspect(run_id));
-              if (!bound.workers.some((worker) => worker.id === worker_id)) throw new Error("herdr accept worker is not authorized by this handoff.");
-            } else {
-              if (!verification_fingerprint) throw new Error("herdr accept requires the exact Pi-issued handoff and the verification_fingerprint from herdr action=verify.");
-              // Strict plans (and lightweight plans with an explicit
-              // fingerprint) must still match fresh workspace/run evidence
-              // immediately before accept.
-              const fresh = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
-              if (verificationFingerprint(fresh) !== verification_fingerprint) {
-                throw new Error("herdr accept fingerprint mismatch: current run/workspace evidence no longer matches the reviewed verification report (re-run herdr action=verify and accept the fresh fingerprint).");
+          if (action === "status") {
+            const result = await deps.subagent.status(run_id);
+            return text(result);
+          }
+          if (action === "correct") {
+            if (!run_id || !worker_id || !instructions) throw new Error("herdr correct requires run_id, worker_id, and instructions.");
+            const run = await deps.subagent.correct(run_id, worker_id, instructions);
+            const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
+            return text({ ok: true, run_id: run.id, status: run.status, corrections: task?.corrections ?? 0, accepted: task?.acceptedAt ? true : undefined });
+          }
+          if (action === "accept") {
+            if (!run_id || !worker_id) throw new Error("herdr accept requires run_id and worker_id.");
+            const evidenceGate = workflows().verificationGate;
+            if (evidenceGate) {
+              if (!handoff?.trim()) throw new Error("herdr accept requires the exact Pi-issued handoff (and a verification_fingerprint for v1 or design-graph plans).");
+              const plan = parseHerdrHandoff(handoff);
+              // Lightweight accept: v2 low compact and v2 medium standard plans —
+              // the planning authority already bounds them — accept on diff review
+              // with the handoff bound to the observed run/prompts, no fingerprint.
+              // v1, v2 high design-graph, and v2 medium design-graph (including
+              // legacy plans) stay strict: fresh verification evidence required.
+              const lightweight = plan.version === "v2" && !verification_fingerprint && (plan.risk === "low" || (plan.risk === "medium" && plan.planningKind === "standard"));
+              if (lightweight) {
+                // A lightweight claim relaxes verification only after matching the
+                // exact worker prompts observed in THIS run to the handoff.
+                if (typeof deps.subagent.inspect !== "function") throw new Error("herdr_verify_unavailable: read-only run inspection is required.");
+                const bound = bindHerdrRunToHandoff(handoff, run_id, await deps.subagent.inspect(run_id));
+                if (!bound.workers.some((worker) => worker.id === worker_id)) throw new Error("herdr accept worker is not authorized by this handoff.");
+              } else {
+                if (!verification_fingerprint) throw new Error("herdr accept requires the exact Pi-issued handoff and the verification_fingerprint from herdr action=verify.");
+                // Strict plans (and lightweight plans with an explicit
+                // fingerprint) must still match fresh workspace/run evidence
+                // immediately before accept.
+                const fresh = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
+                if (verificationFingerprint(fresh) !== verification_fingerprint) {
+                  throw new Error("herdr accept fingerprint mismatch: current run/workspace evidence no longer matches the reviewed verification report (re-run herdr action=verify and accept the fresh fingerprint).");
+                }
               }
             }
+            const run = await deps.subagent.accept(run_id, worker_id);
+            const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
+            return text({ ok: true, run_id: run.id, status: run.status, worker: { id: worker_id, state: task?.status ?? "completed", accepted_at: task?.acceptedAt } });
           }
-          const run = await deps.subagent.accept(run_id, worker_id);
-          const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
-          return text({ ok: true, run_id: run.id, status: run.status, worker: { id: worker_id, state: task?.status ?? "completed", accepted_at: task?.acceptedAt } });
-        }
-        if (action === "verify") {
-          if (!run_id || !handoff?.trim()) throw new Error("herdr verify requires run_id and the exact Pi-issued handoff.");
-          // Observational only: raw inspection + read-only git observations.
-          // Never correct/accept/stop/shutdown and never adapter.status
-          // (whose implementation can auto-shutdown a run after acceptance).
-          const report = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
-          return text({ action: "verify", run_id, verification_fingerprint: verificationFingerprint(report), report });
-        }
-        // stop
-        const result = await deps.subagent.stop(run_id);
-        return text({ ok: true, runs: result });
+          if (action === "verify") {
+            if (!run_id || !handoff?.trim()) throw new Error("herdr verify requires run_id and the exact Pi-issued handoff.");
+            // Observational only: raw inspection + read-only git observations.
+            // Never correct/accept/stop/shutdown and never adapter.status
+            // (whose implementation can auto-shutdown a run after acceptance).
+            const report = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
+            return text({ action: "verify", run_id, verification_fingerprint: verificationFingerprint(report), report });
+          }
+          // stop
+          const result = await deps.subagent.stop(run_id);
+          return text({ ok: true, runs: result });
+        })
+      }
+    ];
+    for (const spec of specs) {
+      server.registerTool(spec.name, { title: spec.title, description: spec.description, inputSchema: spec.schema, annotations: spec.annotations }, spec.run);
+    }
+
+    // Codemode: Lead-written JavaScript composes the harness tools above inside
+    // the OFFICIAL @earendil-works/pi-codemode QuickJS sandbox. Nested calls
+    // re-enter the exact same specs (schema parse + tracked handler), so herdr
+    // runs keep their plan binding and explicit confirmation, and only the
+    // script's own output/return value reaches the Lead context.
+    const codemodeBridges: HarnessCodemodeBridge[] = specs.map((spec) => ({
+      name: spec.name as HarnessCodemodeBridge["name"],
+      description: spec.description,
+      schema: spec.schema,
+      run: spec.run
+    }));
+    server.registerTool(
+      "codemode",
+      {
+        title: "Codemode",
+        description: codemodeToolDescription(),
+        inputSchema: z.object({ code: z.string().trim().min(1).max(CODEMODE_SCRIPT_MAX) }),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+      },
+      track(async ({ code }) => {
+        const result = await runHarnessCodemode({ bridges: codemodeBridges, code });
+        return { content: result.content, ...(result.isError ? { isError: true } : {}) };
       })
     );
 
