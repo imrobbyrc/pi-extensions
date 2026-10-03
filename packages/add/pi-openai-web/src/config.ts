@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { defaultBrowserProfileDir } from "./browser/launcher.js";
 import type { HarnessConfig } from "./types.js";
+import { parseModelRoutes, type ModelRoutes } from "./provider/routes.js";
 
 type PartialConfig = Partial<HarnessConfig>;
 
@@ -48,10 +49,20 @@ export async function loadConfig(): Promise<HarnessConfig> {
   const stateDir = process.env.PLANNER_STATE_DIR ?? file.stateDir ?? DEFAULT_STATE_DIR;
   const browser = browserBackend(process.env.PLANNER_BROWSER ?? file.browser);
 
+  let modelRoutes: ModelRoutes | undefined;
+  try {
+    const routesRaw = process.env.PLANNER_MODEL_ROUTES !== undefined ? JSON.parse(process.env.PLANNER_MODEL_ROUTES) : file.modelRoutes;
+    modelRoutes = parseModelRoutes(routesRaw);
+  } catch (error) {
+    throw new Error(`config invalid: ${(error instanceof Error ? error.message : String(error))} (check PLANNER_MODEL_ROUTES / modelRoutes)`);
+  }
+
   return {
     mcpHost: process.env.PLANNER_MCP_HOST ?? file.mcpHost ?? "127.0.0.1",
     mcpPort: envNumber("PLANNER_MCP_PORT") ?? file.mcpPort ?? 8765,
     mcpPath: process.env.PLANNER_MCP_PATH ?? file.mcpPath ?? "/mcp",
+    mcpAuthToken: process.env.PLANNER_MCP_AUTH_TOKEN ?? file.mcpAuthToken,
+    modelRoutes,
     publicMcpUrl: process.env.PLANNER_PUBLIC_MCP_URL ?? file.publicMcpUrl,
     stateDir,
     browser,

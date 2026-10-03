@@ -23,7 +23,11 @@ import {
   type OrchestratorConfig,
   type OrchestratorScope
 } from "../../src/provider/orchestrator.js";
-import { createHarnessMcpFactory, McpToolActivity } from "../../src/mcp/server.js";
+import { createHarnessMcpFactory, McpToolActivity, CANONICAL_HARNESS_TOOLS } from "../../src/mcp/server.js";
+import { CodemodeStore } from "../../src/mcp/codemode-store.js";
+import { HarnessAuditLog } from "../../src/service/audit.js";
+import { describeMcpExposure } from "../../src/mcp/request-auth.js";
+import { routeAliasesForCatalog } from "../../src/provider/routes.js";
 import { SubagentMcpAdapter } from "../../src/mcp/subagent-adapter.ts";
 import type { SubagentController } from "@imrobbyrc/pi-core-subagent/api";
 
@@ -108,6 +112,11 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
   /** Shared in-flight MCP tool tracker: proves harness tool work is actively running to the provider turn watcher. */
   const mcpToolActivity = new McpToolActivity();
   const activityLog: string[] = [];
+  /** Durable redacted audit + lifecycle-scoped codemode store; built with the first infrastructure runtime. */
+  let auditLog: HarnessAuditLog | undefined;
+  let codemodeStore: CodemodeStore | undefined;
+  /** Deterministic model routes snapshot (config-loaded; aliases never shadow catalog ids). */
+  let modelRoutes: Record<string, string> = {};
 
   const recordActivity = (event: string, detail?: Record<string, unknown>): void => {
     const line = detail ? `${event} ${JSON.stringify(detail)}` : event;
@@ -159,6 +168,7 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
     }
     if (runtime) return;
     const cfg = await config();
+    modelRoutes = cfg.modelRoutes ?? {};
     // Everything is built locally and committed only after pi.registerProvider succeeds,
     // so a failure anywhere above leaves no partial module state for a retry to inherit.
     const nextOrchestratorState = await loadOrchestratorState(process.cwd(), cfg.stateDir);
@@ -190,12 +200,14 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
       activity: (event, detail) => recordActivity(event, detail),
       getOrchestratorConfig: () => orchestratorState?.config,
       stopHarness: async () => { subagents?.shutdown(); },
-      isHarnessActive: async () => Boolean(subagents?.hasActiveRun()) || mcpToolActivity.active
+      isHarnessActive: async () => Boolean(subagents?.hasActiveRun()) || mcpToolActivity.active,
+      routes: () => modelRoutes
     });
     const created = createOpenAIWebProvider({
       runtime: nextRuntime,
       catalog: nextCatalog,
-      onCatalogChanged: (source, count) => recordActivity(`provider catalog ${source} (${count} models)`)
+      onCatalogChanged: (source, count) => recordActivity(`provider catalog ${source} (${count} models)`),
+      routes: () => modelRoutes
     });
     if (nextCatalog.models.length) created.setCatalog(nextCatalog.models);
     pi.registerProvider(created.provider);
@@ -251,12 +263,25 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
         () => resolveWorkflowToggles(orchestratorState?.config).reviewLoop,
         () => orchestratorState?.config.maxParallelWorkers ?? 3
       );
+      // Durable redacted audit + lifecycle-scoped codemode store: built once with
+      // the owned runtime; both live under the harness state dir and never log
+      // credentials, handoffs, worker prompts, script source, or file contents.
+      auditLog = new HarnessAuditLog(join(cfg.stateDir, "audit", "audit.jsonl"));
+      codemodeStore = new CodemodeStore(join(cfg.stateDir, "provider", "codemode-store"));
+      const audit = auditLog;
+      const codemodeBinding = {
+        store: codemodeStore,
+        // Authoritative Pi lifecycle identity: the Pi session id (stable across turns).
+        identity: (): string | undefined => session?.branchKey()
+      };
       infrastructure = new HarnessRuntime(cfg, () => createHarnessMcpFactory({
         config: cfg,
         workspaceRoot: process.cwd(),
         subagent: subagentAdapter,
         activity: mcpToolActivity,
-        workflows: () => resolveWorkflowToggles(orchestratorState?.config)
+        workflows: () => resolveWorkflowToggles(orchestratorState?.config),
+        audit,
+        codemode: codemodeBinding
       })());
     }
     return infrastructure;
@@ -468,31 +493,66 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
   const moduleRef: ProviderModule = {
     doctorLines: async () => {
       const cfg = await config();
-      if (!runtime || !catalog) return ["openai-web provider: not initialized yet"];
+      if (!runtime || !catalog) return ["openai-web provider: not initialized yet", "Action: run /openai-web start (or select an openai-web model) to initialize, then /openai-web doctor again."];
       const models = catalog.models;
       const infra = infrastructure ? await infrastructure.infraSnapshot() : { ready: false, mcp: "stopped", tunnel: "stopped", dia: "stopped" };
       const auth = await resolveCredential(cfg) ? "configured" : "missing (run /openai-web setup)";
       const orch = await getOrchestrator();
-      const runs = subagents ? (subagents.status() as Array<{ id: string; status: string }>).slice(0, 5) : [];
+      // Herdr pane diagnostics: per-run worker pane states, correction counts, and
+      // cleanup-pending evidence straight from the core run snapshots.
+      type DoctorTask = { id: string; status: string; paneId?: string; corrections?: number; acceptedAt?: number; cleanupPending?: { error: string; attempts: number } };
+      type DoctorRun = { id: string; status: string; runtime?: string; tasks?: DoctorTask[] };
+      const runs = subagents ? (subagents.status() as unknown as DoctorRun[]).slice(0, 5) : [];
+      const paneLines: string[] = [];
+      for (const run of runs) {
+        for (const task of run.tasks ?? []) {
+          const corrections = task.corrections ? `, corrections ${task.corrections}` : "";
+          const accepted = task.acceptedAt ? ", accepted" : "";
+          const cleanup = task.cleanupPending ? `, pane cleanup pending (${task.cleanupPending.attempts} attempts)` : "";
+          paneLines.push(`  ${run.id.slice(0, 8)}:${task.id} pane ${task.paneId ?? "?"} — ${task.status}${corrections}${accepted}${cleanup}`);
+        }
+      }
+      const identity = session?.branchKey();
+      const storeStats = codemodeStore && identity ? await codemodeStore.stats(identity) : undefined;
+      const auditStats = auditLog?.stats();
+      const aliases = routeAliasesForCatalog(modelRoutes, models);
+      const toolEntries = CANONICAL_HARNESS_TOOLS;
+      // Actionable next actions derived from live state (failures point at the exact fix).
+      const actions: string[] = [];
+      if (auth.startsWith("missing")) actions.push("Credential missing — run /openai-web setup.");
+      if (infra.tunnel !== "ready") actions.push(`Tunnel ${infra.tunnel} — run /openai-web reload (preserves the provider conversation) or /reload-tunnel.`);
+      if (infra.dia !== "ready") actions.push(`Browser/CDP ${infra.dia} — start the configured browser (npm run browser) or run /openai-web start.`);
+      if (infra.mcp !== "ready") actions.push(`Local MCP ${infra.mcp} — /openai-web reload restarts it together with the tunnel.`);
+      if (!models.length) actions.push("Catalog empty — run /openai-web models refresh with the browser running.");
+      if (storeStats?.lastError) actions.push(`Codemode store: ${storeStats.lastError}`);
+      if (auditStats?.lastError) actions.push(`Audit log: ${auditStats.lastError} (tool calls are unaffected; disk may be full or permissions changed)`);
       return [
         `openai-web provider: ${models.length} models registered (source: ${catalog.source}) · Lead Architect always on`,
         `Infrastructure: ${infra.ready ? "ready" : "idle/not ready"}`,
         `Credential: ${auth}`,
         `MCP: ${infra.mcp}`,
-        `Tunnel: ${infra.tunnel}`,
+        `Tunnel: ${infra.tunnel}${infrastructure?.tunnel.lastError ? ` — ${infrastructure.tunnel.lastError}` : ""}`,
         `Browser/CDP: ${infra.dia}`,
+        `MCP exposure: ${describeMcpExposure(cfg)}`,
+        `Tool surface: ${toolEntries.filter((tool) => !tool.mutating).length} read-only + ${toolEntries.filter((tool) => tool.mutating).map((tool) => tool.name).join("+")} (mutating) — frozen allowlist`,
         `Catalog last discovery error: ${catalog.lastError ?? "none"}`,
         ...(catalogError ? [`Catalog cache error: ${catalogError}`] : []),
         "Registered models:",
         ...(models.map(model => `  openai-web/${model.id} -> "${model.browserModelLabel}"${model.effort ? ` + "${model.effort}"` : ""} [${model.source}]`)),
+        ...(aliases.length ? [`Model route aliases (deterministic, exact):`, ...aliases.map((alias) => `  openai-web/${alias.alias} -> openai-web/${alias.target}`)] : []),
         `Provider conversation: ${JSON.stringify(runtime.conversationSummary())}`,
         `Lead profile: worker ${orch.config.workerModel}, thinking ${orch.config.workerThinking}, max workers ${orch.config.maxParallelWorkers}, ${orch.config.delegationStrategy} (${orch.scope})`,
         `Herdr workers: package runtime (configured model ${orch.config.workerModel})`,
         `Headless run auto-approval: ${cfg.harnessAutoApproveHerdrRun === true ? "ENABLED" : "disabled (fail closed)"}`,
         `Recent harness runs: ${runs.map((run) => `${run.id.slice(0, 8)}:${run.status}`).join(", ") || "(none)"}`,
+        "Herdr pane diagnostics (recent runs):",
+        ...(paneLines.length ? paneLines : ["  (no worker panes observed)"]),
+        `Codemode store: ${storeStats ? `${storeStats.keys} keys, ${storeStats.bytes} bytes (identity ${storeStats.identity.slice(0, 24)})` : identity ? "no writes yet this session" : "no Pi session identity yet (persistence starts with the first session)"}`,
+        `Audit log: ${auditStats ? `${auditStats.events} events this session · ${auditStats.path}` : "not initialized yet"}${auditStats?.lastEvent ? ` · last: ${auditStats.lastEvent}` : ""}`,
         `Transcript store: ${join(cfg.stateDir, "provider", "sessions")}`,
         `Provider public MCP URL: ${cfg.publicMcpUrl ?? "not configured"}`,
-        `Recent provider activity: ${activityLog.slice(-6).join(" | ") || "(none)"}`
+        `Recent provider activity: ${activityLog.slice(-6).join(" | ") || "(none)"}`,
+        ...(actions.length ? ["Next actions:", ...actions.map((action) => `  - ${action}`)] : [])
       ];
     },
     shutdown: async () => {

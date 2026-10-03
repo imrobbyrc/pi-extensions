@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-ai";import type { OpenAIWebModelDescriptor } from "./types.js";
 import type { OpenAIWebRuntime } from "./runtime.js";
 import type { OpenAIWebModelCatalog } from "./catalog.js";
+import { routeAliasesForCatalog, type ModelRoutes } from "./routes.js";
 
 export const OPENAI_WEB_PROVIDER_ID = "openai-web";
 /** Subscription-backed ChatGPT Web: zero marginal cost; conservative display window. */
@@ -30,11 +31,22 @@ export function toPiModel(descriptor: OpenAIWebModelDescriptor): Model<"openai-w
   };
 }
 
+/**
+ * One deterministic route alias as a Pi Model: the alias id selects, the name
+ * shows the exact target — the target descriptor itself is resolved through the
+ * unchanged catalog/runtime exact path at turn time.
+ */
+export function toPiRouteModel(alias: string, target: OpenAIWebModelDescriptor): Model<"openai-web"> {
+  return { ...toPiModel(target), id: alias, name: `${target.displayName}${target.effort ? ` (${target.effort})` : ""} · route ${alias}` };
+}
+
 export interface OpenAIWebProviderDeps {
   runtime: OpenAIWebRuntime;
   catalog: OpenAIWebModelCatalog;
   /** Called after the model list changed so the UI can show the new entries. */
   onCatalogChanged?: (source: "cache" | "live", count: number) => void;
+  /** Optional deterministic alias -> exact catalog id routes; only exactly-resolvable aliases are ever listed. */
+  routes?: () => ModelRoutes;
 }
 
 function zeroUsage(): AssistantMessage["usage"] {
@@ -130,8 +142,21 @@ export function streamTurn(model: Model<"openai-web">, context: Context, options
 export function createOpenAIWebProvider(deps: OpenAIWebProviderDeps): { provider: Provider; setCatalog: (descriptors: OpenAIWebModelDescriptor[]) => void } {
   let models: Model<"openai-web">[] = [];
 
+  /** Exact catalog models plus (deterministic, exactly-resolvable) route aliases. */
+  const buildModels = (descriptors: OpenAIWebModelDescriptor[]): Model<"openai-web">[] => {
+    const base = descriptors.map(toPiModel);
+    const routes = deps.routes?.() ?? {};
+    if (Object.keys(routes).length === 0) return base;
+    const byId = new Map(descriptors.map((descriptor) => [descriptor.id, descriptor]));
+    const aliasModels = routeAliasesForCatalog(routes, descriptors)
+      .map(({ alias, target }) => ({ alias, target: byId.get(target)! }))
+      .filter((entry) => entry.target !== undefined)
+      .map(({ alias, target }) => toPiRouteModel(alias, target));
+    return [...base, ...aliasModels];
+  };
+
   const setCatalog = (descriptors: OpenAIWebModelDescriptor[]): void => {
-    models = descriptors.map(toPiModel);
+    models = buildModels(descriptors);
   };
 
   const provider: Provider = {
@@ -151,7 +176,7 @@ export function createOpenAIWebProvider(deps: OpenAIWebProviderDeps): { provider
       const result = await deps.catalog.refresh();
       if (context.signal.aborted) return;
       if (!result.ok) return; // keep previous list; cache remains last-known-good
-      const refreshed = result.models.map(toPiModel);
+      const refreshed = buildModels(result.models);
       await context.publish({
         update: () => {
           models = refreshed;

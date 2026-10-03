@@ -1,3 +1,5 @@
+import type { ModelRoutes } from "./provider/routes.js";
+
 /**
  * Harness configuration. One product: the Pi harness with an always-on OpenAI
  * Web Lead Architect and Herdr-managed Pi workers. All planner-era settings
@@ -5,6 +7,10 @@
  */
 export interface HarnessConfig {
   mcpHost: string; mcpPort: number; mcpPath: string; publicMcpUrl: string | undefined;
+/** Optional bearer token required on every direct /mcp request. Loopback binds need none; direct non-loopback exposure fails closed without it. */
+  mcpAuthToken?: string | undefined;
+  /** Optional deterministic alias -> exact catalog model id routes (never shadow catalog ids, never rank models). */
+  modelRoutes?: ModelRoutes | undefined;
   stateDir: string; browser: "dia" | "chrome"; browserBinary: string | undefined;
   browserProfileDir: string; browserStartupTimeoutMs: number; cdpHost: string; cdpPort: number;
   chatgptUrl: string; chatgptAppName: string; browserAutoAttachApp: boolean;
