@@ -89,6 +89,38 @@ export function watchPollDelayMs(inputs: WatchPollInputs, config?: WatchPollCade
   return idleMs;
 }
 
+/** One watch poll's authoritative browser completion classification. */
+export type BrowserCompletionKind = "busy" | "semantic" | "fallback" | "none";
+
+export interface BrowserCompletionObservation {
+  /** The bound reply has streamed text. */
+  text: boolean;
+  /** Newest observed browser activity: stop button, shimmer, or a newer busy/stop probe or capture reading. */
+  busy: boolean;
+  /** The cheap revision probe read the bound turn's completion/busy flags this poll. */
+  probed: boolean;
+  /** The probe saw the bound turn's completion control (copy action). */
+  completionVisible: boolean;
+}
+
+/**
+ * Classify browser completion truth for one watch poll. Pure and deliberately
+ * blind to harness activity: harness liveness (Herdr runs, in-flight MCP tool
+ * calls) is a stall/timeout concern and never decides browser completion.
+ *
+ * - "busy": newest browser activity — always blocks completion.
+ * - "semantic": calm bound reply with its completion control visible: browser truth.
+ * - "fallback": calm bound reply without completion evidence: conservative.
+ * - "none": no streamed text on the bound reply — remount gap, pre-text
+ *   shell, or unreadable probe; a settle window opened against earlier text
+ *   must not survive the gap.
+ */
+export function classifyBrowserCompletion(observation: BrowserCompletionObservation): BrowserCompletionKind {
+  if (observation.busy) return "busy";
+  if (!observation.text || !observation.probed) return "none";
+  return observation.completionVisible ? "semantic" : "fallback";
+}
+
 export interface RuntimeActivity {
   (event: string, detail?: Record<string, unknown>): void;
 }
@@ -985,97 +1017,98 @@ export class OpenAIWebRuntime {
         emptyIdentityProgress = undefined;
       }
 
-      // Never complete while ChatGPT is busy (thinking/reasoning shimmer, stop
-      // button, or a newer busy/stop reading from the probe/capture) — and
-      // never while harness tool work (Herdr runs, in-flight MCP tool calls)
-      // is still active, even when the DOM looks calm and completion controls
-      // are visible. Each activity bout must be followed by a fresh settle
-      // window earned after it ends; only new assistant text drives
-      // completion, and the hard timeout still bounds a spinner.
-      if (busyNow || harnessActive) {
-        settle = undefined;
-        if (markdownChanged) {
-          controller.touchProgress();
-          handlers.onText?.(turnMarkdown);
-          lastText = turnMarkdown;
-        }
-      } else if (turnMarkdown.length > 0) {
-        if (markdownChanged) {
-          controller.touchProgress();
-          handlers.onText?.(turnMarkdown);
-          lastText = turnMarkdown;
-          settle = undefined;
-        }
+      // One authoritative per-poll browser completion classification. Harness
+      // activity is deliberately not an input: it is a stall/liveness concern,
+      // never browser completion truth.
+      const completion = classifyBrowserCompletion({
+        text: turnMarkdown.length > 0,
+        busy: busyNow,
+        probed: probe !== undefined,
+        completionVisible: probe?.completionVisible === true
+      });
 
-        // Settle progression runs on the cheap probe: an unchanged revision
-        // plus its completion/busy flags proves the stable snapshot without
-        // serializing the reply again. Opening a window trusts the revision
-        // the markdown was serialized at (this poll's atomic capture on
-        // change, the probe-verified cache otherwise) and requires that
-        // capture to have been calm when probe and capture diverge — the
-        // capture saw the newer DOM. Completion itself is always verified by
-        // one final atomic full capture.
-        const kind: CompletionSettle["kind"] | undefined =
-          identity && probe && !probe.busy && !(capture?.busy || capture?.stopVisible)
-            ? (probe.completionVisible ? "semantic" : "fallback")
+      // Fresh text always streams out and reopens any settle window. A busy
+      // or harness-held poll also streams an emptied snapshot (remount gap) so
+      // the output path can replace stale text; a calm no-text poll never
+      // streams the gap.
+      if (markdownChanged && (turnMarkdown.length > 0 || completion === "busy" || harnessActive)) {
+        controller.touchProgress();
+        handlers.onText?.(turnMarkdown);
+        lastText = turnMarkdown;
+        settle = undefined;
+      }
+
+      // Completion ownership: the classification above is the only completion
+      // authority. Busy browser evidence always blocks. Semantic completion is
+      // browser truth and is never vetoed by harness activity — a stale harness
+      // flag must not hold a finished answer hostage. Only the conservative
+      // fallback path (no completion evidence: finishing harness work may
+      // still append browser output) keeps waiting while the harness is active;
+      // harness liveness otherwise stays a stall/timeout concern alone
+      // (heartbeat refresh and polling cadence below).
+      //
+      // Settle progression runs on the cheap probe: an unchanged revision
+      // plus its completion/busy flags proves the stable snapshot without
+      // serializing the reply again. Opening a window trusts the revision
+      // the markdown was serialized at (this poll's atomic capture on
+      // change, the probe-verified cache otherwise) and requires that
+      // capture to have been calm when probe and capture diverge — the
+      // capture saw the newer DOM. Completion itself is always verified by
+      // one final atomic full capture.
+      const kind: CompletionSettle["kind"] | undefined =
+        completion === "semantic" || (completion === "fallback" && !harnessActive)
+          ? completion
+          : undefined;
+      if (!kind || (settle && (settle.identity !== identity || settle.markdown !== turnMarkdown || settle.kind !== kind))) {
+        settle = undefined;
+      }
+      if (kind && identity && !settle) {
+        settle = { identity, markdown: turnMarkdown, kind, since: Date.now(), observations: 1 };
+      } else if (settle) {
+        settle.observations += 1;
+      }
+      if (settle) {
+        const now = Date.now();
+        if (harnessSettledGraceUntil <= now) controller.touchProgress();
+        if (settle.observations >= COMPLETION_SETTLE_OBSERVATIONS[settle.kind]
+          && now - settle.since >= COMPLETION_SETTLE_MS[settle.kind]) {
+          const finalCapture = identity
+            ? await captureAssistantTurn(conversation.client, identity).catch(() => undefined)
             : undefined;
-        if (!kind || (settle && (settle.identity !== identity || settle.markdown !== turnMarkdown || settle.kind !== kind))) {
+          const finalMarkdown = finalCapture?.tree ? treeToMarkdown(finalCapture.tree as DomTreeNode) : "";
+          // The final capture reads the newest DOM of this poll: a busy/stop
+          // reading there feeds effective busy state exactly like a probe or
+          // mid-poll capture divergence (heartbeat + cadence below).
+          if (finalCapture?.busy === true || finalCapture?.stopVisible === true) busyNow = true;
+          if (identity && finalCapture?.identity === identity && !finalCapture.busy && !finalCapture.stopVisible
+            && finalCapture.completionVisible === (settle.kind === "semantic") && finalMarkdown === settle.markdown) {
+            controller.transition("completed");
+            this.emit("provider_completed", { model: controller.descriptor.id, chars: finalMarkdown.length });
+            return { kind: "completed", markdown: finalMarkdown };
+          }
+          if (finalCapture && finalCapture.identity === identity && finalMarkdown.length > 0) {
+            // The final capture read newer DOM than the settled snapshot:
+            // markup can re-render after the last probe (inline code swapped
+            // for a fenced block). Refresh the cache from the newer capture
+            // so the next settle compares against current markdown — a
+            // retained stale cache would keep re-matching its own revision,
+            // reopening windows on stale text, and timing out on repeated
+            // final-capture mismatches.
+            lastSerialized = { identity, revision: finalCapture.revision };
+            if (finalMarkdown !== lastText) {
+              controller.touchProgress();
+              handlers.onText?.(finalMarkdown);
+              lastText = finalMarkdown;
+            }
+          } else {
+            // Final capture failed or rebound elsewhere: the cached
+            // serialization no longer proves the DOM. Drop it so the next
+            // poll reserializes instead of replaying the stale snapshot.
+            lastSerialized = undefined;
+          }
+          // Any mismatch restarts the full settle window against the refreshed cache.
           settle = undefined;
         }
-        if (kind && identity && !settle) {
-          settle = { identity, markdown: turnMarkdown, kind, since: Date.now(), observations: 1 };
-        } else if (settle) {
-          settle.observations += 1;
-        }
-        if (settle) {
-          const now = Date.now();
-          if (harnessSettledGraceUntil <= now) controller.touchProgress();
-          if (settle.observations >= COMPLETION_SETTLE_OBSERVATIONS[settle.kind]
-            && now - settle.since >= COMPLETION_SETTLE_MS[settle.kind]) {
-            const finalCapture = identity
-              ? await captureAssistantTurn(conversation.client, identity).catch(() => undefined)
-              : undefined;
-            const finalMarkdown = finalCapture?.tree ? treeToMarkdown(finalCapture.tree as DomTreeNode) : "";
-            // The final capture reads the newest DOM of this poll: a busy/stop
-            // reading there feeds effective busy state exactly like a probe or
-            // mid-poll capture divergence (heartbeat + cadence below).
-            if (finalCapture?.busy === true || finalCapture?.stopVisible === true) busyNow = true;
-            if (identity && finalCapture?.identity === identity && !finalCapture.busy && !finalCapture.stopVisible
-              && finalCapture.completionVisible === (settle.kind === "semantic") && finalMarkdown === settle.markdown) {
-              controller.transition("completed");
-              this.emit("provider_completed", { model: controller.descriptor.id, chars: finalMarkdown.length });
-              return { kind: "completed", markdown: finalMarkdown };
-            }
-            if (finalCapture && finalCapture.identity === identity && finalMarkdown.length > 0) {
-              // The final capture read newer DOM than the settled snapshot:
-              // markup can re-render after the last probe (inline code swapped
-              // for a fenced block). Refresh the cache from the newer capture
-              // so the next settle compares against current markdown — a
-              // retained stale cache would keep re-matching its own revision,
-              // reopening windows on stale text, and timing out on repeated
-              // final-capture mismatches.
-              lastSerialized = { identity, revision: finalCapture.revision };
-              if (finalMarkdown !== lastText) {
-                controller.touchProgress();
-                handlers.onText?.(finalMarkdown);
-                lastText = finalMarkdown;
-              }
-            } else {
-              // Final capture failed or rebound elsewhere: the cached
-              // serialization no longer proves the DOM. Drop it so the next
-              // poll reserializes instead of replaying the stale snapshot.
-              lastSerialized = undefined;
-            }
-            // Any mismatch restarts the full settle window against the refreshed cache.
-            settle = undefined;
-          }
-        }
-      } else {
-        // Not busy and no bound text: the response or its message element is
-        // gone, or the capture failed (remount gap / pre-text shell). A settle
-        // window opened against earlier text must not survive the gap — the
-        // remounted message earns a fresh full settle window, never the old one.
-        settle = undefined;
       }
 
       // Check stall after consuming this poll: new response text and effective

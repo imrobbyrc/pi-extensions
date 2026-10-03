@@ -326,22 +326,25 @@ test("watch polls fast while generating and slower during harness tool wait", as
   }
 });
 
-test("harness-active calm DOM cannot complete; fresh settle window after activity ends", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-latency-harness-gate-"));
+test("semantic completion is browser truth: it is not held hostage by harness activity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-latency-harness-ownership-"));
   try {
-    // Uniform ~700ms polls make activity boundaries and the settle window
-    // (3 observations, >=1250ms) clearly distinguishable. The harness (Herdr
-    // run / in-flight MCP tool call) stays active for the first four polls
-    // while the browser already shows a calm reply with visible completion
-    // controls — the exact shape that must NOT complete mid-harness-work.
+    // Uniform ~700ms polls make the settle window (3 observations, >=1250ms)
+    // clearly distinguishable from the harness bout. The harness (Herdr run /
+    // in-flight MCP tool call) stays "active" well past the settle floor while
+    // the browser already shows a calm reply with visible completion controls.
+    // Completion ownership: that strong browser evidence completes the turn on
+    // its own schedule — a stale or slow harness flag must never veto it (the
+    // recurring browser-idle/Pi-working hang). Harness liveness stays a
+    // stall/timeout concern only: it is still consulted every poll. The
+    // conservative fallback path (no completion control) keeps waiting during
+    // harness work — covered deterministically in browser-completion-ownership.
     const cfg = {
       ...baseConfig(dir, { stallTimeoutMs: 10_000, turnTimeoutMs: 60_000, pollHarnessWaitMs: 700 }),
       providerPollActiveMs: 700,
       providerPollIdleMs: 700
     };
     let harnessCalls = 0;
-    let activePolls = 0;
-    let lastActiveAt = 0;
     const emitted: string[] = [];
     const frame = completedFrame("r1", "Partial but stable");
     const h = makeWatchHarness(
@@ -349,12 +352,7 @@ test("harness-active calm DOM cannot complete; fresh settle window after activit
       [frame, structuredClone(frame), structuredClone(frame), structuredClone(frame), structuredClone(frame), structuredClone(frame), structuredClone(frame)],
       async () => {
         harnessCalls += 1;
-        if (harnessCalls <= 4) {
-          activePolls += 1;
-          lastActiveAt = Date.now();
-          return true;
-        }
-        return false;
+        return true; // active for the whole turn: must not delay semantic completion
       },
       { onText: (full) => emitted.push(full) }
     );
@@ -362,20 +360,19 @@ test("harness-active calm DOM cannot complete; fresh settle window after activit
     assert.equal(outcome.kind, "completed", outcome.error);
     assert.match(outcome.markdown ?? "", /Partial but stable/);
     assert.equal(h.controller.state, "completed");
-    // Every harness-active poll must be consumed: a completion fired while
-    // the harness was still active would end the loop after three calls.
-    assert.equal(activePolls, 4, `harness activity must gate completion, got ${activePolls} active polls`);
-    // Completion must trail the last harness-active poll by a full fresh
-    // settle window — never inherit a window accumulated during the work.
+    // The settle window spans its full floor (3 observations over >=1250ms at
+    // ~700ms polls -> completes on poll 3), mid-bout: the harness flag never
+    // extended it.
+    assert.equal(h.pollCount(), 3, `semantic settle must complete mid-bout on its own floor, got ${h.pollCount()} polls`);
     const completionPoll = h.pollTimestamps[h.pollTimestamps.length - 1]!;
     assert.ok(
-      completionPoll - lastActiveAt >= 1_250,
-      `completion must be earned from a fresh post-harness settle window, got ${completionPoll - lastActiveAt}ms`
+      completionPoll - h.pollTimestamps[0]! >= 1_250,
+      `completion must still span the full semantic settle floor, got ${completionPoll - h.pollTimestamps[0]!}ms`
     );
-    assert.ok(h.pollCount() >= 6, `settle window must restart after harness activity, got ${h.pollCount()} polls`);
     assert.deepEqual(emitted, ["Partial but stable"], "partial text may stream during harness work");
     assert.equal(h.stopClickCount(), 0);
     assert.equal(h.serializeCount(), 2); // first sight + final atomic verification
+    assert.equal(harnessCalls, h.pollCount(), "harness liveness stays observable for stall protection on every poll");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
