@@ -655,11 +655,18 @@ function baseConfig(dir: string, overrides: { stallTimeoutMs: number; turnTimeou
   };
 }
 
+/** Default causal anchor for watch harness frames: the confirmed submitted user identity. */
+const ANCHOR_USER = "user-anchor";
+
 function domState(overrides: Partial<TurnDomState>): TurnDomState {
+  const users = overrides.userIdentities ?? [ANCHOR_USER];
+  const responses = overrides.responseIdentities ?? [];
   return {
-    turnIdentities: [],
-    userIdentities: [],
-    responseIdentities: [],
+    // Compose the DOM-ordered turn list when not explicitly scripted: anchor
+    // user first, then responses — mirroring the real readTurnState invariant.
+    turnIdentities: overrides.turnIdentities ?? [...users, ...responses],
+    userIdentities: users,
+    responseIdentities: responses,
     completionActionVisible: false,
     stopVisible: false,
     busy: false,
@@ -748,8 +755,8 @@ function makeDomWatchHarness(
     controller,
     ...double,
     run: (options: { signal?: AbortSignal } = {}) => (runtime as unknown as {
-      watch: (c: ProviderTurnController, h: unknown, o: { signal?: AbortSignal }, b: TurnDomState) => Promise<{ kind: string; error?: string; markdown?: string }>
-    }).watch(controller, handlers ?? {}, options, domState({}))
+      watch: (c: ProviderTurnController, h: unknown, o: { signal?: AbortSignal }, anchor: string) => Promise<{ kind: string; error?: string; markdown?: string }>
+    }).watch(controller, handlers ?? {}, options, ANCHOR_USER)
   };
 }
 

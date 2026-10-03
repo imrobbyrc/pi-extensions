@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { evalJson, readTurnState, submitPrompt, type CdpClient } from "../src/provider/page.js";
 
-test("submitPrompt clicks Send and waits for a new user turn", async () => {
+test("submitPrompt clicks Send and returns the exact confirmed new user identity", async () => {
   let sent = false;
   const actions: string[] = [];
   const client = {
@@ -24,8 +24,11 @@ test("submitPrompt clicks Send and waits for a new user turn", async () => {
     },
     Input: { insertText: async ({ text }: { text: string }) => { actions.push(`insert:${text}`); } }
   } as never;
-  await submitPrompt(client, "review");
+  const confirmed = await submitPrompt(client, "review");
   assert.deepEqual(actions, ["insert:review", "click"]);
+  // The causal anchor for response binding: the exact newly confirmed user
+  // identity, not a display index or a pre-submit guess.
+  assert.equal(confirmed, "new");
 });
 
 test("browser exceptions propagate instead of becoming an empty conversation", async () => {
