@@ -152,8 +152,15 @@ export class CodemodeStore {
         this.setError(identity, "store snapshot is not an object; starting empty");
         return {};
       }
+      const snapshot = { ...(parsed as CodemodeStoreSnapshot) };
+      try {
+        validateCodemodeStoreState(snapshot);
+      } catch {
+        this.setError(identity, "store snapshot violates policy bounds; starting empty");
+        return {};
+      }
       this.setError(identity, undefined);
-      return { ...(parsed as CodemodeStoreSnapshot) };
+      return snapshot;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
@@ -170,16 +177,25 @@ export class CodemodeStore {
    * Validation covers the ENTIRE post-apply state before anything touches the
    * disk, so an invalid batch is rejected whole — no partial commit exists.
    */
-  commit(identity: string, current: CodemodeStoreSnapshot, writesRaw: unknown): Promise<void> {
+  commit(identity: string, _current: CodemodeStoreSnapshot, writesRaw: unknown): Promise<void> {
     const outcome = (this.commits.get(identity) ?? Promise.resolve()).then(async () => {
       const writes = normalizeCodemodeStoreWrites(writesRaw);
-      const next = applyCodemodeStoreWrites(current, writes);
+      // Re-read inside the per-identity queue so concurrent executions merge
+      // against the latest committed snapshot instead of overwriting one another
+      // with the snapshot each execution observed before it started.
+      const latest = await this.load(identity);
+      const next = applyCodemodeStoreWrites(latest, writes);
       validateCodemodeStoreState(next);
       await mkdir(this.dir, { recursive: true });
       const target = this.pathFor(identity);
       const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-      await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, "utf8");
-      await rename(tmp, target);
+      try {
+        await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+        await rename(tmp, target);
+      } catch (error) {
+        await rm(tmp, { force: true }).catch(() => undefined);
+        throw error;
+      }
       this.setError(identity, undefined);
     });
     this.commits.set(identity, outcome.then(() => undefined, () => undefined));

@@ -335,13 +335,14 @@ interface HarnessToolSpec {
 /** Bounded metadata audit records for one tool call: identifiers and paths only — never payloads. */
 function auditDetailOf(args: unknown): Record<string, unknown> | undefined {
   if (typeof args !== "object" || args === null) return undefined;
-  const { action, run_id, worker_id, path, query } = args as Record<string, unknown>;
+  const { action, run_id, worker_id, path } = args as Record<string, unknown>;
   const detail: Record<string, unknown> = {};
   if (typeof action === "string") detail.action = action;
   if (typeof run_id === "string") detail.run_id = run_id;
   if (typeof worker_id === "string") detail.worker_id = worker_id;
+  // Paths are bounded workspace-relative identifiers; never record search
+  // queries or arbitrary payloads, which could contain file contents/secrets.
   if (typeof path === "string") detail.path = path;
-  if (typeof query === "string") detail.query = query;
   return Object.keys(detail).length ? detail : undefined;
 }
 
@@ -360,7 +361,9 @@ function withAudit(audit: AuditRecorder | undefined, tool: string, run: (args: a
       audit.record({ actor: "lead-tool", tool, outcome: "ok", durationMs: Date.now() - started, ...(detail ? { detail } : {}) });
       return outcome;
     } catch (error) {
-      const detail = { ...auditDetailOf(args), error: herdrErrorMessage(error) };
+      // Keep failure evidence bounded to a classification; never persist raw
+      // error text, which may contain handoffs, prompts, paths, or credentials.
+      const detail = { ...auditDetailOf(args), error: "tool_failed" };
       audit.record({ actor: "lead-tool", tool, outcome: "error", durationMs: Date.now() - started, detail });
       throw error;
     }
@@ -719,7 +722,7 @@ export function createHarnessMcpFactory(deps: {
             ...(result.ok ? { structuredContent: { ok: result.ok, store_persisted: result.storePersisted } } : {})
           };
         } catch (error) {
-          deps.audit?.record({ actor: "codemode", tool: "codemode", outcome: "error", durationMs: Date.now() - started, detail: { error: herdrErrorMessage(error) } });
+          deps.audit?.record({ actor: "codemode", tool: "codemode", outcome: "error", durationMs: Date.now() - started, detail: { error: "codemode_failed" } });
           throw error;
         }
       })

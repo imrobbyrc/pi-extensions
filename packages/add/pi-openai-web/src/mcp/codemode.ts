@@ -188,7 +188,18 @@ export function bridgeToCodemodeTool(
       // herdr binding and the TUI confirmation gate — no codemode bypass exists.
       try {
         // Nested calls see the exact text payload a direct MCP call returns.
-        return (await bridge.run(validated)).text;
+        // Accept both the internal HarnessToolOutcome and an MCP CallToolResult
+        // (the latter is useful for tests that capture registerTool handlers).
+        const outcome = await bridge.run(validated);
+        if (typeof outcome?.text === "string") return outcome.text;
+        const content = (outcome as unknown as { content?: unknown }).content;
+        if (Array.isArray(content)) {
+          return content
+            .filter((item): item is { type: string; text: string } => typeof item === "object" && item !== null && (item as { type?: unknown }).type === "text" && typeof (item as { text?: unknown }).text === "string")
+            .map((item) => item.text)
+            .join("\\n");
+        }
+        throw new Error(`${bridge.name} returned an invalid MCP result.`);
       } catch (error) {
         throw new Error(`${bridge.name} failed: ${errorMessage(error)}`);
       }    },

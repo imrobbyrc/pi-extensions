@@ -493,7 +493,7 @@ export function setupProviderModule(pi: ExtensionAPI, subagents?: SubagentContro
   const moduleRef: ProviderModule = {
     doctorLines: async () => {
       const cfg = await config();
-      if (!runtime || !catalog) return ["openai-web provider: not initialized yet", "Action: run /openai-web start (or select an openai-web model) to initialize, then /openai-web doctor again."];
+      if (!runtime || !catalog) return ["openai-web provider: not initialized yet"];
       const models = catalog.models;
       const infra = infrastructure ? await infrastructure.infraSnapshot() : { ready: false, mcp: "stopped", tunnel: "stopped", dia: "stopped" };
       const auth = await resolveCredential(cfg) ? "configured" : "missing (run /openai-web setup)";

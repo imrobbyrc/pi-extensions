@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 
 /**
  * Request-auth policy for the harness MCP HTTP endpoint. The loopback Secure
@@ -13,8 +14,9 @@ import { createHash, timingSafeEqual } from "node:crypto";
 export function isLoopbackHost(host: string): boolean {
   const value = host.trim().toLowerCase();
   if (value === "localhost" || value === "::1" || value === "[::1]") return true;
-  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value)) return true;
-  return false;
+  if (isIP(value) !== 4) return false;
+  const octets = value.split(".").map(Number);
+  return octets.length === 4 && octets.every((octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255) && octets[0] === 127;
 }
 
 /** Actionable, fail-closed startup gate for the configured exposure posture. */

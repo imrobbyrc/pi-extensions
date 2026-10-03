@@ -15,6 +15,10 @@ Shipped:
 - [x] Provider substrate retained: dynamic model/effort discovery with last-known-good cache, exact browser selection, bounded context bootstrap, structured checkpoint compaction, durable transcripts, resume metadata.
 - [x] Planner subsystem removed: `/planner` commands, task store, `submit_plan`/`submit_review` protocol, browser worker tabs, and Pi subagent delegation.
 - [x] Worker orchestration consolidated in `@imrobbyrc/pi-core-subagent` public API; planner owns only OpenAI Web, MCP, Lead policy, and composition. No new scheduler/IPC/worktree implementation belongs in this repository.
+- [x] Codemode state uses the official `store`/`storeWrites` surface, is scoped to the authoritative Pi session identity, and commits atomically only after successful valid execution.
+- [x] MCP request auth fails closed for direct non-loopback binds without a bearer token while preserving loopback Secure MCP Tunnel compatibility; token checks are owned by the HTTP server.
+- [x] Bounded redacted JSONL audit records cover direct and nested tool calls without persisting credentials, handoffs, prompts, Codemode source, or file contents.
+- [x] `/openai-web doctor` reports bounded Herdr pane, MCP exposure, Codemode store, and audit health metadata.
 
 ## Reliability qualification
 
@@ -28,12 +32,10 @@ Shipped:
 
 ## Next
 
-- [ ] Authenticated remote MCP story beyond the tunnel (per-tool authorization or OAuth/pairing).
-- [ ] Structured audit log for lead tool calls and herdr lifecycle events.
+- [ ] Authenticated remote MCP story beyond the tunnel (per-tool authorization or OAuth/pairing); direct bearer-token exposure is shipped, but OAuth/pairing remains future work.
 - [ ] Optional public `executeTool()`-style Pi integration if upstream exposes a safe native hook (nothing depends on it today).
 
 Scope boundary: package API integration is complete. Future work here must stay on provider, MCP boundary, Lead policy, or package integration; worker engine features belong in `pi-core-subagent`.
-- [ ] Herdr pane diagnostics surfaced in `/openai-web doctor` (pane states, last correction evidence).
 - [ ] Cross-platform browser launch hardening (Linux Chrome profiles; Windows remains unsupported).
 
 ---

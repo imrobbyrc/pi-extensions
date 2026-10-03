@@ -10,7 +10,9 @@ One product, one flow:
 
 - **OpenAI Web Lead (always on)** — ChatGPT Web behaves like a native Pi model through `/model openai-web/<id>`, with dynamic model/effort discovery, exact browser selection, bounded context, and structured checkpoint compaction.
 - **Strict lead tools** — the Lead sees exactly nine MCP tools: seven bounded read-only workspace inspections (including optional root `CONTEXT.md` guidance via `read_context`), one Pi-native `herdr` execution tool, and one `codemode` tool that composes the other eight inside the official `@earendil-works/pi-codemode` sandbox. No shell, no writes, no subagent spawning, no browser worker tabs.
-- **Codemode composition (official sandbox)** — `codemode` runs Lead-written JavaScript that loops, branches, filters, and fans the eight harness tools out with `Promise.all`, then returns exactly one script result to the conversation (nested tool results never enter Lead context). Nested calls re-enter the exact registered handlers, so `herdr` keeps its plan binding and explicit TUI confirmation; invalid scripts, unsupported tools, exceeded limits (script size, deadline, output budget, 200 nested calls), and a missing runtime all fail closed.
+- **Codemode composition (official sandbox)** — `codemode` runs Lead-written JavaScript that loops, branches, filters, and fans the eight harness tools out with `Promise.all`, then returns exactly one script result to the conversation (nested tool results never enter Lead context). Nested calls re-enter the exact registered handlers, so `herdr` keeps its plan binding and explicit TUI confirmation; invalid scripts, unsupported tools, exceeded limits (script size, deadline, output budget, 200 nested calls), and a missing runtime all fail closed. The official `store`/`storeWrites` surface is persisted atomically only after successful valid execution and scoped to the Pi session identity; failures never commit partial writes.
+- **Structured results and redacted audit** — MCP responses retain their direct text payload and add bounded `structuredContent` metadata. Direct and nested calls share one redacted JSONL audit seam; credentials/tokens, handoffs, worker prompts, Codemode source, and file contents are never recorded.
+- **MCP exposure safety** — the HTTP server preserves loopback Secure MCP Tunnel behavior. Direct non-loopback binds fail closed without `PLANNER_MCP_AUTH_TOKEN`/`mcpAuthToken`; when configured, every `/mcp` request requires a bearer token.
 - **Risk-aware planning & work-graph validation** — v2 low-risk plans use four-field `compact_plan`, medium-risk plans use five-field `standard_plan`, and high-risk plans keep the nine-axis `decision_graph` (a previously issued medium `decision_graph` stays valid). Gates are optional at every v2 risk; v1 keeps strict gates. Every 1–4 worker graph validates ids, dependencies and ownership before handoff. Risk and planning kind join the v2 fingerprint.
 - **Asynchronous native Herdr** — one `herdr` MCP tool with `plan | run | status | correct | accept | stop | verify` actions. `run` starts a bounded 1–4 Pi-worker execution after explicit TUI confirmation and returns immediately; workers run as Pi agents (`--kind pi`) in Herdr panes. A completed worker stays live in its pane for review: `correct` reopens it in the same pane with feedback and it completes again; `accept` finalizes it and closes the pane.
 - **Risk-bound acceptance** — `herdr verify` produces read-only evidence (spec, design, quality, evidence) and a fingerprint. v2 low compact and v2 medium standard work can be accepted after diff review without a fingerprint, but the handoff must match the actual run and worker prompts. v1, v2 high design-graph, and v2 medium design-graph require a fresh verification fingerprint; drift fails closed.
@@ -274,6 +276,8 @@ Health endpoint: `http://127.0.0.1:8765/healthz`.
 
 ChatGPT cannot reach localhost directly. Use the configured `tunnel-client` and OpenAI Secure MCP Tunnel. Create the custom ChatGPT app named `Pi Workspace`, point it at the tunnel's remote endpoint, and scan tools. Keep the local server loopback-bound. See [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md).
 
+For an explicitly direct non-loopback deployment, set `PLANNER_MCP_AUTH_TOKEN` (or `mcpAuthToken` in config). Startup fails closed without it, and every `/mcp` request must carry `Authorization: Bearer <token>`. Loopback binds do not require a token and remain the Secure MCP Tunnel-compatible default.
+
 ### Configuration precedence
 
 Defaults < `~/.pi/chatgpt-planner/config.json` < environment variables. Copy [`config.example.json`](config.example.json) to that path.
@@ -283,6 +287,7 @@ Defaults < `~/.pi/chatgpt-planner/config.json` < environment variables. Copy [`c
 | `PLANNER_MCP_HOST` | `127.0.0.1` |
 | `PLANNER_MCP_PORT` | `8765` |
 | `PLANNER_MCP_PATH` | `/mcp` |
+| `PLANNER_MCP_AUTH_TOKEN` | unset (required for direct non-loopback binds) |
 | `PLANNER_PUBLIC_MCP_URL` | unset |
 | `PLANNER_BROWSER` | `dia` |
 | `PLANNER_BROWSER_BINARY` | unset |
