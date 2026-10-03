@@ -6,6 +6,7 @@ import type {
   CodemodeResult,
   CodemodeTool,
 } from "@earendil-works/pi-codemode";
+import type { CodemodeStoreSnapshot } from "./codemode-store.js";
 
 /**
  * Codemode bridge for the openai-web harness: runs Lead-written JavaScript in
@@ -63,8 +64,16 @@ export interface HarnessCodemodeBridge {
   description: string;
   /** The same zod input schema the MCP registration validates direct calls with. */
   schema: z.ZodObject<any>;
-  /** The registered MCP handler (activity-tracked); returns CallToolResult-shaped content or throws. */
-  run: (args: any) => Promise<CallToolResult>;
+  /** The registered MCP handler (activity-tracked); returns the tool's text payload (identical to a direct call). */
+  run: (args: any) => Promise<{ text: string }>;
+}
+
+/** Persistence seam for one codemode execution, scoped to the authoritative Pi lifecycle identity. */
+export interface HarnessCodemodeStoreSession {
+  /** Snapshot the script starts from (loaded before execution). */
+  load(): Promise<CodemodeStoreSnapshot>;
+  /** Validate and atomically persist the sandbox's storeWrites; "discarded" = nothing persisted. */
+  commit(writes: unknown): Promise<"committed" | "discarded">;
 }
 
 let runtimeModule: CodemodeRuntime | undefined;
@@ -146,21 +155,6 @@ export class NestedCallBudget {
   }
 }
 
-/** Flatten an MCP CallToolResult to the text a script sees — exactly what the Lead would have read. */
-function callResultText(result: unknown): string {
-  const content = (
-    result as
-      | { content?: Array<{ type?: string; text?: unknown }> }
-      | null
-      | undefined
-  )?.content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) => (typeof block?.text === "string" ? block.text : ""))
-    .filter((text) => text.length > 0)
-    .join("\n");
-}
-
 /** Bridge one harness tool into a sandbox tool with identical validation policy. */
 export function bridgeToCodemodeTool(
   bridge: HarnessCodemodeBridge,
@@ -193,11 +187,22 @@ export function bridgeToCodemodeTool(
       // The registered handler carries activity tracking, workflow toggles,
       // herdr binding and the TUI confirmation gate — no codemode bypass exists.
       try {
-        return callResultText(await bridge.run(validated));
+        // Nested calls see the exact text payload a direct MCP call returns.
+        // Accept both the internal HarnessToolOutcome and an MCP CallToolResult
+        // (the latter is useful for tests that capture registerTool handlers).
+        const outcome = await bridge.run(validated);
+        if (typeof outcome?.text === "string") return outcome.text;
+        const content = (outcome as unknown as { content?: unknown }).content;
+        if (Array.isArray(content)) {
+          return content
+            .filter((item): item is { type: string; text: string } => typeof item === "object" && item !== null && (item as { type?: unknown }).type === "text" && typeof (item as { text?: unknown }).text === "string")
+            .map((item) => item.text)
+            .join("\\n");
+        }
+        throw new Error(`${bridge.name} returned an invalid MCP result.`);
       } catch (error) {
         throw new Error(`${bridge.name} failed: ${errorMessage(error)}`);
-      }
-    },
+      }    },
   };
 }
 
@@ -206,6 +211,8 @@ export interface HarnessCodemodeDeps {
   code: string;
   /** Test seam; defaults to the official package via loadCodemodeRuntime(). */
   runtime?: CodemodeRuntime;
+  /** Optional lifecycle-scoped persistent store; absent = the script runs with no store at all. */
+  store?: HarnessCodemodeStoreSession;
 }
 
 /** The bounded result returned to the Lead: script output only, never nested tool payloads. */
@@ -213,6 +220,8 @@ export interface HarnessCodemodeResult {
   ok: boolean;
   content: CodemodeOutputItem[];
   isError?: boolean;
+  /** Whether successful store writes were persisted: committed (durable), discarded (no authoritative identity), or none (no writes/no store). */
+  storePersisted: "committed" | "discarded" | "none";
 }
 
 /** Clamp the script-requested deadline; exceeding the cap fails closed. */
@@ -286,11 +295,24 @@ function truncateToTokenBudget(
   ];
 }
 
+/** True when the sandbox's ok result actually carries store writes to persist. */
+function hasStoreWrites(result: Extract<CodemodeResult, { ok: true }>): boolean {
+  const writes = result.storeWrites;
+  return Boolean(writes && (Object.keys(writes.set ?? {}).length > 0 || (writes.delete ?? []).length > 0));
+}
+
 /**
  * Execute one script through the official sandbox. Fails closed on an
  * unavailable runtime, an invalid script, options beyond the caps, and script
  * failures (returned as an isError result with the bounded call summary).
  * Resolves only with the script's own output and return value.
+ *
+ * Lifecycle-safe persistence: the script starts from the identity-scoped
+ * snapshot (official `store` execute option; the in-sandbox `store`/`load`
+ * globals are the official runtime's own surface) and its `storeWrites` are
+ * committed ONLY after a successful, policy-valid execution — never on
+ * failure, timeout, abort, budget exhaustion, or invalid writes, and never
+ * partially (the store validates the whole post-apply state first).
  */
 export async function runHarnessCodemode(
   deps: HarnessCodemodeDeps,
@@ -319,14 +341,20 @@ export async function runHarnessCodemode(
     timeoutMs,
     memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
   });
+  // Load the lifecycle-scoped snapshot BEFORE execution; a missing identity
+  // session means no persistence at all (writes are discarded by construction).
+  const storeSnapshot = deps.store ? await deps.store.load() : undefined;
   let result: CodemodeResult;
   try {
-    result = await sandbox.execute(parsed.code);
+    result = await sandbox.execute(parsed.code, {
+      ...(storeSnapshot !== undefined ? { store: storeSnapshot } : {}),
+    });
   } finally {
     await sandbox.close();
   }
   // Exceeded limits fail closed even when the script catches the in-sandbox
-  // rejection: a budget-capped execution never reports success to the Lead.
+  // rejection: a budget-capped execution never reports success to the Lead —
+  // and never persists its store writes.
   if (result.ok && budget.exhausted) {
     result = {
       ok: false,
@@ -338,6 +366,34 @@ export async function runHarnessCodemode(
       output: result.output,
       calls: result.calls,
     };
+  }
+  let storePersisted: HarnessCodemodeResult["storePersisted"] = "none";
+  const storeNotes: string[] = [];
+  if (result.ok && deps.store && hasStoreWrites(result)) {
+    try {
+      const outcome = await deps.store.commit(result.storeWrites);
+      storePersisted = outcome;
+      if (outcome === "discarded") {
+        storeNotes.push("Store writes were discarded: no authoritative Pi lifecycle identity is bound to this execution, so nothing was persisted.");
+      }
+    } catch (error) {
+      // Fail closed on persistence: no partial state was written, and the Lead
+      // must see that the script's store writes did not survive.
+      const message = errorMessage(error);
+      result = {
+        ok: false,
+        error: {
+          kind: "script",
+          name: "Error",
+          message: message.startsWith("codemode_store_invalid")
+            ? `${message} No store writes were persisted.`
+            : `codemode_store_unavailable: ${message} No store writes were persisted.`,
+        },
+        output: result.output,
+        calls: result.calls,
+      };
+      storePersisted = "none";
+    }
   }
   const items: CodemodeOutputItem[] = [...result.output];
   if (result.ok) {
@@ -358,7 +414,13 @@ export async function runHarnessCodemode(
   }
   return {
     ok: result.ok,
-    content: truncateToTokenBudget(items, maxOutputTokens),
+    content: truncateToTokenBudget(
+      storeNotes.length > 0
+        ? [...items, ...storeNotes.map((text) => ({ type: "text" as const, text }))]
+        : items,
+      maxOutputTokens,
+    ),
+    storePersisted,
     ...(result.ok ? {} : { isError: true }),
   };
 }
@@ -384,5 +446,6 @@ export function codemodeToolDescription(): string {
       CODEMODE_TIMEOUT_MS_DEFAULT +
       "ms).",
     "No network, filesystem, timers, or process access: the only capability is the harness tools. Invalid scripts, unsupported tools, exceeded limits, and a missing runtime fail closed.",
+    "A small persistent store may be available in scripts via the official `store(key, value)` / `load(key)` globals: values survive ONLY after a successful script (never on errors, timeouts, or exceeded limits), are scoped to this Pi session, and are bounded (small JSON values only).",
   ].join(" ");
 }

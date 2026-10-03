@@ -3,12 +3,15 @@ import { toNodeHandler, type NodeIncomingMessageLike } from "@modelcontextprotoc
 import { createMcpHandler, McpServer, type CallToolResult, type ToolAnnotations } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import type { HarnessConfig } from "../types.js";
-import { gitDiff, gitStatus } from "../workspace/git.js";
+import { gitDiff, gitStatus, changedFilesFromGitStatus } from "../workspace/git.js";
 import { listDirectory, readContextFile, readTextFile, repoMap } from "../workspace/files.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { parseHerdrHandoff, issueHerdrHandoff, issueHerdrHandoffV2, planFingerprint, planFingerprintV2, assertExecutionSpec, assertDecisionGraph, assertSpecSourceExclusive, assertWorkerSlice, assertWorkGraph, assertRiskLevel, assertPlanningKind, assertRiskPlanningPair, assertCompactPlan, assertStandardPlan, compileDecisionGraph, compileCompactPlan, compileStandardPlan, canonicalExecutionSpec, buildVerificationReport, verificationFingerprint, resolveWorkflowToggles, COMPACT_PLAN_FIELDS, COMPACT_PLAN_VALUE_MAX, STANDARD_PLAN_FIELDS, STANDARD_PLAN_VALUE_MAX, RISK_LEVELS, PLANNING_KINDS, DECISION_GRAPH_AXES, DECISION_GRAPH_VALUE_MAX, EXECUTION_SPEC_KEY_MAX, EXECUTION_SPEC_MAX_ENTRIES, EXECUTION_SPEC_VALUE_MAX, WORKER_COUNT_MAX, WORKER_METADATA_ITEM_MAX, WORKER_METADATA_LIST_MAX, type ParsedHerdrHandoff, type VerificationReport, type VerificationReportInput, type WorkflowToggleId, type WorkerSlice, type RiskLevel, type PlanningKind } from "../provider/orchestrator.js";
 import { buildWorkerTask, type AdapterRunSnapshot } from "./subagent-adapter.js";
-import { CODEMODE_SCRIPT_MAX, codemodeToolDescription, runHarnessCodemode, type HarnessCodemodeBridge } from "./codemode.js";
+import { CODEMODE_SCRIPT_MAX, codemodeToolDescription, runHarnessCodemode, type HarnessCodemodeBridge, type HarnessCodemodeStoreSession } from "./codemode.js";
+import type { CodemodeStore, CodemodeStoreSnapshot } from "./codemode-store.js";
+import type { AuditActor, AuditRecorder } from "../service/audit.js";
+import { assertSafeMcpExposure, bearerTokenFromHeader, bearerTokenMatches } from "./request-auth.js";
 type HerdrWorker = WorkerSlice;
 
 /**
@@ -32,8 +35,21 @@ type HerdrMcpAdapter = {
   inspect?(runId?: string): unknown;
 };
 
-function text(value: unknown) {
-  return { content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
+/**
+ * Internal harness tool outcome. `text` stays the EXACT payload a direct MCP
+ * call returns (and the only thing codemode scripts see); `structured` is the
+ * additive machine-readable view carried as MCP `structuredContent`.
+ */
+export interface HarnessToolOutcome {
+  text: string;
+  structured?: Record<string, unknown>;
+}
+
+function text(value: unknown, structured?: Record<string, unknown>): HarnessToolOutcome {
+  return {
+    text: typeof value === "string" ? value : JSON.stringify(value, null, 2),
+    ...(structured ? { structured } : {})
+  };
 }
 
 /**
@@ -311,10 +327,113 @@ interface HarnessToolSpec {
   description: string;
   schema: z.ZodObject<any>;
   annotations: ToolAnnotations;
-  run: (args: any) => Promise<CallToolResult>;
+  /** Optional declared output schema; success results then carry matching `structuredContent` (additive). */
+  outputSchema?: z.ZodObject<any>;
+  run: (args: any) => Promise<HarnessToolOutcome>;
 }
 
-export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspaceRoot: string; subagent: HerdrMcpAdapter; activity?: McpToolActivity; workflows?: () => Record<WorkflowToggleId, boolean> }) {
+/** Bounded metadata audit records for one tool call: identifiers and paths only — never payloads. */
+function auditDetailOf(args: unknown): Record<string, unknown> | undefined {
+  if (typeof args !== "object" || args === null) return undefined;
+  const { action, run_id, worker_id, path } = args as Record<string, unknown>;
+  const detail: Record<string, unknown> = {};
+  if (typeof action === "string") detail.action = action;
+  if (typeof run_id === "string") detail.run_id = run_id;
+  if (typeof worker_id === "string") detail.worker_id = worker_id;
+  // Paths are bounded workspace-relative identifiers; never record search
+  // queries or arbitrary payloads, which could contain file contents/secrets.
+  if (typeof path === "string") detail.path = path;
+  return Object.keys(detail).length ? detail : undefined;
+}
+
+/**
+ * Audit wrapper at the single shared run seam: every direct MCP call AND every
+ * codemode nested call is audited identically (redaction happens inside the
+ * recorder). Audit failures never affect the audited call.
+ */
+function withAudit(audit: AuditRecorder | undefined, tool: string, run: (args: any) => Promise<HarnessToolOutcome>): (args: any) => Promise<HarnessToolOutcome> {
+  if (!audit) return run;
+  return async (args: any) => {
+    const started = Date.now();
+    try {
+      const outcome = await run(args);
+      const detail = auditDetailOf(args);
+      audit.record({ actor: "lead-tool", tool, outcome: "ok", durationMs: Date.now() - started, ...(detail ? { detail } : {}) });
+      return outcome;
+    } catch (error) {
+      // Keep failure evidence bounded to a classification; never persist raw
+      // error text, which may contain handoffs, prompts, paths, or credentials.
+      const detail = { ...auditDetailOf(args), error: "tool_failed" };
+      audit.record({ actor: "lead-tool", tool, outcome: "error", durationMs: Date.now() - started, detail });
+      throw error;
+    }
+  };
+}
+
+/** Convert one internal outcome to the MCP wire result: text content always; structuredContent additive. */
+function toCallToolResult(outcome: HarnessToolOutcome): CallToolResult {
+  return {
+    content: [{ type: "text", text: outcome.text }],
+    ...(outcome.structured ? { structuredContent: outcome.structured } : {})
+  } as CallToolResult;
+}
+
+/**
+ * Lean canonical discovery over the frozen tool surface: one metadata entry
+ * per registered tool (no schemas, no handlers) for doctor/diagnostics. The
+ * specs array stays the single source of truth this is derived from.
+ */
+export interface HarnessToolCatalogEntry {
+  name: string;
+  title: string;
+  mutating: boolean;
+  description: string;
+}
+
+export function harnessToolCatalog(specs: readonly { name: string; title: string; description: string; annotations: ToolAnnotations }[]): HarnessToolCatalogEntry[] {
+  return specs.map((spec) => ({
+    name: spec.name,
+    title: spec.title,
+    mutating: spec.annotations.readOnlyHint !== true,
+    description: spec.description
+  }));
+}
+
+/**
+ * The canonical frozen lead tool surface (metadata only; codemode composes the
+ * eight tools below and is itself listed). Doctor/diagnostics read this lean
+ * discovery view; a test pins it to the specs the MCP factory actually
+ * registers so it can never drift from the real surface.
+ */
+export const CANONICAL_HARNESS_TOOLS: readonly HarnessToolCatalogEntry[] = [
+  { name: "read_context", title: "Read project context", mutating: false, description: "Read the bounded root CONTEXT.md project guidance, or report that it is absent." },
+  { name: "read_file", title: "Read file", mutating: false, description: "Read a bounded line range from a UTF-8 text file inside the Pi workspace." },
+  { name: "list_directory", title: "List directory", mutating: false, description: "List one directory inside the Pi workspace. Paths are workspace-relative." },
+  { name: "search_workspace", title: "Search workspace", mutating: false, description: "Search text in the Pi workspace using ripgrep when available, with a safe JS fallback." },
+  { name: "repo_map", title: "Repository map", mutating: false, description: "Return a bounded directory tree for the Pi workspace." },
+  { name: "git_status", title: "Git status", mutating: false, description: "Read git status for the Pi workspace." },
+  { name: "git_diff", title: "Git diff", mutating: false, description: "Read the current git diff for the Pi workspace." },
+  { name: "herdr", title: "Herdr harness execution", mutating: true, description: HERDR_TOOL_DESCRIPTION },
+  { name: "codemode", title: "Codemode", mutating: true, description: "Run bounded JavaScript composing the harness tools inside the official @earendil-works/pi-codemode sandbox (codemodeToolDescription)." }
+];
+
+export interface HarnessCodemodeStoreBinding {
+  store: CodemodeStore;
+  /** Authoritative Pi lifecycle identity (Pi session id); undefined = this execution persists nothing. */
+  identity: () => string | undefined;
+}
+
+export function createHarnessMcpFactory(deps: {
+  config: HarnessConfig;
+  workspaceRoot: string;
+  subagent: HerdrMcpAdapter;
+  activity?: McpToolActivity;
+  workflows?: () => Record<WorkflowToggleId, boolean>;
+  /** Durable redacted audit sink (lead tool calls incl. herdr lifecycle + codemode executions). */
+  audit?: AuditRecorder;
+  /** Lifecycle-scoped persistent codemode store binding; absent = codemode runs with no store. */
+  codemode?: HarnessCodemodeStoreBinding;
+}) {
   return (): McpServer => {
     const server = new McpServer({ name: "pi-harness", version: "1.0.0" });
     const workspaceRoot = deps.workspaceRoot;
@@ -325,6 +444,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
 
     // One spec per harness tool: registered on the MCP surface verbatim, then
     // bridged verbatim into the codemode sandbox (schema + handler identical).
+    // Structured content is additive metadata; `text` stays the exact direct-call payload.
     const specs: HarnessToolSpec[] = [
       {
         name: "repo_map",
@@ -332,7 +452,12 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         description: "Return a bounded directory tree for the Pi workspace.",
         schema: z.object({ max_depth: z.number().int().min(1).max(6).optional() }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        run: track(async ({ max_depth }) => text(await repoMap(workspaceRoot, max_depth ?? 3)))
+        outputSchema: z.object({ depth: z.number().int(), lines: z.number().int() }),
+        run: track(async ({ max_depth }) => {
+          const depth = max_depth ?? 3;
+          const tree = await repoMap(workspaceRoot, depth);
+          return text(tree, { depth, lines: tree.split("\n").length });
+        })
       },
       {
         name: "list_directory",
@@ -340,7 +465,11 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         description: "List one directory inside the Pi workspace. Paths are workspace-relative.",
         schema: z.object({ path: z.string().default(".") }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        run: track(async ({ path }) => text((await listDirectory(workspaceRoot, path)).join("\n")))
+        outputSchema: z.object({ entries: z.array(z.string()) }),
+        run: track(async ({ path }) => {
+          const entries = await listDirectory(workspaceRoot, path);
+          return text(entries.join("\n"), { entries });
+        })
       },
       {
         name: "read_context",
@@ -348,7 +477,12 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         description: "Read the bounded root CONTEXT.md project guidance, or report that it is absent.",
         schema: z.object({}),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        run: track(async () => text(await readContextFile(workspaceRoot, limits)))
+        outputSchema: z.object({ present: z.boolean(), lines: z.number().int() }),
+        run: track(async () => {
+          const content = await readContextFile(workspaceRoot, limits);
+          const present = !content.startsWith("No CONTEXT.md");
+          return text(content, { present, lines: content.split("\n").length });
+        })
       },
       {
         name: "read_file",
@@ -360,7 +494,11 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           end_line: z.number().int().positive().optional()
         }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        run: track(async ({ path, start_line, end_line }) => text(await readTextFile(workspaceRoot, path, limits, start_line ?? 1, end_line)))
+        outputSchema: z.object({ path: z.string(), lines: z.number().int() }),
+        run: track(async ({ path, start_line, end_line }) => {
+          const body = await readTextFile(workspaceRoot, path, limits, start_line ?? 1, end_line);
+          return text(body, { path, lines: body.split("\n").length });
+        })
       },
       {
         name: "search_workspace",
@@ -372,7 +510,12 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           max_results: z.number().int().min(1).max(200).optional()
         }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        run: track(async ({ query, glob, max_results }) => text(await searchWorkspace(workspaceRoot, query, max_results ?? 50, glob)))
+        outputSchema: z.object({ matches: z.number().int(), truncated: z.boolean() }),
+        run: track(async ({ query, glob, max_results }) => {
+          const results = await searchWorkspace(workspaceRoot, query, max_results ?? 50, glob);
+          const matches = results.split("\n").filter((line) => line.length > 0).length;
+          return text(results, { matches, truncated: matches >= (max_results ?? 50) });
+        })
       },
       {
         name: "git_status",
@@ -380,7 +523,11 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         description: "Read git status for the Pi workspace.",
         schema: z.object({}),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        run: track(async () => text(await gitStatus(workspaceRoot)))
+        outputSchema: z.object({ changed: z.number().int() }),
+        run: track(async () => {
+          const status = await gitStatus(workspaceRoot);
+          return text(status, { changed: changedFilesFromGitStatus(status).length });
+        })
       },
       {
         name: "git_diff",
@@ -388,7 +535,11 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         description: "Read the current git diff for the Pi workspace.",
         schema: z.object({ staged: z.boolean().optional() }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        run: track(async ({ staged }) => text(await gitDiff(workspaceRoot, staged ?? false)))
+        outputSchema: z.object({ staged: z.boolean(), bytes: z.number().int() }),
+        run: track(async ({ staged }) => {
+          const diff = await gitDiff(workspaceRoot, staged ?? false);
+          return text(diff, { staged: staged ?? false, bytes: diff.length });
+        })
       },
       {
         name: "herdr",
@@ -413,7 +564,8 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
           instructions: herdrText(HERDR_GOAL_MAX).optional()
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
-        run: track(async (args) => {
+        outputSchema: z.looseObject({ action: z.string() }),
+        run: track(async (args): Promise<HarnessToolOutcome> => {
           const { action, goal, workers, gates, decision_graph, worker_model, worker_thinking, handoff, verification_fingerprint, run_id, worker_id, instructions } = args;
           const execution_spec = (args as { execution_spec?: unknown }).execution_spec;
           // Risk-aware fields (v2 handoffs): schema-validated above, consumed only when present.
@@ -428,10 +580,10 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
             // BEFORE the fingerprint, and risk + planning kind join the immutable
             // identity. Gates are optional at every risk; v1 keeps requiring them.
             if (compact_plan !== undefined || standard_plan !== undefined || risk !== undefined || planning_kind !== undefined) {
-              return text({ ok: true, handoff: issueHerdrHandoffV2(goal, workers, gates, risk, planning_kind, { compactPlan: compact_plan, standardPlan: standard_plan, decisionGraph: decision_graph }), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, planning authority, risk, and planning_kind." });
+              return text({ ok: true, handoff: issueHerdrHandoffV2(goal, workers, gates, risk, planning_kind, { compactPlan: compact_plan, standardPlan: standard_plan, decisionGraph: decision_graph }), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, planning authority, risk, and planning_kind." }, { action, ok: true });
             }
             if (!gates || (!decision_graph && execution_spec === undefined)) throw new Error("herdr plan requires goal, workers, decision_graph, and planning gates {graph, handoff, critique}.");
-            return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and decision_graph." });
+            return text({ ok: true, handoff: issueHerdrHandoff(goal, workers, gates, execution_spec, decision_graph), note: "Pass this handoff verbatim to herdr action=run together with the exact same goal, workers, and decision_graph." }, { action, ok: true });
           }
           if (action === "run") {
             // Workflow enforcement (fail-closed): effort lock gates the per-run thinking argument.
@@ -444,17 +596,18 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
             // goal/workers/spec, so run-time args can never drift from the plan.
             const authorized = validateHerdrRunInput({ goal, workers, execution_spec, decision_graph, compact_plan, standard_plan, risk, planning_kind, handoff });
             const run = await deps.subagent.run({ goal, workers: authorized.workers, handoff, ...(worker_model ? { workerModel: worker_model } : {}), ...(worker_thinking ? { workerThinking: worker_thinking } : {}) });
-            return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) });
+            return text({ ok: true, run_id: run.id, status: run.status, workers: run.workers.map((worker) => ({ id: worker.id, state: worker.state })) }, { action, ok: true, run_id: run.id, status: run.status, workers: run.workers.length });
           }
           if (action === "status") {
             const result = await deps.subagent.status(run_id);
-            return text(result);
+            const runCount = Array.isArray(result) ? result.length : 1;
+            return text(result, { action, run_id, run_count: runCount });
           }
           if (action === "correct") {
             if (!run_id || !worker_id || !instructions) throw new Error("herdr correct requires run_id, worker_id, and instructions.");
             const run = await deps.subagent.correct(run_id, worker_id, instructions);
             const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
-            return text({ ok: true, run_id: run.id, status: run.status, corrections: task?.corrections ?? 0, accepted: task?.acceptedAt ? true : undefined });
+            return text({ ok: true, run_id: run.id, status: run.status, corrections: task?.corrections ?? 0, accepted: task?.acceptedAt ? true : undefined }, { action, ok: true, run_id: run.id, worker_id, corrections: task?.corrections ?? 0 });
           }
           if (action === "accept") {
             if (!run_id || !worker_id) throw new Error("herdr accept requires run_id and worker_id.");
@@ -487,7 +640,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
             }
             const run = await deps.subagent.accept(run_id, worker_id);
             const task = run?.tasks?.find((worker: { id: string }) => worker.id === worker_id);
-            return text({ ok: true, run_id: run.id, status: run.status, worker: { id: worker_id, state: task?.status ?? "completed", accepted_at: task?.acceptedAt } });
+            return text({ ok: true, run_id: run.id, status: run.status, worker: { id: worker_id, state: task?.status ?? "completed", accepted_at: task?.acceptedAt } }, { action, ok: true, run_id: run.id, worker_id, state: task?.status ?? "completed" });
           }
           if (action === "verify") {
             if (!run_id || !handoff?.trim()) throw new Error("herdr verify requires run_id and the exact Pi-issued handoff.");
@@ -495,16 +648,24 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
             // Never correct/accept/stop/shutdown and never adapter.status
             // (whose implementation can auto-shutdown a run after acceptance).
             const report = await runHerdrVerification({ runId: run_id, handoff, subagent: deps.subagent, workspaceRoot });
-            return text({ action: "verify", run_id, verification_fingerprint: verificationFingerprint(report), report });
+            return text({ action: "verify", run_id, verification_fingerprint: verificationFingerprint(report), report }, { action, run_id });
           }
           // stop
           const result = await deps.subagent.stop(run_id);
-          return text({ ok: true, runs: result });
+          return text({ ok: true, runs: result }, { action, ok: true });
         })
       }
     ];
-    for (const spec of specs) {
-      server.registerTool(spec.name, { title: spec.title, description: spec.description, inputSchema: spec.schema, annotations: spec.annotations }, spec.run);
+    // The audit wrapper sits at the single shared run seam: direct MCP calls
+    // and codemode nested calls are audited identically (specs stay the source
+    // of truth for both surfaces plus the structured view).
+    const auditedSpecs: HarnessToolSpec[] = specs.map((spec) => ({ ...spec, run: withAudit(deps.audit, spec.name, spec.run) }));
+    for (const spec of auditedSpecs) {
+      server.registerTool(
+        spec.name,
+        { title: spec.title, description: spec.description, inputSchema: spec.schema, annotations: spec.annotations, ...(spec.outputSchema ? { outputSchema: spec.outputSchema } : {}) },
+        async (args: any) => toCallToolResult(await spec.run(args))
+      );
     }
 
     // Codemode: Lead-written JavaScript composes the harness tools above inside
@@ -512,7 +673,7 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
     // re-enter the exact same specs (schema parse + tracked handler), so herdr
     // runs keep their plan binding and explicit confirmation, and only the
     // script's own output/return value reaches the Lead context.
-    const codemodeBridges: HarnessCodemodeBridge[] = specs.map((spec) => ({
+    const codemodeBridges: HarnessCodemodeBridge[] = auditedSpecs.map((spec) => ({
       name: spec.name as HarnessCodemodeBridge["name"],
       description: spec.description,
       schema: spec.schema,
@@ -527,13 +688,56 @@ export function createHarnessMcpFactory(deps: { config: HarnessConfig; workspace
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
       track(async ({ code }) => {
-        const result = await runHarnessCodemode({ bridges: codemodeBridges, code });
-        return { content: result.content, ...(result.isError ? { isError: true } : {}) };
+        const started = Date.now();
+        try {
+          // Lifecycle-scoped persistence: the script starts from the identity's
+          // snapshot and commits only through the validated store seam. Without
+          // an authoritative identity the session is volatile (writes discarded).
+          let storeSession: HarnessCodemodeStoreSession | undefined;
+          if (deps.codemode) {
+            const identity = deps.codemode.identity();
+            if (identity) {
+              const store = deps.codemode.store;
+              let snapshot: CodemodeStoreSnapshot = {};
+              storeSession = {
+                load: async () => { snapshot = await store.load(identity); return snapshot; },
+                commit: async (writes) => { await store.commit(identity, snapshot, writes); return "committed"; }
+              };
+            } else {
+              storeSession = { load: async () => ({}), commit: async () => "discarded" };
+            }
+          }
+          const result = await runHarnessCodemode({ bridges: codemodeBridges, code, ...(storeSession ? { store: storeSession } : {}) });
+          // Audit: bounded execution facts only — never script source, output, or store contents.
+          deps.audit?.record({
+            actor: "codemode",
+            tool: "codemode",
+            outcome: result.ok ? "ok" : "error",
+            durationMs: Date.now() - started,
+            detail: { store: result.storePersisted }
+          });
+          return {
+            content: result.content,
+            ...(result.isError ? { isError: true } : {}),
+            ...(result.ok ? { structuredContent: { ok: result.ok, store_persisted: result.storePersisted } } : {})
+          };
+        } catch (error) {
+          deps.audit?.record({ actor: "codemode", tool: "codemode", outcome: "error", durationMs: Date.now() - started, detail: { error: "codemode_failed" } });
+          throw error;
+        }
       })
     );
 
     return server;
   };
+}
+
+/** Config slice the HTTP server needs; mcpAuthToken is optional (loopback default needs none). */
+export interface HarnessMcpHttpConfig {
+  mcpHost: string;
+  mcpPort: number;
+  mcpPath: string;
+  mcpAuthToken?: string | undefined;
 }
 
 export class HarnessMcpHttpServer {
@@ -547,7 +751,7 @@ export class HarnessMcpHttpServer {
   private transitions: Promise<unknown> = Promise.resolve();
 
   constructor(
-    private readonly config: Pick<HarnessConfig, "mcpHost" | "mcpPort" | "mcpPath">,
+    private readonly config: HarnessMcpHttpConfig,
     private readonly factory: () => McpServer
   ) {}
 
@@ -572,12 +776,22 @@ export class HarnessMcpHttpServer {
   async start(): Promise<void> {
     return this.transition(async () => {
       if (this.app) return;
+      // The HTTP server owns request auth: loopback (Secure MCP Tunnel default)
+      // needs no token; direct non-loopback exposure fails closed here without
+      // one, and a configured token is enforced on every /mcp request below.
+      assertSafeMcpExposure(this.config);
+      const token = this.config.mcpAuthToken?.trim() || undefined;
       const handler = createMcpHandler(this.factory);
       const nodeHandler = toNodeHandler(handler);
       const app = Fastify({ logger: false });
 
       app.get("/healthz", async () => ({ ok: true, name: "pi-harness" }));
       app.all(this.config.mcpPath, async (request, reply) => {
+        if (token && !bearerTokenMatches(bearerTokenFromHeader(request.headers.authorization), token)) {
+          // Fail closed: never forward an unauthenticated request to the MCP handler.
+          reply.code(401).send({ ok: false, error: "unauthorized: a valid Authorization: Bearer token is required on this endpoint" });
+          return;
+        }
         // MCP streamable HTTP owns raw response lifecycle; prevent Fastify from
         // closing the SSE stream before the handler finishes writing.
         reply.hijack();

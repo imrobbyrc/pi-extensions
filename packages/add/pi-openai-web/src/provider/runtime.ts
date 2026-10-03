@@ -16,6 +16,7 @@ import { descriptorKey } from "./model-ids.js";
 import { canonicalHistoryFallback, checkpointIsFrom, compactionBootstrapPrompt, compactionDecision, DEFAULT_COMPACTION_CONFIG, estimateTokens, HANDOFF_BRIEF_PROMPT, parseCompactionCheckpoint, type CompactionConfig } from "./compaction.js";
 import { SessionStore } from "./session-store.js";
 import type { OpenAIWebModelDescriptor } from "./types.js";
+import { resolveModelRoute, type ModelRoutes } from "./routes.js";
 import { buildLeadContract, buildLeadProtocolReminder, type OrchestratorConfig } from "./orchestrator.js";
 import { CAVEMAN_CONTINUATION_REMINDER, CAVEMAN_FULL_CONTRACT } from "./caveman.js";
 import type { ProviderResumeMetadata, ProviderResumeStore } from "./resume.js";
@@ -98,6 +99,8 @@ export interface OpenAIWebRuntimeDeps {
   isHarnessActive?: () => Promise<boolean>;
   /** Optional durable identity store for reconnecting provider browser turns. */
   resumeStore?: ProviderResumeStore;
+  /** Optional deterministic alias -> exact catalog id routes; resolution stays exact (no ranking, no guessing). */
+  routes?: () => ModelRoutes;
   /** Injectable CDP attach for tests; production defaults to the page attach. */
   attachClient?: typeof attach;
 }
@@ -261,10 +264,14 @@ export class OpenAIWebRuntime {
   }
 
   resolveDescriptor(id: string): OpenAIWebModelDescriptor {
-    const descriptor = this.deps.catalog.resolve(id);
+    // Route aliases are deterministic pass-throughs: the alias maps to one exact
+    // catalog id and the EXACT descriptor path (catalog.resolve) stays authoritative.
+    const routed = resolveModelRoute(this.deps.routes?.() ?? {}, id);
+    const descriptor = this.deps.catalog.resolve(routed.id);
     if (!descriptor) {
       const known = this.deps.catalog.models.map(model => model.id).slice(0, 12).join(", ");
-      throw new Error(`unknown_model: openai-web/${id} is not in the current catalog${known ? ` (known: ${known})` : " (catalog is empty; run /openai-web models refresh)"}.`);
+      const via = routed.viaAlias ? ` (route alias ${JSON.stringify(routed.viaAlias)})` : "";
+      throw new Error(`unknown_model: openai-web/${id}${via} is not in the current catalog${known ? ` (known: ${known})` : " (catalog is empty; run /openai-web models refresh)"}.`);
     }
     return descriptor;
   }

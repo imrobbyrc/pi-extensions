@@ -10,10 +10,12 @@
 4. `herdr run` requires explicit human confirmation in Pi's TUI. Headless runs fail closed unless `harnessAutoApproveHerdrRun` is explicitly configured; an explicit human rejection is final even then.
 5. Workers are Herdr-managed Pi agents only (`--kind pi`). Worker source mutations outside the approved `owns` scope — or with ambiguous ownership — fail closed against the run baseline.
 6. Never collect, export, or persist ChatGPT cookies/passwords. The configured browser owns the authenticated profile.
-7. Keep the MCP server bound to loopback by default. The local server has no built-in OAuth/pairing; use a secure tunnel/access layer.
-8. Resolve real paths and reject traversal/symlink escape outside the workspace; keep reads bounded (line/byte caps, generated/vendor paths skipped).
-9. Do not add output scraping as a primary data channel; the MCP tool surface is the supported path.
-10. Shutdown reaps every Herdr pane the session owns; interrupted runs are never replayed automatically after a restart.
+7. Keep the MCP server bound to loopback by default. Loopback remains compatible with the OpenAI Secure MCP Tunnel without a bearer token. Direct non-loopback binds fail closed unless `PLANNER_MCP_AUTH_TOKEN` (or `mcpAuthToken`) is set; the HTTP server enforces `Authorization: Bearer` on every MCP request. OAuth/pairing is not implemented.
+8. Codemode persistence uses only the official `store`/`storeWrites` API, is scoped to the Pi session identity, and commits atomically after successful valid execution. Invalid, failed, timed-out, aborted, or budget-exhausted scripts never persist writes.
+9. Audit records are bounded redacted metadata only; credentials/tokens, handoffs, worker prompts, Codemode source, and file contents are excluded by construction.
+10. Resolve real paths and reject traversal/symlink escape outside the workspace; keep reads bounded (line/byte caps, generated/vendor paths skipped).
+11. Do not add output scraping as a primary data channel; the MCP tool surface is the supported path.
+12. Shutdown reaps every Herdr pane the session owns; interrupted runs are never replayed automatically after a restart.
 
 ## Threats intentionally mitigated
 
@@ -26,7 +28,7 @@
 
 ## Threats not solved
 
-- MCP endpoint authentication and authorization beyond the tunnel,
+- Per-tool authorization or OAuth/pairing beyond the optional bearer token,
 - prompt injection inside repository content reaching the Lead,
 - a compromised tunnel/access provider,
 - multiple simultaneous users/workspaces,
