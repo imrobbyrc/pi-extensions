@@ -172,7 +172,9 @@ export class SubagentsWidget implements Component {
 		}
 		const hidden = total - shown;
 		if (hidden > 0) {
-			lines.push(truncateToWidth(`${this.theme.fg("dim", "└─")} ${this.theme.fg("dim", `+${hidden} more`)}`, width, "…"));
+			lines.push(
+				truncateToWidth(`${this.theme.fg("dim", "└─")} ${this.theme.fg("dim", `+${hidden} more`)}`, width, "…"),
+			);
 		} else if (lines.length > 1) {
 			const last = lines[lines.length - 1];
 			if (last) lines[lines.length - 1] = last.replace("├─", "└─");

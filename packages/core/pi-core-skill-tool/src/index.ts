@@ -17,8 +17,13 @@
  * is stripped and the shared skill list is left untouched for `/skill:name`.
  */
 
-import { parseFrontmatter, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
+import {
+	type AgentToolUpdateCallback,
+	type ExtensionAPI,
+	type ExtensionContext,
+	parseFrontmatter,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const CATALOG_DESC_MAX = 100;
@@ -76,10 +81,17 @@ function stripSkillsCatalog(systemPrompt: string): string | undefined {
 	const close = systemPrompt.indexOf(closeTag, start);
 	if (start < 0 || close < 0) return undefined;
 
-	// Remove heading/instructions immediately before catalog, without relying on their wording.
+	// Remove the catalog's whole introductory paragraph without relying on wording.
 	const sectionStart = systemPrompt.lastIndexOf("\n\n", start);
+	const introStart =
+		sectionStart < 0 ? -1 : systemPrompt.lastIndexOf("\n\n", sectionStart - 1);
 	const end = close + closeTag.length;
-	return systemPrompt.slice(0, sectionStart < 0 ? start : sectionStart) + systemPrompt.slice(end);
+	return (
+		systemPrompt.slice(
+			0,
+			introStart < 0 ? (sectionStart < 0 ? start : sectionStart) : introStart,
+		) + systemPrompt.slice(end)
+	);
 }
 
 /**
@@ -96,14 +108,17 @@ function isStructuredPromptHost(event: object): boolean {
 function clearStructuredSkillCatalog(options: StructuredPromptOptions): void {
 	try {
 		if (Array.isArray(options.skills)) options.skills.length = 0;
-		if (options.sections !== undefined && options.sections !== null) delete options.sections.skills;
+		if (options.sections !== undefined && options.sections !== null)
+			delete options.sections.skills;
 	} catch {
 		// Frozen options: leave the catalog in place and warn from the caller.
 	}
 }
 
 function stripRenderedSkillCatalog(prompt: string): string {
-	const stripped = prompt.replace(RENDERED_CATALOG, "").replace(EMPTY_SKILLS_SECTION, "");
+	const stripped = prompt
+		.replace(RENDERED_CATALOG, "")
+		.replace(EMPTY_SKILLS_SECTION, "");
 	if (stripped !== prompt) return stripped;
 	// pi's intro wording changed (or the catalog is already partially stripped):
 	// fall back to tag-anchored removal so the catalog never leaks through.
@@ -122,7 +137,8 @@ export default async function (pi: ExtensionAPI) {
 
 	// ── Strip built-in catalog from system prompt (intro + block) ──────────
 	pi.on("before_agent_start", (event) => {
-		const options = event.systemPromptOptions as unknown as StructuredPromptOptions;
+		const options =
+			event.systemPromptOptions as unknown as StructuredPromptOptions;
 		const skills = (options.skills ?? []) as SkillEntry[];
 		if (skills.length === 0) return; // no catalog → nothing to strip
 		// Copy the catalog before any removal: the tool description needs it.
@@ -137,9 +153,10 @@ export default async function (pi: ExtensionAPI) {
 		if (isStructuredPromptHost(event)) {
 			clearStructuredSkillCatalog(options);
 			const rendered = event.systemPrompt;
-			const stripped = typeof options.forceSystemPrompt === "string"
-				? stripRenderedSkillCatalog(rendered)
-				: rendered;
+			const stripped =
+				typeof options.forceSystemPrompt === "string"
+					? stripRenderedSkillCatalog(rendered)
+					: rendered;
 			if (stripped.includes(CATALOG_TAG)) warnCatalogRemains();
 			registerToolOnce();
 			// Only replace a prompt another extension already made opaque.
@@ -188,17 +205,35 @@ export default async function (pi: ExtensionAPI) {
 				"</available_skills>",
 			].join("\n"),
 			parameters: Type.Object({
-				name: Type.String({ description: "The skill identifier from available_skills" }),
+				name: Type.String({
+					description: "The skill identifier from available_skills",
+				}),
 			}),
-			async execute(_toolCallId: string, params: { name?: unknown }, _signal: AbortSignal | undefined, _onUpdate: AgentToolUpdateCallback<unknown> | undefined, _ctx: ExtensionContext): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
+			async execute(
+				_toolCallId: string,
+				params: { name?: unknown },
+				_signal: AbortSignal | undefined,
+				_onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+				_ctx: ExtensionContext,
+			): Promise<{
+				content: Array<{ type: "text"; text: string }>;
+				details: Record<string, unknown>;
+			}> {
 				const name = typeof params.name === "string" ? params.name : "";
-				const skill = catalog.find((s) => !s.disableModelInvocation && s.name === name);
+				const skill = catalog.find(
+					(s) => !s.disableModelInvocation && s.name === name,
+				);
 				if (!skill) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Skill "${name}" not found. Available skills: ${catalog.filter((s) => !s.disableModelInvocation).map((s) => s.name).join(", ") || "(none)"}`,
+								text: `Skill "${name}" not found. Available skills: ${
+									catalog
+										.filter((s) => !s.disableModelInvocation)
+										.map((s) => s.name)
+										.join(", ") || "(none)"
+								}`,
 							},
 						],
 						details: {},

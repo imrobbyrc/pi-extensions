@@ -296,7 +296,7 @@ describe("structured prompt host (pi >= 0.99)", () => {
 		});
 	}
 
-	test("warns only when the catalog actually survives (forced prompt)", async () => {
+	test("strips the catalog from a forced prompt when structured options cannot", async () => {
 		const { handlers } = await loadExtension();
 		const { event, options } = modernHost({
 			skills: [skill()],
@@ -306,9 +306,9 @@ describe("structured prompt host (pi >= 0.99)", () => {
 
 		const { result, warnings } = await runHandler(handlers, event);
 
-		expect(result).toBeUndefined();
+		expect(result?.systemPrompt).toBe("FORCED PROMPT\n");
 		expect(options.skills).toHaveLength(0);
-		expect(warnings).toHaveLength(1);
+		expect(warnings).toEqual([]);
 	});
 
 	test("repeated starts strip each fresh options copy and register the tool once", async () => {
@@ -389,7 +389,7 @@ describe("legacy prompt-string host (pi 0.84.x)", () => {
 		expect(warnings).toEqual([]);
 	});
 
-	test("warns and leaves the prompt when the catalog format is unknown", async () => {
+	test("tag-anchored fallback strips catalog when intro wording changes", async () => {
 		const { handlers } = await loadExtension();
 		const shared = [skill()];
 		const unknownCatalog = legacyCatalogBlock("read").replace(
@@ -401,10 +401,9 @@ describe("legacy prompt-string host (pi 0.84.x)", () => {
 
 		const { result, warnings } = await runHandler(handlers, event);
 
-		expect(result).toBeUndefined();
-		expect(event.systemPrompt).toBe(prompt);
+		expect(result?.systemPrompt).toBe("KEEP-BEFORE\n\nKEEP-AFTER");
 		expect(shared).toHaveLength(1);
-		expect(warnings).toHaveLength(1);
+		expect(warnings).toEqual([]);
 	});
 
 	test("does not warn when discovered skills are not rendered in the prompt", async () => {

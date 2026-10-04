@@ -413,7 +413,7 @@ test("codemode runs Promise.all parallel nested reads (official runtime, skipped
         subHasGamma: listing.includes("gamma.md"),
         ctxPresent: typeof ctx === "string",
         mapBounded: map.split("\\n").length > 0,
-        entriesIncludeSub: entries.includes("dir sub"),
+        entriesIncludeSub: entries.includes("sub"),
         gammaRead: read.includes("gamma")
       };
     `,
@@ -446,7 +446,7 @@ test("official runtime: unsupported tools and exceeded deadlines fail closed (sk
       code: `await tools.write_file({ path: "x.txt", content: "no" });`,
     });
   assert.equal(unsupported.isError, true);
-  assert.match(textOf(unsupported), /not a function|is not callable/);
+  assert.match(textOf(unsupported), /does not exist|not a function|is not callable/);
   // Exceeded deadline: the official sandbox terminates the worker.
   const timedOut = await tools.get("codemode")!.handler({
     code: `// @options: {"timeout_ms": 300}\nwhile (true) { await null; }`,

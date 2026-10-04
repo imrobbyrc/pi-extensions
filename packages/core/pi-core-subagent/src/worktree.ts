@@ -1,6 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { hostname, uptime } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -301,7 +310,9 @@ export function claimWorktree(wt: Worktree): void {
 	const marker = ownerFile(wt.path);
 	const temp = `${marker}.${randomUUID()}.tmp`;
 	try {
-		writeFileSync(temp, JSON.stringify({ pid: process.pid, host: hostname(), boot: bootId(), at: Date.now() }), { mode: 0o600 });
+		writeFileSync(temp, JSON.stringify({ pid: process.pid, host: hostname(), boot: bootId(), at: Date.now() }), {
+			mode: 0o600,
+		});
 		renameSync(temp, marker);
 	} catch {
 		rmSync(temp, { force: true });
