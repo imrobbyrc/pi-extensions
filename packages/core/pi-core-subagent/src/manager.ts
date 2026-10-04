@@ -3,7 +3,13 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync,
 import { rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, sep } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	type AssistantMessage,
+	clampThinkingLevel,
+	getSupportedThinkingLevels,
+	type Model,
+} from "@earendil-works/pi-ai";
 import {
 	type AgentSessionEvent,
 	createAgentSession,
@@ -24,6 +30,7 @@ import {
 	getFirstText,
 	isStartupFailure,
 	isTalking,
+	makeAskNotice,
 	makeNotice,
 	makeTaskNotice,
 	SubagentsWidget,
@@ -40,6 +47,7 @@ import {
 	runHerdrChild,
 } from "./herdr.ts";
 import { createMailbox, type Mailbox } from "./mailbox.ts";
+import { chooseModel, resolveChildModel } from "./models.ts";
 import type { SubagentParamsShape, TaskInput } from "./schemas.ts";
 import {
 	MAX_TASKS,
@@ -72,8 +80,8 @@ const DEFAULT_RUNTIME_MS = 3_600_000;
 const UNLIMITED_RUNTIME_MS = 21_600_000;
 const PARENT_REPLY_TIMEOUT_MS = 600_000;
 const PARKED_MSG_CAP = 24;
-const READONLY_TOOLS = ["read", "grep", "find", "ls"];
-const WRITE_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"];
+const READONLY_TOOLS = ["read", "grep", "find", "ls", "codemode"];
+const WRITE_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write", "codemode"];
 const WRITE_CAPABLE = ["bash", "edit", "write"];
 const SAFE_TASK_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const WIDGET_THROTTLE_MS = 150;
@@ -89,6 +97,25 @@ export const WORKER_EXECUTION_INVARIANT =
 
 function newId(prefix: string): string {
 	return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+type ChildExtensionFactories = ConstructorParameters<typeof DefaultResourceLoader>[0]["extensionFactories"];
+
+/**
+ * Children run with `noExtensions`, so they get none of the configured extensions — codemode is the
+ * one exception, because it is how a child batches tool calls. `createCodemodeExtension()` is the
+ * supported factory (pi >= 1.0); hosts that do not export it simply give children no codemode.
+ */
+async function codemodeFactories(): Promise<ChildExtensionFactories> {
+	try {
+		const host = (await import("@earendil-works/pi-coding-agent")) as unknown as {
+			createCodemodeExtension?: () => unknown;
+		};
+		const factory = host.createCodemodeExtension?.();
+		return factory ? ([factory] as ChildExtensionFactories) : [];
+	} catch {
+		return [];
+	}
 }
 function emptyUsage(): UsageStats {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -156,37 +183,48 @@ function updateUsageFromMessage(task: TaskSnapshot, message: AssistantMessage): 
 export function cloneRun(run: RunSnapshot): RunSnapshot {
 	return JSON.parse(JSON.stringify(run)) as RunSnapshot;
 }
-export function resolveChildModel(ctx: ExtensionContext, explicit: string | undefined) {
-	if (!explicit?.trim()) return ctx.model;
-	const ref = explicit.trim();
-	if (!ctx.modelRegistry) return ctx.model;
-	const available = ctx.modelRegistry.getAvailable();
-	const sessionProvider = ctx.model?.provider;
-	if (sessionProvider && !ref.includes("/")) {
-		const own = available.filter((m) => m.provider === sessionProvider);
-		const hit = own.find((m) => m.id === ref) ?? own.find((m) => m.id.endsWith(`/${ref}`));
-		if (hit) return hit;
-	}
+/**
+ * A resumed task keeps its stored thinking level, clamped to what the target model accepts — a
+ * resume that swaps model must not fail on an effort the new model does not define.
+ */
+export function clampResumeThinking(
+	model: Model<Api> | undefined,
+	thinking: ThinkingLevel | undefined,
+): ThinkingLevel | undefined {
+	if (!thinking || !model) return thinking;
+	return clampThinkingLevel(model, thinking) as ThinkingLevel;
+}
 
-	const byId = available.find((m) => m.id === ref);
-	if (byId) return byId;
-	for (let slash = ref.indexOf("/"); slash > 0; slash = ref.indexOf("/", slash + 1)) {
-		const model = ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1));
-		if (model) return model;
-	}
-	throw new Error(`Model not found: ${ref}`);
+const PROBE_THINKING_LEVELS: ThinkingLevel[] = ["low", "minimal", "medium", "high", "xhigh", "max"];
+
+/**
+ * Thinking level for the usability probe: exactly what the child session will send — the clamped
+ * requested level, or the cheapest the model accepts when none was requested. Probing without a
+ * level makes adaptive-thinking providers reject the request (9router claude models answer
+ * "thinking.type.disabled is not supported"), which used to make every preflight fail and fall
+ * back to the session model.
+ */
+function probeThinking(model: Model<Api>, thinking?: string): ThinkingLevel | undefined {
+	if (!model.reasoning) return undefined;
+	const supported = getSupportedThinkingLevels(model);
+	if (thinking && thinking !== "off") return clampThinkingLevel(model, thinking as ThinkingLevel);
+	// the child clamps an unsupported "off" up to its cheapest level, so probe that instead
+	if (thinking === "off") return supported.includes("off") ? undefined : supported[0];
+	return PROBE_THINKING_LEVELS.find((level) => supported.includes(level));
 }
 
 async function probeModel(
 	ctx: ExtensionContext,
 	model: Model<Api>,
 	signal: AbortSignal | undefined,
+	thinking?: string,
 ): Promise<string | undefined> {
 	try {
+		const reasoningEffort = probeThinking(model, thinking);
 		const reply = await ctx.modelRegistry.complete(
 			model,
 			{ messages: [{ role: "user", content: "ping", timestamp: Date.now() }] },
-			{ maxTokens: 16, signal },
+			{ maxTokens: 16, signal, ...(reasoningEffort ? { reasoningEffort } : {}) },
 		);
 		return reply.stopReason === "error" ? (reply.errorMessage ?? "provider returned an error") : undefined;
 	} catch (err) {
@@ -198,12 +236,18 @@ export async function ensureUsableModel(
 	ctx: ExtensionContext,
 	model: Model<Api> | undefined,
 	signal: AbortSignal | undefined,
+	thinking?: string,
 ): Promise<{ model: Model<Api> | undefined; note?: string }> {
 	const session = ctx.model;
 	if (!model || !ctx.modelRegistry) return { model };
 	if (session && model.provider === session.provider && model.id === session.id) return { model };
-	const error = await probeModel(ctx, model, signal);
+	const error = await probeModel(ctx, model, signal, thinking);
 	if (!error) return { model };
+	if (model.provider === "opencode-go" && /MissingSessionID|x-opencode-session/i.test(error)) {
+		// ponytail: opencode-go rejects stateless probes but accepts AgentSession requests, which add the session header.
+		// Upgrade path: remove this exception when modelRegistry.complete can carry AgentSession request transforms.
+		return { model, note: `preflight unavailable (${error}); child session will validate the model` };
+	}
 	if (!session) throw new Error(`Model ${model.provider}/${model.id} is unusable: ${error}`);
 	return {
 		model: session,
@@ -398,10 +442,10 @@ export class SubagentManager {
 		return false;
 	}
 
-	clearWidget(ctx: ExtensionContext): void {
+	clearWidget(ctx?: ExtensionContext): void {
 		this.widgetRuns = [];
 		this.widgetTui = null;
-		if (ctx.hasUI) {
+		if (ctx?.hasUI) {
 			try {
 				ctx.ui.setWidget("subagents", undefined);
 			} catch {}
@@ -628,24 +672,32 @@ export class SubagentManager {
 	private notifyParent(
 		run: RunSnapshot,
 		kind: "completed" | "failed" | "aborted" | "asked",
-		extra?: { taskId?: string; question?: string },
+		extra?: { taskId?: string; agent?: string; question?: string; urgent?: boolean },
 	): void {
 		if (kind !== "asked" && run.awaited) return;
 		// single-task completed run: the task notice already said everything (failure paths may not have notified per-task)
 		if (kind === "completed" && run.tasks.length === 1 && run.notifyPerTask) return;
-		const body =
-			kind === "asked"
-				? `A subagent is asking you a question (task ${extra?.taskId}): ${extra?.question ?? ""}\nReply with reply_subagent(runId: "${run.id}", taskId: "${extra?.taskId}", message: ...).`
-				: makeNotice(run, kind);
+		const body = kind === "asked" ? makeAskNotice(run, extra ?? {}) : makeNotice(run, kind);
+		// asks steer: the leader sees the question during its turn and the urgent flag tells it whether to
+		// answer now or after the current step. Failures steer for the same reason — a broken result must
+		// not be consumed. Completions and aborts queue as follow-ups.
 		try {
-			this.pi.sendUserMessage(body, { deliverAs: kind === "failed" ? "steer" : "followUp" });
+			this.pi.sendUserMessage(body, {
+				deliverAs: kind === "completed" || kind === "aborted" ? "followUp" : "steer",
+			});
 		} catch {}
-		this.emit("subagent:notification", { runId: run.id, kind, body });
+		this.emit("subagent:notification", { runId: run.id, taskId: extra?.taskId, kind, body });
 	}
 
 	private widgetTui: TUI | null = null;
+
+	/** Settled runs are history (subagent_status/result still reach them) — the widget shows live work only. */
+	private pruneSettledWidget(): void {
+		this.widgetRuns = this.widgetRuns.filter((r) => !TERMINAL.includes(r.status));
+	}
 	private upsertWidgetRun(run: RunSnapshot | undefined): void {
-		if (!run) return;
+		this.pruneSettledWidget();
+		if (!run || TERMINAL.includes(run.status)) return;
 		const idx = this.widgetRuns.findIndex((r) => r.id === run.id);
 		if (idx >= 0) this.widgetRuns[idx] = run;
 		else this.widgetRuns.push(run);
@@ -685,12 +737,17 @@ export class SubagentManager {
 				this.widgetTimers.delete(run.id);
 			}
 		}
-		if (!run || this.widgetRuns.length === 0) return;
-		if (ctx?.hasUI) {
-			this.ensureWidget(ctx);
-			this.widgetTui?.requestRender();
+		this.pruneSettledWidget();
+		if (this.widgetRuns.length === 0) {
+			if (this.widgetTui) this.clearWidget(ctx);
+		} else {
+			if (ctx?.hasUI) {
+				this.ensureWidget(ctx);
+				this.widgetTui?.requestRender();
+			}
+			this.maybePulse(ctx);
 		}
-		this.maybePulse(ctx);
+		if (!run) return;
 
 		onUpdate?.({
 			content: [
@@ -737,14 +794,14 @@ export class SubagentManager {
 
 	private makeChildHandlers(run: RunSnapshot, task: TaskSnapshot, ctx: ExtensionContext): ChildHandlers {
 		return {
-			onAskParent: async (_taskId, question) => {
+			onAskParent: async (_taskId, question, urgent) => {
 				if (TERMINAL.includes(task.status)) {
 					return "(your task has already ended — stop work and return immediately)";
 				}
 				this.updateTask(run, task, { status: "awaiting_parent" }, ctx);
 
 				if (!this.collectParked(run.id, { kind: "ask", taskId: task.id, agent: task.agent, text: question })) {
-					this.notifyParent(run, "asked", { taskId: task.id, question });
+					this.notifyParent(run, "asked", { taskId: task.id, agent: task.agent, question, urgent });
 				}
 
 				const reply = await this.awaitParentReply(run.id, task.id, PARENT_REPLY_TIMEOUT_MS);
@@ -924,10 +981,10 @@ export class SubagentManager {
 
 		let model: Model<Api> | undefined;
 		try {
-			model = resolveChildModel(ctx, file?.model ?? input.model);
+			model = resolveChildModel(ctx, chooseModel(file, input.model).requested);
 			validateThinking(model, thinking);
 
-			const checked = await ensureUsableModel(ctx, model, signal);
+			const checked = await ensureUsableModel(ctx, model, signal, thinking);
 			model = checked.model;
 			if (checked.note) {
 				task.modelNote = checked.note;
@@ -1012,6 +1069,7 @@ export class SubagentManager {
 					task: input.task,
 
 					model: model?.id ?? input.model,
+					provider: model?.provider,
 					thinking,
 					tools,
 				},
@@ -1032,7 +1090,7 @@ export class SubagentManager {
 			const worktreeNote = wt
 				? ` You work in an isolated git worktree (branch ${wt.branch})${task.stackedOn ? `, stacked on ${task.stackedOn} (its changes are already in your tree)` : ""}. Never run git commands that switch branches, create branches, or move the worktree (git switch/checkout/branch/worktree). The extension commits your changes when you finish. git status/diff are fine for inspecting your own changes. node_modules is a SHARED symlink to the main checkout: never install, upgrade, or delete dependencies (no npm/bun/yarn/pnpm install, no \`rm -rf node_modules\`) — those writes escape your worktree and damage the user's project. If the task truly needs a dependency change, edit the manifest only and say so in your answer.`
 				: "";
-			const subagentInstruction = `You are running as a subagent. Your bash tool already executes in the project working directory — never prefix commands with \`cd\`. Do not call subagent/delegation tools unless the parent explicitly asks. Return a concise final answer. You MAY use ask_parent only when truly blocked on information only the parent has; notify_parent for one-way updates; send_agent_message/poll_agent_messages to coordinate with siblings. Your mailbox address and siblings: ${task.roster ?? "(none)"}. Use the exact task ids (e.g. task_2) as send_agent_message targets. Siblings run independently and may start late or finish early — never block indefinitely on their replies: poll at most 5 times, then proceed with your best judgment. A gated sibling (marked ↳ waits in the graph) may not be running yet; do not wait for it. An unanswered ask_parent times out after 10 minutes — proceed with your best judgment then. When your work is done, call notify_parent ONCE with a concise result summary — key findings, verdicts, file:line evidence — so the leader can start consuming your output before the run finishes.${worktreeNote} ${WORKER_EXECUTION_INVARIANT}`;
+			const subagentInstruction = `You are running as a subagent. Your bash tool already executes in the project working directory — never prefix commands with \`cd\`. Do not call subagent/delegation tools unless the parent explicitly asks. Return a concise final answer. You MAY use ask_parent only when truly blocked on information only the parent has (set urgent: true only when nothing else can proceed while you wait); notify_parent for one-way updates; send_agent_message/poll_agent_messages to coordinate with siblings. Your mailbox address and siblings: ${task.roster ?? "(none)"}. Use the exact task ids (e.g. task_2) as send_agent_message targets. Siblings run independently and may start late or finish early — never block indefinitely on their replies: poll at most 5 times, then proceed with your best judgment. A gated sibling (marked ↳ waits in the graph) may not be running yet; do not wait for it. An unanswered ask_parent times out after 10 minutes — proceed with your best judgment then. When your work is done, call notify_parent ONCE with a concise result summary — key findings, verdicts, file:line evidence — so the leader can start consuming your output before the run finishes.${worktreeNote} ${WORKER_EXECUTION_INVARIANT}`;
 
 			if (run.runtime === "herdr") {
 				const token = this.herdrTokens.get(key) ?? randomBytes(16).toString("hex");
@@ -1082,13 +1140,13 @@ export class SubagentManager {
 					cwd: childCwd,
 					agentDir: getAgentDir(),
 					noExtensions: true,
+					extensionFactories: await codemodeFactories(),
 					appendSystemPromptOverride: (base) => [
 						...base,
 						[prompt?.trim(), subagentInstruction].filter(Boolean).join("\n\n"),
 					],
 				});
 				await loader.reload();
-
 				const customTools: ToolDefinition[] = createChildTools(task.id, this.makeChildHandlers(run, task, ctx));
 
 				const created = await createAgentSession({
@@ -1109,7 +1167,13 @@ export class SubagentManager {
 				this.updateTask(
 					run,
 					task,
-					{ status: "running", sessionId: child.sessionId, sessionFile: child.sessionFile },
+					{
+						status: "running",
+						sessionId: child.sessionId,
+						sessionFile: child.sessionFile,
+						provider: child.model?.provider ?? task.provider,
+						thinking: child.thinkingLevel,
+					},
 					ctx,
 					onUpdate,
 				);
@@ -1154,6 +1218,9 @@ export class SubagentManager {
 				});
 
 				const maxRuntimeMs = input.maxRuntimeMs ?? (this.autoLimit ? DEFAULT_RUNTIME_MS : UNLIMITED_RUNTIME_MS);
+				// A resumed session can still be draining the turn that failed or timed out. Prompting while
+				// its agent is mid-run is rejected outright ("already processing a prompt"), so wait first.
+				if (resume) await child.waitForIdle();
 				const promptPromise = child.prompt(resume?.message ?? task.task, { source: "extension" });
 				const races: Promise<unknown>[] = [promptPromise, childFailurePromise, childEndPromise];
 				if (maxRuntimeMs > 0) {
@@ -1350,12 +1417,12 @@ export class SubagentManager {
 			const input = inputs[i] as TaskInput;
 			const cwd = input.cwd ?? ctx.cwd;
 			const file = resolveAgentFile(input.agent, input.task, cwd, getAgentDir());
-			const requested = file?.model ?? input.model;
+			const choice = chooseModel(file, input.model);
 			try {
-				validateThinking(resolveChildModel(ctx, requested), input.thinking);
+				validateThinking(resolveChildModel(ctx, choice.requested), input.thinking);
 			} catch (err) {
-				const where = file?.model
-					? ` (from agent file ${file.path}, which overrides the requested model${input.model ? ` "${input.model}"` : ""})`
+				const where = choice.sourceFile
+					? ` (from agent file ${choice.sourceFile}, which overrides the requested model${input.model ? ` "${input.model}"` : ""})`
 					: "";
 				throw new Error(
 					`Task ${input.id ?? `task_${i + 1}`} (${input.agent}): ${err instanceof Error ? err.message : String(err)}${where}`,
@@ -1570,8 +1637,8 @@ export class SubagentManager {
 		runId: string,
 		taskId: string,
 		ctx: ExtensionContext,
-		opts: { message?: string; model?: string } = {},
-	): { ok: true; task: TaskSnapshot } | { ok: false; reason: string } {
+		opts: { message?: string; model?: string; thinking?: string } = {},
+	): { ok: true; task: TaskSnapshot; note?: string } | { ok: false; reason: string } {
 		const run = this.runs.get(runId);
 		const task = run?.tasks.find((t) => t.id === taskId);
 		if (!run || !task) return { ok: false, reason: `Unknown ${runId}/${taskId}.` };
@@ -1597,6 +1664,21 @@ export class SubagentManager {
 
 		const tools = task.tools?.filter((t) => !(CHILD_TALK_TOOLS as readonly string[]).includes(t));
 		const write = tools?.some((t) => WRITE_CAPABLE.includes(t)) ?? false;
+		// A resume may swap the model, so the level stored on the task can be one the new model
+		// rejects (a mode-clamped xhigh onto a model that only takes low|high|max). Clamp it against
+		// the model runChild will actually use — including a matched agent file's, whose frontmatter
+		// overrides the inline model at spawn — or the clamp would validate a different model.
+		const file = resolveAgentFile(task.agent, task.task, task.cwd, getAgentDir());
+		let resumeModel: Model<Api> | undefined;
+		try {
+			resumeModel = resolveChildModel(ctx, chooseModel(file, opts.model ?? task.model).requested);
+		} catch {}
+		const requestedThinking = (opts.thinking ?? task.thinking) as ThinkingLevel | undefined;
+		const thinking = clampResumeThinking(resumeModel, requestedThinking);
+		const thinkingNote =
+			requestedThinking && thinking !== requestedThinking
+				? `thinking ${requestedThinking} → ${thinking} (${resumeModel?.provider}/${resumeModel?.id} does not accept ${requestedThinking})`
+				: undefined;
 		const input: TaskInput = {
 			id: task.id,
 			agent: task.agent,
@@ -1605,7 +1687,7 @@ export class SubagentManager {
 			write,
 			tools: tools?.length ? tools : undefined,
 			model: opts.model ?? task.model,
-			thinking: task.thinking as TaskInput["thinking"],
+			thinking: thinking as TaskInput["thinking"],
 			needs: task.needs,
 		};
 		const resume: ResumeInput = {
@@ -1620,6 +1702,7 @@ export class SubagentManager {
 		this.turnActivity = true;
 		Object.assign(task, {
 			status: "queued" as TaskStatus,
+			thinking,
 			error: undefined,
 			endedAt: undefined,
 			finalText: undefined,
@@ -1652,7 +1735,7 @@ export class SubagentManager {
 				if (run.notifyPerTask) this.notifyTask(run, task, task.status as "completed" | "failed" | "aborted");
 				this.finishRunIfSettled(run, ctx);
 			});
-		return { ok: true, task };
+		return { ok: true, task, note: thinkingNote };
 	}
 
 	/**

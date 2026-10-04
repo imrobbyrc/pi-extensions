@@ -51,9 +51,9 @@ flowchart LR
 - **Proof is an exit code, never a self-report.** Tasks are asked for a runnable `Verify:` command; the leader checks `git diff --stat`. Agents auditing their own work score ~0. ([why](#why-9-is-a-verification-command-not-a-self-report))
 - **No ceremony without edges.** Six independent reviewers stay six independent reviewers — no waves, no gates, no graph vocabulary imposed on flat work.
 - **Agent files respected.** A spawn goal (name + task) that matches a user agent file's `description` (`.agents/agents`, `.claude/agents`, `.pi/agents` — project then home) loads that file — body = system prompt, frontmatter `model`/`tools` apply, file `model` validated against the pi model registry. File wins over inline; no match → on-demand definition.
-- **Two toolsets, plus explicit override.** Read-only (`read, grep, find, ls` — default) or write (`read, grep, find, ls, bash, edit, write` — `write: true`); `tools:` sets an explicit per-task allowlist.
+- **Two toolsets, plus explicit override.** Read-only (`read, grep, find, ls, codemode` — default) or write (`read, grep, find, ls, bash, edit, write, codemode` — `write: true`); `tools:` sets an explicit per-task allowlist. Children run with `noExtensions`, so `codemode` is the one extension they get: it lets a child batch `tools.*` calls instead of spending a model turn per call.
 - **In-process** — children are `AgentSession`s in the same runtime. No process spawn, no context bleed.
-- **Zero parent-context injection.** No catalog, no context hook. 7 slim tools total.
+- **Zero parent-context injection.** No catalog, no context hook. 11 slim tools total.
 - **Throttled updates** — widget/stream updates coalesce to ~6/s; no per-event deep clones.
 - **Bounded always** — a child is limited only by wall clock: explicit `maxRuntimeMs`, else the 1 h ceiling with `/subagents auto-limit on`, else the 6 h safety ceiling (default).
 
@@ -284,22 +284,27 @@ Background (default) + intercom — the run returns a runId immediately; you sta
 
 **Resuming a failed child:** a child that dies mid-work (provider rate limit, timeout, network error) keeps its session JSONL and its worktree branch. `resume_subagent({ runId, taskId, model?: "openai/gpt-5", message? })` reopens that session with full context, re-attaches the branch, and prompts it to recap and continue — no respawn, no lost tokens. `model` swaps provider when the original one is exhausted. Refused for tasks that never started (no session file); those you respawn. Wait for the run to settle before resuming (the tool tells you if it hasn't).
 
+**Choosing a model:** `subagent_models` lists what this session may use — the same set `/scoped-models` shows when scoping is configured, and every model with usable credentials when it is not (the output states which case applies). Each row gives the exact `model` value to pass, the thinking levels the runtime honors, the context window, and pi's catalog price per million tokens (`free` only when the reported rates are zero; absent rates read `unavailable`; catalog rates are a planning guide, not a billing quote). `model` is optional: omit it to inherit the leader's current session model, or name one (a matched agent file's `model` frontmatter still wins) to pin the run. `~/.pi/agent/subagent-models.json` may shape the listing only — `prefer` sorts, `hide` omits, `default` is surfaced as a suggestion and never applied. It never grants or blocks a model: a hidden model still runs when named, because pi owns what may run.
+
 ## Tools
 
 | Tool | Purpose |
 |---|---|
+| `subagent_models` | list the models a subagent task may name, each with the exact `model` value, thinking levels the runtime honors, context window, and catalog price; scoped to the session's enabled set when scoping is configured, else the full available catalogue (the output says which) |
 | `subagent` | single / `tasks` (parallel or graph via `needs`) / `chain` (`{previous}`); every run is background — returns a runId, completion notifies you; `autoAwait:true` parks the call until the run finishes and returns the final result inline; children always carry talk tools (ask/notify/mailbox); `notifyPerTask` (default true) wakes you as each task completes |
 | `subagent_status` | live per-task snapshot (non-blocking), including each child's session file path |
 | `subagent_result` | full output of a run or one task |
 | `await_subagent` | block until a run finishes (optional `timeoutMs`) |
 | `reply_subagent` | answer a child's `ask_parent` question |
 | `steer_subagent` | inject a steering message into a running child's session (queues as steer if mid-turn; lands at its next model boundary) |
-| `resume_subagent` | revive a failed/aborted task in its original session (context + branch preserved); optional `model` swap and custom `message` |
+| `resume_subagent` | revive a failed/aborted task in its original session (context + branch preserved); optional `model` swap, `thinking` override (the task's stored level is clamped to what the target model accepts), custom `message`. Waits for the reopened session to go idle before prompting, so a task killed mid-turn can still be resumed |
+| `review_subagent` | herdr-only correction round: re-prompt the SAME live pane in place with feedback; the task reopens and completes again for re-review (repeatable, work accumulates on the task's branch) |
+| `accept_subagent` | herdr-only explicit acceptance: closes the owned pane once the close is confirmed, marks `task.acceptedAt`, releases the live binding (idempotent; a failed close is retryable) |
 | `subagent_cancel` | abort a running/queued run |
 
 ### Per-task fields
 
-`agent` (name you invent — required), `task` (required), `prompt` (system prompt, optional — minimal default used), `write` (toolset, default read-only), plus optional `model` (`provider/model-id`), `thinking` (validated enum: `off|minimal|low|medium|high|xhigh|max`), `tools` (explicit allowlist), `cwd`, `maxRuntimeMs`, `id`, `needs` (dependency edges — see [Graph mode](#graph-mode--needs)). Top-level only: `autoAwait`, `notifyPerTask`, `concurrency`, `runtime` (`"inprocess"` | `"herdr"`).
+`agent` (name you invent — required), `task` (required), `prompt` (system prompt, optional — minimal default used), `write` (toolset, default read-only), plus optional `model` (`provider/model-id`; omitted → the leader's current session model, a matched agent file's frontmatter wins), `thinking` (validated enum: `off|minimal|low|medium|high|xhigh|max`), `tools` (explicit allowlist), `cwd`, `maxRuntimeMs`, `id`, `needs` (dependency edges — see [Graph mode](#graph-mode--needs)). Top-level only: `autoAwait`, `notifyPerTask`, `concurrency`, `runtime` (`"inprocess"` | `"herdr"`).
 
 ### Runtimes: inprocess vs herdr
 
@@ -322,17 +327,18 @@ Failure/abort stay terminal (use `resume_subagent`, which still spawns a fresh p
 #### Session handoff preservation (one-shot)
 
 An intentional in-place extension reload no longer has to kill active Herdr panes. `prepareHandoff()` (manager; the controller exposes the same delegate) validates that **every nonterminal task runs on the `herdr` runtime** — live panes and their bindings survive a session reload; inprocess work never does. Idle or herdr-only state arms a one-shot preservation; an active inprocess/mixed state is rejected without arming (and revokes a prior arming). An armed `session_shutdown` (`handleSessionShutdown()`) then preserves runs, owned panes, IPC tokens and live children **exactly once** — a controller recreated for the same session (`createSubagentController` on the same `ExtensionAPI`, via the shared-manager registry) observes the same manager, runs and live pane bindings, so review/correction loops continue seamlessly. The next ordinary `session_shutdown` force-cleans as always, and `shutdown()` semantics never change for ordinary callers.
-
 ### Child talk tools (always on)
 
 | Tool | Meaning |
 |---|---|
-| `ask_parent` | blocking question to the leader; parent answers via `reply_subagent` |
+| `ask_parent` | blocking question to the leader; delivered mid-turn as a **steering** message labelled `[URGENT]` or `[not urgent]`, parent answers via `reply_subagent` |
 | `notify_parent` | one-way message to the leader |
 | `send_agent_message` | message to a sibling subagent's mailbox (`to` = its task id, or `"leader"`) |
 | `poll_agent_messages` | drain this subagent's mailbox |
 
 > **Intercom anti-deadlock:** children are told to never block indefinitely on intercom replies — an unanswered `ask_parent` times out after 10 minutes (the child is told to proceed with best judgment), and sibling polls are capped (~5 tries) with the same fallback. Gated siblings (later waves) may not be running yet — waiting on them is the top stall cause, so children are instructed not to.
+
+> **Ask urgency:** `ask_parent` takes `urgent` (default `false`). Both variants steer into the leader's current turn so the question is never deferred to the end of a long turn. `[URGENT]` tells the leader to answer before its next step; `[not urgent]` tells it that the child keeps waiting, so it may finish its current step first. Failures steer for the same reason; completions and aborts queue as follow-ups.
 
 ## Commands
 
@@ -377,9 +383,9 @@ The extension has no multiplexer integration and does not want one: it exposes t
 
 ## Context budget
 
-- Parent tools: 7 schemas with short descriptions. **No catalog, no context hook** — nothing injected per request.
+- Parent tools: 9 schemas with short descriptions. **No catalog, no context hook** — nothing injected per request.
 - Background completion: 3-line notice. Full text only via `subagent_result`.
-- Children: isolated sessions; talk tools always injected; each child's prompt states its own task id and its siblings' so mailbox addressing works. Model resolution: explicit `provider/model-id` or bare id via the pi model registry → the parent's current model → settings default. Thinking levels validated against the resolved model's `thinkingLevelMap`.
+- Children: isolated sessions; talk tools always injected; each child's prompt states its own task id and its siblings' so mailbox addressing works. Model resolution: explicit `provider/model-id` or bare id via the pi model registry → the parent's current model → settings default. Thinking levels validated against the resolved model's `thinkingLevelMap`; `subagent_models` lists the levels the runtime honors when you need a safe set.
 
 ## What this is built on
 

@@ -140,7 +140,7 @@ describe("dual-package loading without duplicate native tool registration", () =
 		// 2. Load pi-core-subagent extension next
 		registerCoreSubagent(pi);
 		expect(pi.registeredTools).toContain("subagent");
-		expect(pi.registeredTools).toHaveLength(10);
+		expect(pi.registeredTools).toHaveLength(11);
 
 		// Controller created after also shares the same manager
 		const controller = createSubagentController(pi);
@@ -152,7 +152,7 @@ describe("dual-package loading without duplicate native tool registration", () =
 
 		registerCoreSubagent(pi);
 		const countAfterFirst = pi.registeredTools.length;
-		expect(countAfterFirst).toBe(10);
+		expect(countAfterFirst).toBe(11);
 
 		// Calling it again should be a no-op, not throw duplicate tool error
 		expect(() => registerCoreSubagent(pi)).not.toThrow();

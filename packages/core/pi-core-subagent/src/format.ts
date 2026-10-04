@@ -3,6 +3,8 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
 import {
 	MAX_TASKS,
+	type ModelCatalog,
+	type ModelPricing,
 	type RunSnapshot,
 	type RunStatus,
 	type TaskSnapshot,
@@ -60,8 +62,12 @@ function taskStatsWithUsage(task: TaskSnapshot): string {
 	const usage = formatUsage(task.usage);
 	return `${stats}${usage ? ` · ${usage}` : ""}`;
 }
+export function modelTag(task: TaskSnapshot): string {
+	const ref = [task.provider, task.model, task.thinking].filter(Boolean).join("/");
+	return ref ? ` [${ref}]` : "";
+}
 export function taskLine(task: TaskSnapshot): string {
-	return `${statusIcon(task.status)} ${task.agent} · ${taskStatsWithUsage(task)} · ${taskTimer(task)}`;
+	return `${statusIcon(task.status)} ${task.agent}${modelTag(task)} · ${taskStatsWithUsage(task)} · ${taskTimer(task)}`;
 }
 export function colorNums(text: string, theme: Theme): string {
 	return text.replace(/((?:\d+(?:\.\d+)?[a-zA-Z]*)+)|([^\d]+)/g, (_m, num?: string, rest?: string) =>
@@ -71,15 +77,16 @@ export function colorNums(text: string, theme: Theme): string {
 function themedTaskLine(task: TaskSnapshot, theme: Theme, activity = ""): string {
 	const tail = `${taskStatsWithUsage(task)} · ${taskTimer(task)}`;
 
+	const tag = theme.fg("dim", modelTag(task));
 	const gate =
 		task.status === "queued" && task.needs?.length ? `${theme.fg("muted", `↳ waits ${task.needs.join(", ")}`)} · ` : "";
 	if (TERMINAL.includes(task.status)) {
-		return theme.fg("dim", `${statusIcon(task.status)} ${task.agent} · ${tail}`);
+		return theme.fg("dim", `${statusIcon(task.status)} ${task.agent}${tag} · ${tail}`);
 	}
 
 	pulsePhase += 1;
 	const name = isTalking(task) ? theme.fg(pulsePhase % 2 === 0 ? "accent" : "dim", `${task.agent} ⇄`) : task.agent;
-	return `${statusIcon(task.status)} ${name} · ${gate}${activity}${colorNums(tail, theme)}`;
+	return `${statusIcon(task.status)} ${name}${tag} · ${gate}${activity}${colorNums(tail, theme)}`;
 }
 const ARG_KEYS = ["pattern", "query", "command", "path", "file_path", "filePath", "url", "name", "subject", "task"];
 export function describeCall(toolName: string, args: unknown, cwd?: string): string {
@@ -106,10 +113,17 @@ export function isTalking(task: TaskSnapshot): boolean {
 	return TALK_TOOLS.some((t) => a.startsWith(t));
 }
 let pulsePhase = 0;
+const NOTE_CAP = 240;
+function noteSnippet(note: string): string {
+	return note.length > NOTE_CAP ? `${note.slice(0, NOTE_CAP)}…` : note;
+}
 export function compactLines(run: RunSnapshot): string[] {
 	const lines: string[] = [];
 	for (const task of run.tasks.slice(0, MAX_TASKS)) {
 		lines.push(taskLine(task));
+		// a swapped model or toolset changes what the task did, so it cannot stay out of the status view
+		if (task.modelNote) lines.push(`   ↳ Model: ${noteSnippet(task.modelNote)}`);
+		if (task.toolsNote) lines.push(`   ↳ Tools: ${noteSnippet(task.toolsNote)}`);
 	}
 	if (run.tasks.length > MAX_TASKS) lines.push(`… +${run.tasks.length - MAX_TASKS} more`);
 	return lines;
@@ -241,6 +255,17 @@ export function makeTaskNotice(run: RunSnapshot, task: TaskSnapshot, kind: strin
 				: `Session file kept — resume_subagent(runId: "${run.id}", taskId: "${task.id}", model?: ...) revives it with full context. subagent_result for what it produced so far.${pendingCleanup}`,
 	].join("\n");
 }
+export function makeAskNotice(
+	run: RunSnapshot,
+	extra: { taskId?: string; agent?: string; question?: string; urgent?: boolean },
+): string {
+	const who = extra.agent ? `${extra.agent} (${extra.taskId ?? "task"})` : (extra.taskId ?? "a subagent");
+	const reply = `reply_subagent(runId: "${run.id}", taskId: "${extra.taskId ?? ""}", message: ...)`;
+	return extra.urgent
+		? `[URGENT] Subagent ${who} is blocked and cannot continue until you answer: ${extra.question ?? ""}\nAnswer now, before your next step, with ${reply}.`
+		: `[not urgent] Subagent ${who} asks: ${extra.question ?? ""}\nIt waits while you keep working — finish your current step first if you want, then answer with ${reply}.`;
+}
+
 export function makeNotice(run: RunSnapshot, kind: string): string {
 	const lines = [
 		`Background subagent run ${run.id} ${kind}: ${run.tasks.filter((t) => t.status === "completed").length}/${run.tasks.length} succeeded.`,
@@ -250,4 +275,77 @@ export function makeNotice(run: RunSnapshot, kind: string): string {
 	}
 	lines.push(`Use subagent_result(runId: "${run.id}") for full output.`);
 	return lines.join("\n");
+}
+
+/** Per-million-token rates, terse. A zero rate reads as "free"; absent rates are "unavailable", not free. */
+function priceTag(cost: ModelPricing | undefined): string {
+	if (!cost) return "unavailable (provider did not report rates)";
+	if (cost.input === 0 && cost.output === 0 && cost.cacheRead === 0 && cost.cacheWrite === 0) return "free";
+	const rate = (n: number) => (n === 0 ? "free" : `$${n.toFixed(n < 0.01 ? 4 : 2)}`);
+	const parts = [`in ${rate(cost.input)}`, `out ${rate(cost.output)}`];
+	if (cost.cacheRead === undefined) parts.push("cache-read unavailable");
+	else if (cost.cacheRead > 0) parts.push(`cache-read ${rate(cost.cacheRead)}`);
+	if (cost.cacheWrite === undefined) parts.push("cache-write unavailable");
+	else if (cost.cacheWrite > 0) parts.push(`cache-write ${rate(cost.cacheWrite)}`);
+	return `${parts.join(", ")} per Mtok`;
+}
+
+/**
+ * Render the model catalog as the `subagent_models` tool result. Pure, so the exact text an agent
+ * receives is testable: the tool handler holds no formatting of its own. Throws when the list is
+ * empty — the SDK tool loop discards a returned `isError` for any `execute` that does not throw.
+ */
+export function renderModelCatalog(catalog: ModelCatalog): {
+	content: { type: "text"; text: string }[];
+	details: ModelCatalog;
+} {
+	if (catalog.models.length === 0) {
+		throw new Error(
+			`No models can be listed for subagent tasks: ${catalog.unavailable ?? "the model registry returned no models"}. This is not an empty catalog — a task without \`model\` still inherits the session model, but naming one needs the references. Fix model configuration, then retry.`,
+		);
+	}
+	const lines = catalog.models.map((model) =>
+		[
+			`- model: "${model.reference}"`,
+			`    ${model.name}; ${model.contextWindow > 0 ? `${model.contextWindow.toLocaleString("en-US")} context` : "context window unreported"}`,
+			`    price: ${priceTag(model.cost)}`,
+			model.reasoning
+				? `    thinking levels: ${model.thinkingLevels.join(" | ")}`
+				: `    thinking: not supported — omit it or pass "off"`,
+		].join("\n"),
+	);
+	const heading =
+		catalog.scope === "session"
+			? `${catalog.models.length} model(s) enabled for this session. Pass the \`model\` value verbatim in a subagent task:`
+			: `${catalog.models.length} model(s) available — this session has no model scoping, so every model with usable credentials is listed. Pass the \`model\` value verbatim in a subagent task:`;
+	const suggestion = catalog.preferredDefault
+		? `\n\nThis configuration suggests \`model: "${catalog.preferredDefault}"\`. It is a preference, never applied automatically.`
+		: "";
+	const unlistedDefault = catalog.unlistedDefault
+		? `\n\nNOTE: configured default \`${catalog.unlistedDefault}\` is not in the displayed catalog; it is not suggested or applied.`
+		: "";
+	const hidden =
+		catalog.hidden && catalog.hidden > 0
+			? `\n\n${catalog.hidden} enabled model(s) are hidden by your model preferences.`
+			: "";
+	const unused = catalog.unusedPatterns?.length
+		? `\n\nNOTE: these preference patterns matched no listed model and did nothing: ${catalog.unusedPatterns.join(", ")}. They may target models that are not enabled.`
+		: "";
+	const ambiguous = catalog.ambiguous?.length
+		? `\n\nDo not pass these references: ${catalog.ambiguous.join(", ")} — ${catalog.reason}.`
+		: "";
+	const unresolved = catalog.unresolved?.length ? `\n\n${catalog.unresolvedReason}` : "";
+	const configError = catalog.configError
+		? `\n\nWARNING: the model preferences file could not be used (${catalog.configError}). Continuing with no preferences.`
+		: "";
+	const billing = "\n\nPrices are pi catalog list rates per Mtok, not a billing quote.";
+	return {
+		content: [
+			{
+				type: "text",
+				text: `${heading}\n${lines.join("\n")}${suggestion}${unlistedDefault}${hidden}${unused}${ambiguous}${unresolved}${configError}${billing}`,
+			},
+		],
+		details: catalog,
+	};
 }

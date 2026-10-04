@@ -65,6 +65,8 @@ export interface ChildAskParentMessage extends BaseChildMessage {
 	type: "ask_parent";
 	id: string;
 	question: string;
+	/** Upstream ask-parent urgency flag: true when the child cannot proceed until answered. */
+	urgent?: boolean;
 }
 
 export interface ChildNotifyParentMessage extends BaseChildMessage {
@@ -225,6 +227,9 @@ export function parseChildMessage(raw: string): { ok: true; message: ChildMessag
 			}
 			if (typeof msg.question !== "string") {
 				return { ok: false, error: "Missing or invalid 'question' in ask_parent message" };
+			}
+			if (msg.urgent !== undefined && typeof msg.urgent !== "boolean") {
+				return { ok: false, error: "Invalid 'urgent' in ask_parent message" };
 			}
 			break;
 		case "notify_parent":

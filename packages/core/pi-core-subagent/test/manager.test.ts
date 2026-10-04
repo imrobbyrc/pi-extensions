@@ -1,8 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { clearAgentFileCache } from "../src/agentfile.ts";
 import { SubagentManager, WORKER_EXECUTION_INVARIANT } from "../src/manager.ts";
 
 const stubPi = { events: { emit() {} }, sendUserMessage() {} } as unknown as ExtensionAPI;
@@ -326,5 +327,123 @@ describe("resumeTask", () => {
 		expect(task.error === undefined || task.error !== "usage limit").toBe(true);
 		await new Promise((r) => setTimeout(r, 300));
 		rmSync(dir, { recursive: true, force: true });
+	});
+	test("resume clamps thinking against the agent-file model, matching spawn precedence", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "resume-file-"));
+		const agents = join(dir, ".agents", "agents");
+		mkdirSync(agents, { recursive: true });
+		writeFileSync(
+			join(agents, "reviewer.md"),
+			"---\ndescription: Reviews auth module changes\nmodel: file-model\n---\nYou review the auth module.\n",
+		);
+		clearAgentFileCache();
+		const file = join(dir, "s.jsonl");
+		writeFileSync(file, "");
+		const fileModel = {
+			provider: "p",
+			id: "file-model",
+			name: "File",
+			reasoning: true,
+			contextWindow: 1000,
+		};
+		const otherModel = {
+			provider: "p",
+			id: "other-model",
+			name: "Other",
+			reasoning: true,
+			contextWindow: 1000,
+			thinkingLevelMap: { xhigh: "high" },
+		};
+		const models = [fileModel, otherModel];
+		const ctx = {
+			cwd: dir,
+			hasUI: false,
+			modelRegistry: {
+				getAvailable: () => models,
+				find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
+			},
+		} as unknown as ExtensionContext;
+		const m = makeManager();
+		const { run } = m.createRun({ agent: "reviewer", task: "review the auth module", model: "other-model" }, ctx);
+		const task = run.tasks[0]!;
+		// What runChild records at spawn: the agent file's model won over the inline one.
+		task.status = "failed";
+		task.sessionFile = file;
+		task.model = "file-model";
+		task.thinking = "xhigh";
+		run.status = "failed";
+
+		const res = m.resumeTask(run.id, task.id, ctx, { model: "other-model" });
+		expect(res.ok).toBe(true);
+		if (res.ok) {
+			// The swap names other-model, but runChild re-applies the file's model; clamping against
+			// other-model would validate a model this task never runs.
+			expect(res.note).toContain("p/file-model");
+			expect(res.note).toContain("xhigh → high");
+		}
+		await new Promise((r) => setTimeout(r, 50));
+		clearAgentFileCache();
+		rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+describe("widget auto-prune", () => {
+	interface WidgetInternals {
+		widgetRuns: { id: string }[];
+		upsertWidgetRun(run: unknown): void;
+		flushWidget(run: unknown, ctx?: unknown, onUpdate?: (partial: unknown) => void): void;
+	}
+	const internals = (m: SubagentManager): WidgetInternals => m as unknown as WidgetInternals;
+
+	test("a settled run leaves the widget as soon as it settles", () => {
+		const m = makeManager();
+		const { run } = m.createRun({ agent: "a", task: "t" }, stubCtx);
+		internals(m).upsertWidgetRun(run);
+		expect(internals(m).widgetRuns).toHaveLength(1);
+
+		run.status = "failed";
+		run.tasks[0]!.status = "failed";
+		internals(m).flushWidget(run, stubCtx);
+		expect(internals(m).widgetRuns).toHaveLength(0);
+	});
+
+	test("a terminal run never enters the widget (restored or cancelled history)", () => {
+		const m = makeManager();
+		const { run } = m.createRun({ agent: "a", task: "t" }, stubCtx);
+		run.status = "aborted";
+		run.tasks[0]!.status = "aborted";
+		internals(m).upsertWidgetRun(run);
+		expect(internals(m).widgetRuns).toHaveLength(0);
+	});
+
+	test("settling one run keeps a live sibling in the widget", () => {
+		const m = makeManager();
+		const settled = m.createRun({ agent: "a", task: "t" }, stubCtx).run;
+		const live = m.createRun({ agent: "b", task: "t2" }, stubCtx).run;
+		internals(m).upsertWidgetRun(settled);
+		internals(m).upsertWidgetRun(live);
+
+		settled.status = "completed";
+		settled.tasks[0]!.status = "completed";
+		internals(m).flushWidget(settled, stubCtx);
+		expect(internals(m).widgetRuns.map((r) => r.id)).toEqual([live.id]);
+	});
+});
+
+describe("child toolsets", () => {
+	test("read-only children get codemode for batching tool calls", () => {
+		const { run } = makeManager().createRun({ agent: "a", task: "t" }, stubCtx);
+		expect(run.tasks[0]?.tools).toEqual(["read", "grep", "find", "ls", "codemode"]);
+	});
+
+	test("write children get codemode next to bash/edit/write", () => {
+		const { run } = makeManager().createRun({ agent: "a", task: "t", write: true }, stubCtx);
+		expect(run.tasks[0]?.tools).toContain("codemode");
+		expect(run.tasks[0]?.tools).toContain("bash");
+	});
+
+	test("explicit tools stay exactly what the caller asked for", () => {
+		const { run } = makeManager().createRun({ agent: "a", task: "t", tools: ["read"] }, stubCtx);
+		expect(run.tasks[0]?.tools).toEqual(["read"]);
 	});
 });

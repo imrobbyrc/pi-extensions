@@ -1,8 +1,3 @@
-/**
- * Domain types + TypeBox schema. Field names and descriptions are the LLM
- * contract — kept verbatim from rpiv-todo.
- */
-
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
@@ -20,6 +15,7 @@ export interface Task {
 	description?: string;
 	activeForm?: string;
 	status: TaskStatus;
+	parentId?: number;
 	blockedBy?: number[];
 	owner?: string;
 	metadata?: Record<string, unknown>;
@@ -40,6 +36,7 @@ export interface TaskMutationParams {
 	description?: string;
 	activeForm?: string;
 	status?: TaskStatus;
+	parentId?: number | null;
 	blockedBy?: number[];
 	addBlockedBy?: number[];
 	removeBlockedBy?: number[];
@@ -69,6 +66,11 @@ export const TodoParamsSchema = Type.Object({
 		StringEnum(["pending", "in_progress", "completed", "deleted"] as const, {
 			description:
 				"Set this task's status (update): one of pending, in_progress, completed, deleted. When action is list, filters returned tasks by this status.",
+		}),
+	),
+	parentId: Type.Optional(
+		Type.Union([Type.Number(), Type.Null()], {
+			description: "Parent task id (create/update). Pass null for a root task; omit to leave parent unchanged on update. Statuses are explicit: a parent cannot complete until all live descendants complete.",
 		}),
 	),
 	blockedBy: Type.Optional(Type.Array(Type.Number(), { description: "Initial blockedBy ids (create only)" })),

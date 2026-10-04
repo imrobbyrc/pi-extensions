@@ -1,12 +1,22 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { compactLines, formatUsage, makeSummary, statusIcon, taskLine, truncateText } from "./format.ts";
+import {
+	compactLines,
+	formatUsage,
+	makeSummary,
+	renderModelCatalog,
+	statusIcon,
+	taskLine,
+	truncateText,
+} from "./format.ts";
 import { waveNotation } from "./graph.ts";
 import { cloneRun, getOrCreateSubagentManager, type ParkedMsg, type SubagentManager } from "./manager.ts";
+import { listSelectableModels } from "./models.ts";
 import { createPeekPane, type PeekTask } from "./peek.ts";
 import {
 	AcceptParam,
 	AwaitParam,
+	ModelsParam,
 	ReplyParam,
 	ResultParam,
 	ResumeParam,
@@ -16,7 +26,7 @@ import {
 	SubagentParams,
 	type SubagentParamsShape,
 } from "./schemas.ts";
-import { type RunDetails, type RunSnapshot, TERMINAL } from "./types.ts";
+import { type ModelCatalog, type RunDetails, type RunSnapshot, TERMINAL } from "./types.ts";
 import { cleanupMerged, ownerAlive, reapDeadWorktrees, repoRoot, sweepStale } from "./worktree.ts";
 
 export type { RunDetails, RunSnapshot, SubagentParamsShape, SubagentRuntime, TaskSnapshot } from "./api.ts";
@@ -181,6 +191,18 @@ export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 		manager.handleSessionShutdown();
 	});
 
+	pi.registerTool<typeof ModelsParam, ModelCatalog>({
+		name: "subagent_models",
+		label: "Subagent Models",
+		description:
+			"List the models a subagent task may name, each with the exact `model` value to pass. The list is scoped to this session's enabled models when scoping is configured (the same set `/scoped-models` shows); when no scoping is configured, every model with usable credentials is listed and the output says so. Each entry includes its context window and pi catalog price per million tokens, and the thinking levels the runtime honors — a level shown here is not silently clamped. References shown here are safe to pass; ambiguous ones are called out. Naming a model is optional: omit `model` to inherit the session model, or call this when choosing one.",
+		promptSnippet: "List the models a subagent task can name (reference, thinking levels, context, price).",
+		parameters: ModelsParam,
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			return renderModelCatalog(listSelectableModels(ctx));
+		},
+	});
+
 	pi.registerTool<typeof SubagentParams, RunDetails>({
 		name: "subagent",
 		label: "Subagent",
@@ -189,6 +211,7 @@ export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 			"Run isolated subagents (own context, own session) in the background: returns a runId immediately, completion notifies you. One call = one agent (`agent`+`task`) or many (`tasks`, or `chain` with `{previous}`). `needs` edges gate tasks and prepend upstream outputs to their prompts. A user agent file (`.agents/agents`, `.claude/agents`, `.pi/agents`; project dirs, then home) whose `description` matches the goal is authoritative: body = system prompt, frontmatter `model`/`tools` apply, but explicit per-call `tools`/`write` override the file's tools. Write agents get an isolated git worktree; the result reports the branch. Children always carry talk tools (ask/notify the leader, message siblings).",
 		promptSnippet: "Define and delegate work to specialized subagents.",
 		promptGuidelines: [
+			"`model` is optional: omit it to inherit your current session model, or name one (agent-file `model` frontmatter wins) to pin the run. Call subagent_models for the exact references, thinking levels, and prices this session may use.",
 			"Use subagent when independent review, testing, research, or parallel analysis improves quality.",
 			"Batch every sub-task in ONE call: subagent({ tasks: [...] }) — never multiple parallel subagent calls.",
 			"Declare ordering with `needs` edges on the tasks, never by splitting into separate calls; dependents receive upstream outputs automatically — do not restate them. Prefer flat `tasks` (plain parallel); add `needs` only when ordering genuinely matters.",
@@ -357,7 +380,8 @@ export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 							? `\nApplied IN PLACE (no branch) — ${t.isolationReason ?? "worktree unavailable"}. The changes are already in your working tree.`
 							: "";
 					const wtErr = t.worktreeError ? `\nWorktree: ${t.worktreeError}` : "";
-					return `\n## ${t.agent} ${statusIcon(t.status)}\nGoal: ${truncateText(t.task, 300)}\n${t.error ? `Error: ${t.error}` : t.finalText || "(no output yet)"}${wt}${wtErr}\n${formatUsage(t.usage)}`;
+					const modelNote = t.modelNote ? `\nModel: ${t.modelNote}` : "";
+					return `\n## ${t.agent} ${statusIcon(t.status)}\nGoal: ${truncateText(t.task, 300)}\n${t.error ? `Error: ${t.error}` : t.finalText || "(no output yet)"}${wt}${wtErr}${modelNote}\n${formatUsage(t.usage)}`;
 				}),
 			].join("\n");
 			return { content: [{ type: "text", text: truncateText(text) }], details: { run: cloneRun(run) } };
@@ -438,23 +462,24 @@ export default function (pi: ExtensionAPI, existingManager?: SubagentManager) {
 		name: "resume_subagent",
 		label: "Resume Subagent",
 		description:
-			"Revive a failed/aborted task in its original session (full context + worktree branch preserved). Optional `model` swaps provider (e.g. after a rate limit); optional `message` replaces the default 'recap and continue' prompt. Refuses tasks that never started — respawn those.",
+			"Revive a failed/aborted task in its original session (full context + worktree branch preserved). Optional `model` swaps provider (e.g. after a rate limit); optional `thinking` sets the effort — the stored level is clamped to what the target model accepts, so a resume never dies on an unsupported effort; optional `message` replaces the default 'recap and continue' prompt. Refuses tasks that never started — respawn those.",
 		parameters: ResumeParam,
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const { runId, taskId, message, model } = params as {
+			const { runId, taskId, message, model, thinking } = params as {
 				runId: string;
 				taskId: string;
 				message?: string;
 				model?: string;
+				thinking?: string;
 			};
-			const res = manager.resumeTask(runId, taskId, ctx, { message, model });
+			const res = manager.resumeTask(runId, taskId, ctx, { message, model, thinking });
 			if (!res.ok) return { content: [{ type: "text", text: res.reason }], isError: true, details: {} };
 			const run = manager.getRun(runId);
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Resumed ${runId}/${taskId} (${res.task.agent})${model ? ` on ${model}` : ""} from ${res.task.sessionFile}${res.task.branch ? `, branch ${res.task.branch}` : ""}.\nNext: subagent_status("${runId}") to confirm it is running; completion will notify you.`,
+						text: `Resumed ${runId}/${taskId} (${res.task.agent})${model ? ` on ${model}` : ""} from ${res.task.sessionFile}${res.task.branch ? `, branch ${res.task.branch}` : ""}.${res.note ? ` Adjusted ${res.note}.` : ""}\nNext: subagent_status("${runId}") to confirm it is running; completion will notify you.`,
 					},
 				],
 				details: { run: run ? cloneRun(run) : undefined },

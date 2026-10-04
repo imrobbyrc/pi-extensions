@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { makeSummary, SubagentsWidget } from "../src/format.ts";
+import { compactLines, makeSummary, SubagentsWidget, taskLine } from "../src/format.ts";
 import type { RunSnapshot, TaskSnapshot, UsageStats } from "../src/types.ts";
 
 const plain = { fg: (_c: string, s: string) => s } as unknown as Theme;
@@ -84,6 +84,37 @@ describe("makeSummary merge safety", () => {
 		const out = makeSummary(run([task({ isolation: "in-place", isolationReason: "not a git repository" })]));
 		expect(out).toContain("Applied IN PLACE (no branch)");
 		expect(out).toContain("not a git repository");
+	});
+});
+
+describe("taskLine model tag", () => {
+	test("provider/model/effort ride after the agent name", () => {
+		expect(
+			taskLine(
+				task({ agent: "vendor-factchecker", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "xhigh" }),
+			),
+		).toStartWith("✓ vendor-factchecker [openai-codex/gpt-5.6-sol/xhigh] ·");
+		expect(taskLine(task({ agent: "bare" }))).toStartWith("✓ bare ·");
+	});
+});
+
+describe("compactLines notes", () => {
+	test("a model swap stays visible in subagent_status", () => {
+		const out = compactLines(
+			run([
+				task({
+					id: "task_1",
+					model: "cc/claude-opus-5-5",
+					modelNote:
+						"9router/cc/claude-sonnet-5-5 failed preflight (400); using session model 9router/cc/claude-opus-5-5",
+				}),
+			]),
+		).join("\n");
+		expect(out).toContain("↳ Model: 9router/cc/claude-sonnet-5-5 failed preflight");
+	});
+
+	test("no note line is added when nothing was swapped", () => {
+		expect(compactLines(run([task({ id: "task_1" })]))).toHaveLength(1);
 	});
 });
 

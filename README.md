@@ -22,6 +22,10 @@ packages/
 │   ├── pi-core-tps-stats/
 │   └── pi-core-vision/
 ├── add/         → optional/extra extensions (opt in)
+│   ├── pi-add-deliberate/
+│   ├── pi-add-mode/
+│   ├── pi-openai-web/
+│   └── pi-senja/
 └── pi-toolset/  → installer: manage the installed set
 ```
 
@@ -57,7 +61,7 @@ pi -e npm:@arhen/pi-core-vision
 | [`@arhen/pi-core-ask`](packages/core/pi-core-ask) | Structured up-to-4-question questionnaire tool |
 | [`@arhen/pi-core-skill-tool`](packages/core/pi-core-skill-tool) | Skills catalog, lazy `skill` tool |
 | [`@imrobbyrc/pi-core-subagent`](packages/core/pi-core-subagent) | Fast in-process subagents, dependency scheduler |
-| [`@arhen/pi-core-todo`](packages/core/pi-core-todo) | Todo tool with 4-state machine + blockedBy |
+| [`@arhen/pi-core-todo`](packages/core/pi-core-todo) | Flat/nested todos, direct-child progress, bounded tree UI + blockedBy |
 | [`@arhen/pi-core-tps-stats`](packages/core/pi-core-tps-stats) | Live tokens-per-second stats |
 | [`@arhen/pi-core-vision`](packages/core/pi-core-vision) | Vision fallback for text-only models |
 
@@ -65,6 +69,10 @@ pi -e npm:@arhen/pi-core-vision
 
 | Package | Purpose for |
 | --- | --- |
+| [`@arhen/pi-add-deliberate`](packages/add/pi-add-deliberate) | Configured advise/plan modes: read-only second opinions and research-first plans |
+| [`@arhen/pi-add-mode`](packages/add/pi-add-mode) | Named modes: instructions + tools + model + subagent model, `/mode` and `ctrl+tab` |
+| [`@imrobbyrc/pi-openai-web`](packages/add/pi-openai-web) | Always-on ChatGPT Web Lead Architect with bounded lead tools and Herdr-managed Pi workers |
+| [`@arhen/pi-senja`](packages/add/pi-senja) | Haiku-style header/footer with the Gruvbox Material Senja palette |
 
 ## 🔧 Manage the set
 

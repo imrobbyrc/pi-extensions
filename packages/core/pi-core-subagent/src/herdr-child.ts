@@ -139,11 +139,17 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: Type.Object({
 			question: Type.String({ description: "A single, focused question for the parent agent" }),
+			urgent: Type.Optional(
+				Type.Boolean({
+					description:
+						"Set urgent: true only when you cannot keep working while waiting; otherwise the parent is told it may answer after its current step.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params) {
-			const { question } = params as { question: string };
+			const { question, urgent } = params as { question: string; urgent?: boolean };
 			const id = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-			send({ type: "ask_parent", runId, taskId, token, id, question });
+			send({ type: "ask_parent", runId, taskId, token, id, question, urgent: urgent === true });
 
 			const answer = await new Promise<string>((resolve) => {
 				const timer = setTimeout(() => {

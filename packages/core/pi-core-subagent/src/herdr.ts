@@ -489,7 +489,7 @@ export async function runHerdrChild(opts: RunHerdrChildOptions): Promise<void> {
 			childSettledResolve?.();
 		} else if (msg.type === "ask_parent") {
 			opts.updateTask({ status: "awaiting_parent" });
-			const answer = await opts.childHandlers.onAskParent(opts.task.id, msg.question);
+			const answer = await opts.childHandlers.onAskParent(opts.task.id, msg.question, msg.urgent === true);
 			opts.updateTask({ status: "running" });
 			if (!sock.destroyed) {
 				sock.write(`${JSON.stringify({ type: "ask_reply", id: msg.id, answer })}\n`);
